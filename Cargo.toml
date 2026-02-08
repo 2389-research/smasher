@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "smasher-llm",
+    "smasher-agent",
+    "smasher-attractor",
+    "smasher-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# HTTP + networking
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# IDs + encoding
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Utilities
+rand = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+regex = "1"
+glob = "0.3"
+libc = "0.2"
+
+# DOT parsing (Layer 3)
+winnow = "0.7"
+
+# Dev dependencies
+wiremock = "0.6"
+tokio-test = "0.4"
+tempfile = "3"
+
+# Workspace crate cross-references
+smasher-llm = { path = "smasher-llm" }
+smasher-agent = { path = "smasher-agent" }
+smasher-attractor = { path = "smasher-attractor" }

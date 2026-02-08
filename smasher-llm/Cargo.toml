@@ -1,0 +1,27 @@
+[package]
+name = "smasher-llm"
+description = "Unified LLM client for OpenAI, Anthropic, and Gemini APIs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+base64.workspace = true
+rand.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio-test.workspace = true

@@ -1,0 +1,1726 @@
+// ABOUTME: Core agentic session loop that orchestrates LLM calls, tool execution, and steering.
+// ABOUTME: Drives the conversation by building requests, dispatching tool calls, and emitting events.
+
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::events::EventEmitter;
+use crate::profile::{ProviderProfile, SystemPromptConfig, profile_for_model};
+use crate::tools::ToolRegistry;
+use crate::types::{SessionConfig, SessionEvent, SessionPhase, SessionState, Turn};
+
+/// Output returned by a successful `process_input` call.
+#[derive(Debug)]
+pub struct SessionOutput {
+    /// The final text response from the assistant, if any.
+    pub text: Option<String>,
+    /// Number of turns consumed during this invocation.
+    pub turns_used: u32,
+    /// Accumulated token usage across all LLM calls in this invocation.
+    pub total_usage: smasher_llm::types::Usage,
+}
+
+/// Errors that can occur during session processing.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("LLM error: {0}")]
+    Llm(#[from] smasher_llm::types::Error),
+    #[error("session is no longer active")]
+    Inactive,
+    #[error("turn limit reached ({0} turns)")]
+    TurnLimitReached(u32),
+    #[error("session cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Other(String),
+}
+
+/// An agentic session that drives conversation between the user, LLM, and tools.
+///
+/// The session maintains conversation state, applies steering messages, executes
+/// tool calls, and emits events as processing progresses.
+pub struct Session {
+    config: SessionConfig,
+    state: SessionState,
+    client: Arc<smasher_llm::client::Client>,
+    tool_registry: ToolRegistry,
+    event_emitter: EventEmitter,
+    profile: Box<dyn ProviderProfile>,
+    cancel_token: CancellationToken,
+}
+
+impl Session {
+    /// Create a session from configuration, an LLM client, a tool registry, and an event emitter.
+    ///
+    /// A unique session ID is generated, the provider profile is inferred from the
+    /// configured model, and internal state is initialized.
+    pub fn new(
+        config: SessionConfig,
+        client: Arc<smasher_llm::client::Client>,
+        tool_registry: ToolRegistry,
+        event_emitter: EventEmitter,
+    ) -> Self {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let state = SessionState::new(session_id);
+        let profile = profile_for_model(&config.model);
+
+        Self {
+            config,
+            state,
+            client,
+            tool_registry,
+            event_emitter,
+            profile,
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    /// Create a session with an externally supplied cancellation token.
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = token;
+        self
+    }
+
+    /// Cancel the session, causing the agentic loop to exit at the next check point.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Return a clone of the cancellation token so callers can trigger or observe cancellation.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// Process user input through the agentic loop, returning the final output.
+    ///
+    /// This method:
+    /// 1. Validates the session is active
+    /// 2. Adds the user message to conversation history
+    /// 3. Applies any queued steering messages
+    /// 4. Builds and sends an LLM request
+    /// 5. Loops on tool calls until the model produces a final response or the turn limit is hit
+    /// 6. Emits events throughout for subscribers
+    pub async fn process_input(&mut self, input: &str) -> Result<SessionOutput, SessionError> {
+        if !self.state.active {
+            return Err(SessionError::Inactive);
+        }
+
+        let turn_start = self.state.turn_number;
+
+        // Add user input to conversation
+        self.state.add_user_message(input);
+
+        // Emit turn started
+        self.event_emitter.emit(SessionEvent::TurnStarted {
+            turn_number: self.state.turn_number,
+        });
+
+        // Apply steering: drain queued steering messages and add as user messages
+        let steering_msgs = self.state.drain_steering();
+        for msg in &steering_msgs {
+            self.state.messages.push(smasher_llm::types::Message::user(msg));
+            self.state.turns.push(Turn::Steering {
+                text: msg.clone(),
+            });
+            self.event_emitter.emit(SessionEvent::SteeringApplied {
+                text: msg.clone(),
+            });
+        }
+
+        // Build the initial request
+        let system_prompt_config = SystemPromptConfig {
+            working_directory: self.config.working_directory.clone(),
+            ..Default::default()
+        };
+        let system_prompt = self
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| self.profile.system_prompt(&system_prompt_config));
+
+        let tool_defs = self.tool_registry.tool_definitions();
+
+        let mut request = smasher_llm::types::Request::new(
+            &self.config.model,
+            self.state.messages.clone(),
+        )
+        .system_prompt(system_prompt);
+
+        if let Some(max_tokens) = self.config.max_tokens {
+            request = request.max_tokens(max_tokens);
+        }
+        if let Some(temperature) = self.config.temperature {
+            request = request.temperature(temperature);
+        }
+        if !tool_defs.is_empty() {
+            request = request.tools(tool_defs);
+        }
+        if let Some(ref thinking) = self.config.thinking {
+            request = request.thinking(thinking.clone());
+        }
+
+        // Agentic loop: call LLM, process tool calls, repeat
+        let final_text;
+
+        loop {
+            // Check for cancellation before each LLM call
+            if self.cancel_token.is_cancelled() {
+                self.state.active = false;
+                self.state.phase = SessionPhase::Completed;
+                return Err(SessionError::Cancelled);
+            }
+
+            // Call the LLM
+            let response = self.client.complete(request.clone()).await?;
+
+            // Emit assistant message event
+            self.event_emitter.emit(SessionEvent::AssistantMessage {
+                response: response.clone(),
+            });
+
+            // Record the response in state (updates turn counter, accumulates usage)
+            self.state.add_assistant_response(&response);
+
+            // Check for tool calls
+            let tool_calls = response.tool_calls();
+
+            if tool_calls.is_empty() {
+                // No tool calls: extract text and finish
+                final_text = response.text();
+                break;
+            }
+
+            // Check turn limit before executing tools
+            if self.state.is_at_turn_limit(self.config.max_turns) {
+                self.state.active = false;
+                self.state.phase = SessionPhase::Completed;
+                self.event_emitter.emit(SessionEvent::SessionCompleted {
+                    session_id: self.state.session_id.clone(),
+                    total_turns: self.state.turn_number,
+                    total_usage: self.state.total_usage.clone(),
+                });
+                return Err(SessionError::TurnLimitReached(self.config.max_turns));
+            }
+
+            // Check for cancellation before tool execution
+            if self.cancel_token.is_cancelled() {
+                self.state.active = false;
+                self.state.phase = SessionPhase::Completed;
+                return Err(SessionError::Cancelled);
+            }
+
+            // Execute each tool call
+            for tc in &tool_calls {
+                self.event_emitter.emit(SessionEvent::ToolCallStarted {
+                    tool_name: tc.name.clone(),
+                    tool_call_id: tc.id.clone(),
+                });
+
+                let output = self.tool_registry.execute(&tc.name, &tc.arguments).await;
+
+                self.event_emitter.emit(SessionEvent::ToolCallCompleted {
+                    tool_name: tc.name.clone(),
+                    tool_call_id: tc.id.clone(),
+                    result: output.content.clone(),
+                    is_error: output.is_error,
+                    duration_ms: output.duration_ms,
+                });
+
+                // Add tool result to conversation
+                self.state
+                    .add_tool_result(&tc.id, &output.content, output.is_error);
+
+                // Record the tool execution turn
+                self.state.turns.push(Turn::ToolExecution {
+                    tool_name: tc.name.clone(),
+                    tool_call_id: tc.id.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: output.content,
+                    is_error: output.is_error,
+                    duration_ms: output.duration_ms,
+                });
+            }
+
+            // Update request messages for the next iteration
+            request.messages = self.state.messages.clone();
+
+            // If the finish reason is Stop or Length (and we had tool calls handled above),
+            // continue the loop. The loop will naturally terminate when no tool calls are
+            // present in the response.
+        }
+
+        self.state.phase = SessionPhase::Completed;
+
+        let turns_used = self.state.turn_number - turn_start;
+
+        // Emit session completed
+        self.event_emitter.emit(SessionEvent::SessionCompleted {
+            session_id: self.state.session_id.clone(),
+            total_turns: self.state.turn_number,
+            total_usage: self.state.total_usage.clone(),
+        });
+
+        Ok(SessionOutput {
+            text: final_text,
+            turns_used,
+            total_usage: self.state.total_usage.clone(),
+        })
+    }
+
+    /// Queue a steering message to be injected before the next LLM call.
+    pub fn steer(&mut self, text: &str) {
+        self.state.queue_steering(text);
+    }
+
+    /// Queue a follow-up message (semantically different from steering but mechanically identical).
+    pub fn follow_up(&mut self, text: &str) {
+        self.state.queue_steering(text);
+    }
+
+    /// Return the unique session identifier.
+    pub fn session_id(&self) -> &str {
+        &self.state.session_id
+    }
+
+    /// Return whether the session is still active.
+    pub fn is_active(&self) -> bool {
+        self.state.active
+    }
+
+    /// Return the current turn count.
+    pub fn turn_count(&self) -> u32 {
+        self.state.turn_number
+    }
+
+    /// Return a reference to accumulated token usage.
+    pub fn total_usage(&self) -> &smasher_llm::types::Usage {
+        &self.state.total_usage
+    }
+
+    /// Return a slice of all messages in the conversation.
+    pub fn messages(&self) -> &[smasher_llm::types::Message] {
+        &self.state.messages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use smasher_llm::provider::{ProviderAdapter, StreamResponse};
+    use smasher_llm::types::{
+        ContentPart, Error as LlmError, FinishReason, Provider, Request, Response,
+        ToolCallData, Usage,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use crate::tools::{AgentTool, ToolOutput};
+
+    // ── Mock provider adapter ────────────────────────────────────────
+
+    struct MockAdapter {
+        responses: Arc<Mutex<VecDeque<Response>>>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for MockAdapter {
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+
+        async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
+            let mut queue = self.responses.lock().unwrap();
+            queue.pop_front().ok_or_else(|| LlmError::Other {
+                message: "no more mock responses".into(),
+                retryable: false,
+            })
+        }
+
+        async fn stream(&self, _request: &Request) -> Result<StreamResponse, LlmError> {
+            Err(LlmError::Other {
+                message: "streaming not implemented in mock".into(),
+                retryable: false,
+            })
+        }
+    }
+
+    // ── Mock tool ────────────────────────────────────────────────────
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl AgentTool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes input back"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(&self, arguments: &str) -> ToolOutput {
+            let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+            let text = v["text"].as_str().unwrap_or("no text");
+            ToolOutput::success(text, 1)
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    fn text_response(text: &str) -> Response {
+        Response {
+            id: "resp_text".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            content: vec![ContentPart::text(text)],
+            finish_reason: Some(FinishReason::Stop),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                raw: None,
+            },
+            warnings: vec![],
+            rate_limit: None,
+            provider: None,
+            raw: None,
+        }
+    }
+
+    fn tool_call_response(tool_name: &str, tool_call_id: &str, arguments: &str) -> Response {
+        Response {
+            id: "resp_tool".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            content: vec![ContentPart::ToolCall(ToolCallData {
+                id: tool_call_id.into(),
+                name: tool_name.into(),
+                arguments: arguments.into(),
+                raw_arguments: None,
+            })],
+            finish_reason: Some(FinishReason::ToolUse),
+            usage: Usage {
+                input_tokens: 15,
+                output_tokens: 25,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                raw: None,
+            },
+            warnings: vec![],
+            rate_limit: None,
+            provider: None,
+            raw: None,
+        }
+    }
+
+    fn multi_tool_call_response() -> Response {
+        Response {
+            id: "resp_multi".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            content: vec![
+                ContentPart::ToolCall(ToolCallData {
+                    id: "call_a".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"first"}"#.into(),
+                    raw_arguments: None,
+                }),
+                ContentPart::ToolCall(ToolCallData {
+                    id: "call_b".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"second"}"#.into(),
+                    raw_arguments: None,
+                }),
+            ],
+            finish_reason: Some(FinishReason::ToolUse),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 30,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                raw: None,
+            },
+            warnings: vec![],
+            rate_limit: None,
+            provider: None,
+            raw: None,
+        }
+    }
+
+    fn make_client(responses: VecDeque<Response>) -> Arc<smasher_llm::client::Client> {
+        let response_queue = Arc::new(Mutex::new(responses));
+        let adapter = MockAdapter {
+            responses: response_queue,
+        };
+        let mut client = smasher_llm::client::Client::new();
+        client.register_provider(Provider::Anthropic, Arc::new(adapter));
+        Arc::new(client)
+    }
+
+    fn make_session(responses: VecDeque<Response>) -> Session {
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default();
+        Session::new(config, client, tool_registry, event_emitter)
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────
+
+    // ── SessionOutput ────────────────────────────────────────────────
+
+    #[test]
+    fn session_output_with_text() {
+        let output = SessionOutput {
+            text: Some("Hello".into()),
+            turns_used: 3,
+            total_usage: Usage {
+                input_tokens: 100,
+                output_tokens: 200,
+                cache_read_tokens: Some(10),
+                cache_creation_tokens: None,
+                reasoning_tokens: Some(50),
+                total_tokens: None,
+                raw: None,
+            },
+        };
+        assert_eq!(output.text.as_deref(), Some("Hello"));
+        assert_eq!(output.turns_used, 3);
+        assert_eq!(output.total_usage.input_tokens, 100);
+        assert_eq!(output.total_usage.output_tokens, 200);
+        assert_eq!(output.total_usage.cache_read_tokens, Some(10));
+        assert_eq!(output.total_usage.reasoning_tokens, Some(50));
+    }
+
+    #[test]
+    fn session_output_with_no_text() {
+        let output = SessionOutput {
+            text: None,
+            turns_used: 0,
+            total_usage: Usage::default(),
+        };
+        assert!(output.text.is_none());
+        assert_eq!(output.turns_used, 0);
+        assert_eq!(output.total_usage.input_tokens, 0);
+        assert_eq!(output.total_usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn session_output_debug_is_implemented() {
+        let output = SessionOutput {
+            text: Some("test".into()),
+            turns_used: 1,
+            total_usage: Usage::default(),
+        };
+        let debug_str = format!("{:?}", output);
+        assert!(debug_str.contains("SessionOutput"));
+        assert!(debug_str.contains("test"));
+    }
+
+    // ── SessionError ─────────────────────────────────────────────────
+
+    #[test]
+    fn session_error_inactive_display() {
+        let err = SessionError::Inactive;
+        assert_eq!(err.to_string(), "session is no longer active");
+    }
+
+    #[test]
+    fn session_error_turn_limit_display() {
+        let err = SessionError::TurnLimitReached(42);
+        assert_eq!(err.to_string(), "turn limit reached (42 turns)");
+    }
+
+    #[test]
+    fn session_error_other_display() {
+        let err = SessionError::Other("something custom".into());
+        assert_eq!(err.to_string(), "something custom");
+    }
+
+    #[test]
+    fn session_error_llm_display() {
+        let llm_err = LlmError::RateLimited {
+            provider: "anthropic".into(),
+            retry_after_ms: Some(5000),
+        };
+        let err = SessionError::Llm(llm_err);
+        let display = err.to_string();
+        assert!(display.contains("LLM error"));
+        assert!(display.contains("anthropic"));
+    }
+
+    #[test]
+    fn session_error_from_llm_error() {
+        let llm_err = LlmError::Timeout {
+            provider: "openai".into(),
+            timeout_ms: 30000,
+        };
+        let session_err: SessionError = llm_err.into();
+        assert!(matches!(session_err, SessionError::Llm(_)));
+    }
+
+    #[test]
+    fn session_error_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SessionError>();
+    }
+
+    #[test]
+    fn session_error_turn_limit_zero() {
+        let err = SessionError::TurnLimitReached(0);
+        assert_eq!(err.to_string(), "turn limit reached (0 turns)");
+    }
+
+    #[test]
+    fn session_error_other_empty_string() {
+        let err = SessionError::Other(String::new());
+        assert_eq!(err.to_string(), "");
+    }
+
+    // ── Session::new() construction ──────────────────────────────────
+
+    #[test]
+    fn session_new_creates_session_with_id() {
+        let session = make_session(VecDeque::new());
+        assert!(!session.session_id().is_empty());
+        assert!(session.is_active());
+        assert_eq!(session.turn_count(), 0);
+        assert_eq!(session.total_usage().input_tokens, 0);
+        assert_eq!(session.total_usage().output_tokens, 0);
+        assert!(session.messages().is_empty());
+    }
+
+    #[test]
+    fn session_new_with_custom_model() {
+        let client = make_client(VecDeque::new());
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_model("gpt-4o");
+        let session = Session::new(config, client, tool_registry, event_emitter);
+
+        assert!(session.is_active());
+        assert_eq!(session.turn_count(), 0);
+    }
+
+    #[test]
+    fn session_new_with_custom_system_prompt() {
+        let client = make_client(VecDeque::new());
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_system_prompt("Be brief.");
+        let session = Session::new(config, client, tool_registry, event_emitter);
+
+        assert!(session.is_active());
+        assert!(session.messages().is_empty());
+    }
+
+    #[test]
+    fn session_new_with_empty_tool_registry() {
+        let client = make_client(VecDeque::new());
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default();
+        let session = Session::new(config, client, tool_registry, event_emitter);
+
+        assert!(session.is_active());
+        assert_eq!(session.turn_count(), 0);
+    }
+
+    #[test]
+    fn session_new_generates_unique_ids() {
+        let s1 = make_session(VecDeque::new());
+        let s2 = make_session(VecDeque::new());
+        assert_ne!(
+            s1.session_id(),
+            s2.session_id(),
+            "Two sessions should have different IDs"
+        );
+    }
+
+    #[test]
+    fn session_id_returns_valid_uuid_format() {
+        let session = make_session(VecDeque::new());
+        let id = session.session_id();
+        // UUID v4 format: 8-4-4-4-12 hex chars
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+        // Verify it parses as a valid UUID
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+    }
+
+    // ── Session state accessors ──────────────────────────────────────
+
+    #[test]
+    fn total_usage_returns_default_on_fresh_session() {
+        let session = make_session(VecDeque::new());
+        let usage = session.total_usage();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert!(usage.cache_read_tokens.is_none());
+        assert!(usage.cache_creation_tokens.is_none());
+        assert!(usage.reasoning_tokens.is_none());
+    }
+
+    #[test]
+    fn messages_returns_empty_on_fresh_session() {
+        let session = make_session(VecDeque::new());
+        assert!(session.messages().is_empty());
+    }
+
+    // ── steer() and follow_up() ──────────────────────────────────────
+
+    #[test]
+    fn steer_queues_steering_message() {
+        let mut session = make_session(VecDeque::new());
+        session.steer("Focus on tests");
+
+        assert_eq!(session.state.steering_queue.len(), 1);
+        assert_eq!(session.state.steering_queue[0], "Focus on tests");
+    }
+
+    #[test]
+    fn steer_queues_multiple_messages() {
+        let mut session = make_session(VecDeque::new());
+        session.steer("First instruction");
+        session.steer("Second instruction");
+        session.steer("Third instruction");
+
+        assert_eq!(session.state.steering_queue.len(), 3);
+        assert_eq!(session.state.steering_queue[0], "First instruction");
+        assert_eq!(session.state.steering_queue[1], "Second instruction");
+        assert_eq!(session.state.steering_queue[2], "Third instruction");
+    }
+
+    #[test]
+    fn follow_up_queues_message_like_steer() {
+        let mut session = make_session(VecDeque::new());
+        session.follow_up("Please elaborate on that");
+
+        assert_eq!(session.state.steering_queue.len(), 1);
+        assert_eq!(
+            session.state.steering_queue[0],
+            "Please elaborate on that"
+        );
+    }
+
+    #[test]
+    fn steer_and_follow_up_share_same_queue() {
+        let mut session = make_session(VecDeque::new());
+        session.steer("Steering first");
+        session.follow_up("Follow up second");
+
+        assert_eq!(session.state.steering_queue.len(), 2);
+        assert_eq!(session.state.steering_queue[0], "Steering first");
+        assert_eq!(session.state.steering_queue[1], "Follow up second");
+    }
+
+    // ── process_input: simple text response ──────────────────────────
+
+    #[tokio::test]
+    async fn process_input_with_simple_text_response() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Hello, Doctor Biz!"));
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Hello").await.unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("Hello, Doctor Biz!"));
+        assert_eq!(output.turns_used, 1);
+        assert_eq!(output.total_usage.input_tokens, 10);
+        assert_eq!(output.total_usage.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn process_input_adds_user_message_to_conversation() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Got it."));
+
+        let mut session = make_session(responses);
+        session.process_input("Hello agent").await.unwrap();
+
+        let messages = session.messages();
+        // Should have user message + assistant response
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].is_user());
+        assert_eq!(messages[0].text(), Some("Hello agent".to_string()));
+        assert!(messages[1].is_assistant());
+    }
+
+    #[tokio::test]
+    async fn process_input_increments_turn_count() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("One."));
+
+        let mut session = make_session(responses);
+        assert_eq!(session.turn_count(), 0);
+
+        session.process_input("First").await.unwrap();
+        assert_eq!(session.turn_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_input_accumulates_usage_across_calls() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("First response."));
+        responses.push_back(text_response("Second response."));
+
+        let mut session = make_session(responses);
+
+        session.process_input("First").await.unwrap();
+        assert_eq!(session.total_usage().input_tokens, 10);
+        assert_eq!(session.total_usage().output_tokens, 20);
+
+        session.process_input("Second").await.unwrap();
+        assert_eq!(session.total_usage().input_tokens, 20);
+        assert_eq!(session.total_usage().output_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn process_input_preserves_conversation_across_calls() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Reply 1."));
+        responses.push_back(text_response("Reply 2."));
+
+        let mut session = make_session(responses);
+
+        session.process_input("Message 1").await.unwrap();
+        session.process_input("Message 2").await.unwrap();
+
+        let messages = session.messages();
+        // User1, Assistant1, User2, Assistant2
+        assert_eq!(messages.len(), 4);
+        assert!(messages[0].is_user());
+        assert_eq!(messages[0].text(), Some("Message 1".to_string()));
+        assert!(messages[1].is_assistant());
+        assert!(messages[2].is_user());
+        assert_eq!(messages[2].text(), Some("Message 2".to_string()));
+        assert!(messages[3].is_assistant());
+    }
+
+    // ── process_input: tool call loop ────────────────────────────────
+
+    #[tokio::test]
+    async fn process_input_with_tool_call_executes_tool_and_loops() {
+        let mut responses = VecDeque::new();
+        // First response: tool call
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_1",
+            r#"{"text":"echoed"}"#,
+        ));
+        // Second response: final text
+        responses.push_back(text_response("Done processing tool."));
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Use the echo tool").await.unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("Done processing tool."));
+        // Two LLM calls = 2 turns
+        assert_eq!(output.turns_used, 2);
+    }
+
+    #[tokio::test]
+    async fn process_input_tool_call_adds_tool_result_to_messages() {
+        let mut responses = VecDeque::new();
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_42",
+            r#"{"text":"hi"}"#,
+        ));
+        responses.push_back(text_response("Done."));
+
+        let mut session = make_session(responses);
+        session.process_input("Call echo").await.unwrap();
+
+        // Should have: user, assistant (tool call), tool result, assistant (text)
+        let messages = session.messages();
+        assert_eq!(messages.len(), 4);
+        assert!(messages[0].is_user());
+        assert!(messages[1].is_assistant());
+        assert!(messages[2].is_tool());
+        assert!(messages[3].is_assistant());
+    }
+
+    #[tokio::test]
+    async fn process_input_with_chained_tool_calls() {
+        let mut responses = VecDeque::new();
+        // Tool call 1
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_1",
+            r#"{"text":"first"}"#,
+        ));
+        // Tool call 2
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_2",
+            r#"{"text":"second"}"#,
+        ));
+        // Final text
+        responses.push_back(text_response("All done."));
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Chain tools").await.unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("All done."));
+        assert_eq!(output.turns_used, 3);
+        assert_eq!(session.turn_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn process_input_accumulates_usage_across_tool_loop() {
+        let mut responses = VecDeque::new();
+        // Tool call response: input=15, output=25
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_1",
+            r#"{"text":"x"}"#,
+        ));
+        // Final text: input=10, output=20
+        responses.push_back(text_response("Done."));
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Go").await.unwrap();
+
+        assert_eq!(output.total_usage.input_tokens, 25);
+        assert_eq!(output.total_usage.output_tokens, 45);
+    }
+
+    // ── process_input: turn limit ────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_input_respects_turn_limit() {
+        // Respond with tool calls every time to force hitting the limit
+        let mut responses = VecDeque::new();
+        for i in 0..5 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"loop"}"#,
+            ));
+        }
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_max_turns(2);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let result = session.process_input("Loop forever").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SessionError::TurnLimitReached(limit) => assert_eq!(limit, 2),
+            other => panic!("Expected TurnLimitReached, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_becomes_inactive_after_turn_limit() {
+        let mut responses = VecDeque::new();
+        for i in 0..5 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"loop"}"#,
+            ));
+        }
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_max_turns(1);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Go").await;
+        assert!(
+            !session.is_active(),
+            "Session should be inactive after hitting turn limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_session_rejects_further_input() {
+        let mut responses = VecDeque::new();
+        for i in 0..5 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"loop"}"#,
+            ));
+        }
+        responses.push_back(text_response("Should never reach this."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_max_turns(1);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        // First call hits turn limit
+        let _ = session.process_input("First").await;
+        // Second call should fail as Inactive
+        let result = session.process_input("Second").await;
+        assert!(matches!(result.unwrap_err(), SessionError::Inactive));
+    }
+
+    // ── process_input: inactive session ──────────────────────────────
+
+    #[tokio::test]
+    async fn process_input_on_inactive_session_returns_error() {
+        let mut session = make_session(VecDeque::new());
+        session.state.active = false;
+
+        let result = session.process_input("Should fail").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SessionError::Inactive => {} // expected
+            other => panic!("Expected Inactive, got: {:?}", other),
+        }
+    }
+
+    // ── process_input: LLM error propagation ─────────────────────────
+
+    #[tokio::test]
+    async fn process_input_propagates_llm_errors() {
+        // Empty response queue causes an error from the mock adapter
+        let mut session = make_session(VecDeque::new());
+
+        let result = session.process_input("Trigger error").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SessionError::Llm(_) => {} // expected: error from mock adapter
+            other => panic!("Expected Llm error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_remains_active_after_llm_error() {
+        let mut session = make_session(VecDeque::new());
+
+        let _ = session.process_input("Trigger error").await;
+        // Session should still be active because the LLM error doesn't disable it
+        assert!(
+            session.is_active(),
+            "Session should remain active after a transient LLM error"
+        );
+    }
+
+    // ── process_input: unknown tool ──────────────────────────────────
+
+    #[tokio::test]
+    async fn process_input_handles_unknown_tool_gracefully() {
+        let mut responses = VecDeque::new();
+        // LLM tries to call a tool that doesn't exist
+        responses.push_back(tool_call_response(
+            "nonexistent_tool",
+            "call_bad",
+            r#"{}"#,
+        ));
+        // After the error result, LLM produces final text
+        responses.push_back(text_response("I see the tool failed."));
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Call fake tool").await.unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("I see the tool failed."));
+
+        // There should be a tool result message with is_error = true
+        let tool_msgs: Vec<_> = session.messages().iter().filter(|m| m.is_tool()).collect();
+        assert_eq!(tool_msgs.len(), 1, "Should have one tool result message");
+    }
+
+    // ── process_input: steering integration ──────────────────────────
+
+    #[tokio::test]
+    async fn steering_is_applied_before_llm_call() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Acknowledged steering."));
+
+        let mut session = make_session(responses);
+        session.steer("Be concise");
+        let output = session.process_input("What is Rust?").await.unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("Acknowledged steering."));
+
+        // Verify steering message is in the conversation messages
+        let messages = session.messages();
+        let has_steering = messages.iter().any(|m| {
+            m.is_user() && m.text() == Some("Be concise".to_string())
+        });
+        assert!(has_steering, "Steering message should be in conversation");
+    }
+
+    #[tokio::test]
+    async fn steering_is_drained_after_application() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("First."));
+        responses.push_back(text_response("Second."));
+
+        let mut session = make_session(responses);
+        session.steer("Focus on tests");
+
+        session.process_input("First call").await.unwrap();
+        // Steering should be consumed
+        assert!(
+            session.state.steering_queue.is_empty(),
+            "Steering queue should be empty after being applied"
+        );
+
+        session.process_input("Second call").await.unwrap();
+        // Second call should not have the steering message
+        let messages_after_second = session.messages();
+        let steering_count = messages_after_second
+            .iter()
+            .filter(|m| m.is_user() && m.text() == Some("Focus on tests".to_string()))
+            .count();
+        assert_eq!(
+            steering_count, 1,
+            "Steering message should only appear once"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_steering_messages_all_applied() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Done."));
+
+        let mut session = make_session(responses);
+        session.steer("Instruction one");
+        session.steer("Instruction two");
+
+        session.process_input("Go").await.unwrap();
+
+        let messages = session.messages();
+        let steering_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                m.is_user()
+                    && (m.text() == Some("Instruction one".to_string())
+                        || m.text() == Some("Instruction two".to_string()))
+            })
+            .collect();
+        assert_eq!(
+            steering_msgs.len(),
+            2,
+            "Both steering messages should be in conversation"
+        );
+    }
+
+    // ── process_input: events ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn events_are_emitted_during_process_input() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Event test."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Hi").await.unwrap();
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Verify TurnStarted is emitted
+        let has_turn_started = events.iter().any(|e| {
+            matches!(e, SessionEvent::TurnStarted { .. })
+        });
+        assert!(has_turn_started, "TurnStarted event should be emitted");
+
+        // Verify AssistantMessage is emitted
+        let has_assistant_msg = events.iter().any(|e| {
+            matches!(e, SessionEvent::AssistantMessage { .. })
+        });
+        assert!(has_assistant_msg, "AssistantMessage event should be emitted");
+
+        // Verify SessionCompleted is emitted
+        let has_completed = events.iter().any(|e| {
+            matches!(e, SessionEvent::SessionCompleted { .. })
+        });
+        assert!(has_completed, "SessionCompleted event should be emitted");
+    }
+
+    #[tokio::test]
+    async fn event_order_for_simple_text_response() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Ok."));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Hello").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Expected order: TurnStarted -> AssistantMessage -> SessionCompleted
+        assert!(events.len() >= 3, "Should have at least 3 events, got {}", events.len());
+        assert!(
+            matches!(events[0], SessionEvent::TurnStarted { turn_number: 0 }),
+            "First event should be TurnStarted, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(events[1], SessionEvent::AssistantMessage { .. }),
+            "Second event should be AssistantMessage, got {:?}",
+            events[1]
+        );
+        let last = events.last().unwrap();
+        assert!(
+            matches!(last, SessionEvent::SessionCompleted { .. }),
+            "Last event should be SessionCompleted, got {:?}",
+            last
+        );
+    }
+
+    #[tokio::test]
+    async fn events_include_tool_call_details() {
+        let mut responses = VecDeque::new();
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_xyz",
+            r#"{"text":"hi"}"#,
+        ));
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Use echo").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Verify ToolCallStarted has correct fields
+        let started = events.iter().find(|e| {
+            matches!(e, SessionEvent::ToolCallStarted { .. })
+        });
+        assert!(started.is_some(), "Should have ToolCallStarted event");
+        if let Some(SessionEvent::ToolCallStarted {
+            tool_name,
+            tool_call_id,
+        }) = started
+        {
+            assert_eq!(tool_name, "echo");
+            assert_eq!(tool_call_id, "call_xyz");
+        }
+
+        // Verify ToolCallCompleted has correct fields
+        let completed = events.iter().find(|e| {
+            matches!(e, SessionEvent::ToolCallCompleted { .. })
+        });
+        assert!(completed.is_some(), "Should have ToolCallCompleted event");
+        if let Some(SessionEvent::ToolCallCompleted {
+            tool_name,
+            tool_call_id,
+            result,
+            is_error,
+            ..
+        }) = completed
+        {
+            assert_eq!(tool_name, "echo");
+            assert_eq!(tool_call_id, "call_xyz");
+            assert_eq!(result, "hi");
+            assert!(!is_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_applied_event_is_emitted() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Ok."));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.steer("Be verbose");
+        session.process_input("Tell me about Rust").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let steering_event = events.iter().find(|e| {
+            matches!(e, SessionEvent::SteeringApplied { .. })
+        });
+        assert!(
+            steering_event.is_some(),
+            "SteeringApplied event should be emitted"
+        );
+        if let Some(SessionEvent::SteeringApplied { text }) = steering_event {
+            assert_eq!(text, "Be verbose");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_completed_event_contains_correct_totals() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Hi").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let completed = events.iter().find(|e| {
+            matches!(e, SessionEvent::SessionCompleted { .. })
+        });
+        assert!(completed.is_some());
+        if let Some(SessionEvent::SessionCompleted {
+            session_id,
+            total_turns,
+            total_usage,
+        }) = completed
+        {
+            assert_eq!(session_id, session.session_id());
+            assert_eq!(*total_turns, 1);
+            assert_eq!(total_usage.input_tokens, 10);
+            assert_eq!(total_usage.output_tokens, 20);
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_limit_emits_session_completed_event() {
+        let mut responses = VecDeque::new();
+        for i in 0..5 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"x"}"#,
+            ));
+        }
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default().with_max_turns(1);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Go").await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let has_completed = events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SessionCompleted { .. }));
+        assert!(
+            has_completed,
+            "SessionCompleted should be emitted even on turn limit"
+        );
+    }
+
+    // ── process_input: multiple tool calls ───────────────────────────
+
+    #[tokio::test]
+    async fn multiple_tool_calls_in_one_response_are_all_executed() {
+        let mut responses = VecDeque::new();
+        // First: multiple tool calls in one response
+        responses.push_back(multi_tool_call_response());
+        // Then: final text
+        responses.push_back(text_response("Both tools executed."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let output = session
+            .process_input("Call both tools")
+            .await
+            .unwrap();
+
+        assert_eq!(output.text.as_deref(), Some("Both tools executed."));
+
+        // Collect events and count ToolCallCompleted
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let tool_completed_count = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolCallCompleted { .. }))
+            .count();
+        assert_eq!(
+            tool_completed_count, 2,
+            "Both tool calls should have completed"
+        );
+
+        // Verify tool results are in conversation (two tool result messages)
+        let tool_result_count = session
+            .messages()
+            .iter()
+            .filter(|m| m.is_tool())
+            .count();
+        assert_eq!(tool_result_count, 2, "Both tool results should be in messages");
+    }
+
+    #[tokio::test]
+    async fn multiple_tool_calls_emit_started_and_completed_for_each() {
+        let mut responses = VecDeque::new();
+        responses.push_back(multi_tool_call_response());
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Go").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let started_count = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(started_count, 2, "Should have 2 ToolCallStarted events");
+
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolCallCompleted { .. }))
+            .count();
+        assert_eq!(completed_count, 2, "Should have 2 ToolCallCompleted events");
+    }
+
+    // ── process_input: custom system prompt override ─────────────────
+
+    #[tokio::test]
+    async fn custom_system_prompt_is_used() {
+        // This test verifies that the session can be created and works
+        // when a custom system prompt is set (the prompt is passed to the LLM request)
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Custom prompt acknowledged."));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default()
+            .with_system_prompt("You are a pirate. Only speak in pirate language.");
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let output = session.process_input("Hello").await.unwrap();
+        assert_eq!(
+            output.text.as_deref(),
+            Some("Custom prompt acknowledged.")
+        );
+    }
+
+    // ── process_input: no text in response ───────────────────────────
+
+    #[tokio::test]
+    async fn process_input_with_no_text_in_response() {
+        // Response has no text content parts (only empty content)
+        let response = Response {
+            id: "resp_empty".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            content: vec![],
+            finish_reason: Some(FinishReason::Stop),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 0,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                raw: None,
+            },
+            warnings: vec![],
+            rate_limit: None,
+            provider: None,
+            raw: None,
+        };
+
+        let mut responses = VecDeque::new();
+        responses.push_back(response);
+
+        let mut session = make_session(responses);
+        let output = session.process_input("Hello").await.unwrap();
+
+        assert!(
+            output.text.is_none(),
+            "Output text should be None when response has no text"
+        );
+        assert_eq!(output.turns_used, 1);
+    }
+
+    // ── Session with config variations ───────────────────────────────
+
+    #[tokio::test]
+    async fn session_with_temperature_and_max_tokens() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Configured."));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default()
+            .with_temperature(0.5)
+            .with_max_tokens(4096);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let output = session.process_input("Test").await.unwrap();
+        assert_eq!(output.text.as_deref(), Some("Configured."));
+    }
+
+    // ── CancellationToken ───────────────────────────────────────────
+
+    #[test]
+    fn session_has_cancel_token_by_default() {
+        let session = make_session(VecDeque::new());
+        let token = session.cancel_token();
+        assert!(
+            !token.is_cancelled(),
+            "Token should not be cancelled initially"
+        );
+    }
+
+    #[test]
+    fn cancel_sets_cancellation_token() {
+        let session = make_session(VecDeque::new());
+        let token = session.cancel_token();
+        assert!(!token.is_cancelled());
+
+        session.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn with_cancel_token_replaces_default_token() {
+        use tokio_util::sync::CancellationToken;
+
+        let external_token = CancellationToken::new();
+        let session = make_session(VecDeque::new()).with_cancel_token(external_token.clone());
+
+        assert!(!external_token.is_cancelled());
+        session.cancel();
+        assert!(external_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_causes_loop_to_exit_before_llm_call() {
+        // Queue up a response that would succeed if reached
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Should not reach this."));
+
+        let mut session = make_session(responses);
+        // Cancel before process_input
+        session.cancel();
+
+        let result = session.process_input("Hello").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SessionError::Cancelled => {}
+            other => panic!("Expected Cancelled, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_causes_loop_to_exit_before_tool_execution() {
+        // First response triggers a tool call; cancel before tools run
+        let mut responses = VecDeque::new();
+        responses.push_back(tool_call_response(
+            "echo",
+            "call_1",
+            r#"{"text":"should not run"}"#,
+        ));
+        responses.push_back(text_response("Should not reach this."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default();
+
+        let external_token = tokio_util::sync::CancellationToken::new();
+        let mut session = Session::new(config, client, tool_registry, event_emitter)
+            .with_cancel_token(external_token.clone());
+
+        // Spawn a task that cancels after a very short delay
+        let token_clone = external_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            token_clone.cancel();
+        });
+
+        // Give the cancel a moment to fire, then call process_input
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let result = session.process_input("Use the tool").await;
+        assert!(
+            matches!(result, Err(SessionError::Cancelled)),
+            "Expected Cancelled error, got: {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn session_becomes_inactive_after_cancellation() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Should not reach."));
+
+        let mut session = make_session(responses);
+        session.cancel();
+
+        let _ = session.process_input("Hello").await;
+        assert!(
+            !session.is_active(),
+            "Session should be inactive after cancellation"
+        );
+    }
+
+    #[test]
+    fn session_error_cancelled_display() {
+        let err = SessionError::Cancelled;
+        assert_eq!(err.to_string(), "session cancelled");
+    }
+
+    // ── SessionPhase in session context ──────────────────────────────
+
+    #[test]
+    fn session_phase_starts_active() {
+        let session = make_session(VecDeque::new());
+        assert_eq!(session.state.phase, SessionPhase::Active);
+    }
+
+    #[tokio::test]
+    async fn session_phase_becomes_completed_after_turn_limit() {
+        let mut responses = VecDeque::new();
+        for i in 0..5 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"loop"}"#,
+            ));
+        }
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_max_turns(1);
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Go").await;
+        assert_eq!(
+            session.state.phase,
+            SessionPhase::Completed,
+            "Phase should be Completed after hitting turn limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_phase_becomes_completed_after_cancellation() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Nope."));
+
+        let mut session = make_session(responses);
+        session.cancel();
+
+        let _ = session.process_input("Go").await;
+        assert_eq!(
+            session.state.phase,
+            SessionPhase::Completed,
+            "Phase should be Completed after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_phase_becomes_completed_after_normal_completion() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("All done."));
+
+        let mut session = make_session(responses);
+        session.process_input("Hello").await.unwrap();
+        assert_eq!(
+            session.state.phase,
+            SessionPhase::Completed,
+            "Phase should be Completed after normal completion"
+        );
+    }
+
+    #[test]
+    fn session_phase_can_be_set_to_awaiting_input() {
+        let mut session = make_session(VecDeque::new());
+        session.state.phase = SessionPhase::AwaitingInput;
+        assert_eq!(session.state.phase, SessionPhase::AwaitingInput);
+    }
+
+    #[test]
+    fn session_phase_awaiting_input_to_active_transition() {
+        let mut session = make_session(VecDeque::new());
+        session.state.phase = SessionPhase::AwaitingInput;
+        assert_eq!(session.state.phase, SessionPhase::AwaitingInput);
+
+        session.state.phase = SessionPhase::Active;
+        assert_eq!(session.state.phase, SessionPhase::Active);
+    }
+}
