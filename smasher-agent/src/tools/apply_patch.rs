@@ -71,10 +71,8 @@ impl AgentTool for ApplyPatchTool {
 
         for fp in &file_patches {
             if fp.is_deleted {
-                // Delete the file by writing empty content (the environment doesn't
-                // expose a delete operation, so we write an empty file as a signal).
                 let path = &fp.original_path;
-                match self.env.write_file(path, "").await {
+                match self.env.delete_file(path).await {
                     Ok(()) => results.push(format!("Deleted {path}")),
                     Err(e) => {
                         return ToolOutput::error(
@@ -94,10 +92,7 @@ impl AgentTool for ApplyPatchTool {
                 match self.env.read_file(path).await {
                     Ok(c) => c,
                     Err(e) => {
-                        return ToolOutput::error(
-                            format!("Failed to read {path}: {e}"),
-                            elapsed(),
-                        );
+                        return ToolOutput::error(format!("Failed to read {path}: {e}"), elapsed());
                     }
                 }
             };
@@ -121,10 +116,7 @@ impl AgentTool for ApplyPatchTool {
                     }
                 }
                 Err(e) => {
-                    return ToolOutput::error(
-                        format!("Failed to write {path}: {e}"),
-                        elapsed(),
-                    );
+                    return ToolOutput::error(format!("Failed to write {path}: {e}"), elapsed());
                 }
             }
         }
@@ -186,8 +178,7 @@ pub fn parse_patch(patch: &str) -> Result<Vec<FilePatch>, String> {
 
     while i < lines.len() {
         // Look for the start of a file diff: a `---` line followed by a `+++` line.
-        if lines[i].starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ")
-        {
+        if lines[i].starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ") {
             let orig_raw = lines[i].trim_start_matches("--- ").trim();
             let mod_raw = lines[i + 1].trim_start_matches("+++ ").trim();
 
@@ -247,9 +238,7 @@ pub fn parse_patch(patch: &str) -> Result<Vec<FilePatch>, String> {
                         modified_count: hunk.3,
                         lines: hunk_lines,
                     });
-                } else if lines[i].starts_with("--- ")
-                    || lines[i].starts_with("diff ")
-                {
+                } else if lines[i].starts_with("--- ") || lines[i].starts_with("diff ") {
                     // Start of a new file diff -- stop collecting hunks.
                     break;
                 } else {
@@ -479,9 +468,7 @@ fn find_hunk_position(
             return Ok(expected_start + delta);
         }
         // Check above.
-        if delta <= expected_start
-            && matches_at(orig_lines, expected_start - delta, &match_lines)
-        {
+        if delta <= expected_start && matches_at(orig_lines, expected_start - delta, &match_lines) {
             return Ok(expected_start - delta);
         }
     }
@@ -591,6 +578,17 @@ mod tests {
 
         fn working_directory(&self) -> &str {
             &self.working_dir
+        }
+
+        async fn delete_file(&self, path: &str) -> Result<(), EnvironmentError> {
+            let mut files = self.files.lock().unwrap();
+            if files.remove(path).is_some() {
+                Ok(())
+            } else {
+                Err(EnvironmentError::FileNotFound {
+                    path: path.to_string(),
+                })
+            }
         }
 
         async fn path_exists(&self, path: &str) -> bool {
@@ -938,12 +936,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_tool_delete_removes_file() {
+        let mock =
+            Arc::new(MockEnvironment::new().with_file("old_file.txt", "this will be deleted\n"));
+        let env: Arc<dyn ExecutionEnvironment> = Arc::clone(&mock) as Arc<dyn ExecutionEnvironment>;
+        let tool = ApplyPatchTool::new(env);
+
+        // Verify the file exists before deletion.
+        assert!(mock.read("old_file.txt").is_some());
+
+        let patch_json = serde_json::json!({
+            "patch": "--- a/old_file.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-this will be deleted\n"
+        });
+
+        let result = tool.execute(&patch_json.to_string()).await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains("Deleted old_file.txt"));
+
+        // Verify the file has been removed, not just emptied.
+        assert!(
+            mock.read("old_file.txt").is_none(),
+            "file should be removed, not just emptied"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_tool_name_and_schema() {
         let env: Arc<dyn ExecutionEnvironment> = Arc::new(MockEnvironment::new());
         let tool = ApplyPatchTool::new(env);
 
         assert_eq!(tool.name(), "apply_patch");
-        assert_eq!(tool.description(), "Apply a unified diff patch to one or more files");
+        assert_eq!(
+            tool.description(),
+            "Apply a unified diff patch to one or more files"
+        );
 
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");

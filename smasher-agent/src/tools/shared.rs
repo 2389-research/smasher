@@ -221,17 +221,12 @@ impl AgentTool for EditFileTool {
         let match_count = content.matches(old_string).count();
 
         if match_count == 0 {
-            return ToolOutput::error(
-                format!("old_string not found in {path}"),
-                elapsed(),
-            );
+            return ToolOutput::error(format!("old_string not found in {path}"), elapsed());
         }
 
         if match_count > 1 {
             return ToolOutput::error(
-                format!(
-                    "old_string is ambiguous: found {match_count} occurrences in {path}"
-                ),
+                format!("old_string is ambiguous: found {match_count} occurrences in {path}"),
                 elapsed(),
             );
         }
@@ -403,10 +398,7 @@ impl AgentTool for GrepTool {
             Err(e) => return e,
         };
 
-        let search_path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let options = GrepOptions {
             file_pattern: args
@@ -510,10 +502,7 @@ impl AgentTool for GlobTool {
 // ---------------------------------------------------------------------------
 
 /// Register all six shared tools with the given registry.
-pub fn register_shared_tools(
-    registry: &mut ToolRegistry,
-    env: Arc<dyn ExecutionEnvironment>,
-) {
+pub fn register_shared_tools(registry: &mut ToolRegistry, env: Arc<dyn ExecutionEnvironment>) {
     registry.register(ReadFileTool::new(Arc::clone(&env)));
     registry.register(WriteFileTool::new(Arc::clone(&env)));
     registry.register(EditFileTool::new(Arc::clone(&env)));
@@ -636,6 +625,17 @@ mod tests {
             &self.working_dir
         }
 
+        async fn delete_file(&self, path: &str) -> Result<(), EnvironmentError> {
+            let mut files = self.files.lock().unwrap();
+            if files.remove(path).is_some() {
+                Ok(())
+            } else {
+                Err(EnvironmentError::FileNotFound {
+                    path: path.to_string(),
+                })
+            }
+        }
+
         async fn path_exists(&self, path: &str) -> bool {
             let files = self.files.lock().unwrap();
             files.contains_key(path)
@@ -650,9 +650,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_reads_existing_file() {
-        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
-            MockEnvironment::new().with_file("/test/hello.txt", "hello world"),
-        );
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/hello.txt", "hello world"));
         let tool = ReadFileTool::new(env);
 
         let result = tool.execute(r#"{"path": "/test/hello.txt"}"#).await;
@@ -692,9 +691,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_overwrites_existing_file() {
-        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
-            MockEnvironment::new().with_file("/test/existing.txt", "old content"),
-        );
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/existing.txt", "old content"));
         let tool = WriteFileTool::new(Arc::clone(&env));
 
         let result = tool
@@ -712,10 +710,8 @@ mod tests {
     #[tokio::test]
     async fn edit_file_replaces_string() {
         let env: Arc<dyn ExecutionEnvironment> = Arc::new(
-            MockEnvironment::new().with_file(
-                "/test/code.rs",
-                "fn main() {\n    println!(\"hello\");\n}",
-            ),
+            MockEnvironment::new()
+                .with_file("/test/code.rs", "fn main() {\n    println!(\"hello\");\n}"),
         );
         let tool = EditFileTool::new(Arc::clone(&env));
 
@@ -734,9 +730,8 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_returns_error_when_old_string_not_found() {
-        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
-            MockEnvironment::new().with_file("/test/code.rs", "fn main() {}"),
-        );
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/code.rs", "fn main() {}"));
         let tool = EditFileTool::new(env);
 
         let result = tool
@@ -752,10 +747,7 @@ mod tests {
     #[tokio::test]
     async fn edit_file_returns_error_when_old_string_is_ambiguous() {
         let env: Arc<dyn ExecutionEnvironment> = Arc::new(
-            MockEnvironment::new().with_file(
-                "/test/code.rs",
-                "let x = 1;\nlet y = 1;\nlet z = 1;",
-            ),
+            MockEnvironment::new().with_file("/test/code.rs", "let x = 1;\nlet y = 1;\nlet z = 1;"),
         );
         let tool = EditFileTool::new(env);
 
@@ -786,7 +778,10 @@ mod tests {
     async fn grep_finds_matching_lines() {
         let env: Arc<dyn ExecutionEnvironment> = Arc::new(
             MockEnvironment::new()
-                .with_file("/src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}")
+                .with_file(
+                    "/src/lib.rs",
+                    "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}",
+                )
                 .with_file("/src/main.rs", "fn main() {\n    let x = 42;\n}"),
         );
         let tool = GrepTool::new(env);

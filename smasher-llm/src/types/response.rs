@@ -124,7 +124,11 @@ pub struct Response {
 impl Response {
     /// Returns concatenated text from all Text content parts, or None if there are no text parts.
     pub fn text(&self) -> Option<String> {
-        let texts: Vec<&str> = self.content.iter().filter_map(|part| part.as_text()).collect();
+        let texts: Vec<&str> = self
+            .content
+            .iter()
+            .filter_map(|part| part.as_text())
+            .collect();
         if texts.is_empty() {
             None
         } else {
@@ -168,8 +172,8 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::content::ToolCallData;
+    use super::*;
 
     // ── Usage arithmetic ──────────────────────────────────────────────
 
@@ -277,22 +281,40 @@ mod tests {
 
     #[test]
     fn usage_total_tokens_add_both_some() {
-        let a = Usage { total_tokens: Some(10), ..Default::default() };
-        let b = Usage { total_tokens: Some(20), ..Default::default() };
+        let a = Usage {
+            total_tokens: Some(10),
+            ..Default::default()
+        };
+        let b = Usage {
+            total_tokens: Some(20),
+            ..Default::default()
+        };
         assert_eq!((a + b).total_tokens, Some(30));
     }
 
     #[test]
     fn usage_total_tokens_add_one_none() {
-        let a = Usage { total_tokens: Some(10), ..Default::default() };
-        let b = Usage { total_tokens: None, ..Default::default() };
+        let a = Usage {
+            total_tokens: Some(10),
+            ..Default::default()
+        };
+        let b = Usage {
+            total_tokens: None,
+            ..Default::default()
+        };
         assert_eq!((a + b).total_tokens, Some(10));
     }
 
     #[test]
     fn usage_raw_dropped_on_add() {
-        let a = Usage { raw: Some(serde_json::json!({"a": 1})), ..Default::default() };
-        let b = Usage { raw: Some(serde_json::json!({"b": 2})), ..Default::default() };
+        let a = Usage {
+            raw: Some(serde_json::json!({"a": 1})),
+            ..Default::default()
+        };
+        let b = Usage {
+            raw: Some(serde_json::json!({"b": 2})),
+            ..Default::default()
+        };
         assert!((a + b).raw.is_none());
     }
 
@@ -461,10 +483,7 @@ mod tests {
         let resp = Response {
             id: "resp_multi_text".into(),
             model: "test".into(),
-            content: vec![
-                ContentPart::text("Hello, "),
-                ContentPart::text("world!"),
-            ],
+            content: vec![ContentPart::text("Hello, "), ContentPart::text("world!")],
             finish_reason: Some(FinishReason::Stop),
             usage: Usage::default(),
             warnings: vec![],
@@ -720,7 +739,10 @@ mod tests {
 
         assert_eq!(back.provider.as_deref(), Some("openai"));
         assert_eq!(back.raw.as_ref().unwrap()["raw_field"], true);
-        assert_eq!(back.finish_reason, Some(FinishReason::Other("custom".into())));
+        assert_eq!(
+            back.finish_reason,
+            Some(FinishReason::Other("custom".into()))
+        );
         assert_eq!(back.usage.total_tokens, Some(42));
         assert_eq!(back.usage.raw.as_ref().unwrap()["total"], 42);
     }

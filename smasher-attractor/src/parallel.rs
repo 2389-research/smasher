@@ -62,6 +62,121 @@ impl ParallelResult {
     }
 }
 
+/// Strategy for resolving conflicting values when merging context from parallel branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeStrategy {
+    /// Later branch values overwrite earlier ones (insertion order).
+    #[default]
+    LastWriteWins,
+    /// First branch value is preserved; subsequent writes for the same key are ignored.
+    FirstWriteWins,
+    /// Conflicting values for the same key are collected into a JSON array string.
+    Collect,
+    /// Any conflict produces an error listing the conflicting keys.
+    Error,
+}
+
+/// Error produced when merging branch contexts with the `Error` strategy.
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    #[error("merge conflict on keys: {}", keys.join(", "))]
+    Conflict {
+        /// Keys that had differing values across branches.
+        keys: Vec<String>,
+    },
+}
+
+/// Merge context maps from multiple parallel branches using the given strategy.
+///
+/// Each element in `branches` is a snapshot of the context produced by one branch.
+/// Keys that appear in only one branch are always included. The `strategy` governs
+/// what happens when the same key has different values in multiple branches.
+pub fn merge_contexts(
+    branches: &[HashMap<String, String>],
+    strategy: MergeStrategy,
+) -> Result<HashMap<String, String>, MergeError> {
+    if branches.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if branches.len() == 1 {
+        return Ok(branches[0].clone());
+    }
+
+    match strategy {
+        MergeStrategy::LastWriteWins => {
+            let mut merged = HashMap::new();
+            for branch in branches {
+                for (k, v) in branch {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(merged)
+        }
+        MergeStrategy::FirstWriteWins => {
+            let mut merged = HashMap::new();
+            for branch in branches {
+                for (k, v) in branch {
+                    merged.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            Ok(merged)
+        }
+        MergeStrategy::Collect => {
+            // First pass: gather all values per key, preserving branch order.
+            let mut all_values: HashMap<String, Vec<String>> = HashMap::new();
+            for branch in branches {
+                for (k, v) in branch {
+                    all_values.entry(k.clone()).or_default().push(v.clone());
+                }
+            }
+            // Second pass: keys with a single unique value stay scalar;
+            // keys with conflicting values become a JSON array.
+            let mut merged = HashMap::new();
+            for (k, values) in all_values {
+                let first = &values[0];
+                let has_conflict = values.iter().any(|v| v != first);
+                if has_conflict {
+                    let json_array = serde_json::to_string(&values)
+                        .unwrap_or_else(|_| format!("[{}]", values.join(",")));
+                    merged.insert(k, json_array);
+                } else {
+                    merged.insert(k, first.clone());
+                }
+            }
+            Ok(merged)
+        }
+        MergeStrategy::Error => {
+            let mut merged = HashMap::new();
+            let mut conflicting_keys = Vec::new();
+            for branch in branches {
+                for (k, v) in branch {
+                    match merged.get(k) {
+                        Some(existing) if existing != v => {
+                            if !conflicting_keys.contains(k) {
+                                conflicting_keys.push(k.clone());
+                            }
+                        }
+                        None => {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        _ => {
+                            // Same value, no conflict.
+                        }
+                    }
+                }
+            }
+            if conflicting_keys.is_empty() {
+                Ok(merged)
+            } else {
+                conflicting_keys.sort();
+                Err(MergeError::Conflict {
+                    keys: conflicting_keys,
+                })
+            }
+        }
+    }
+}
+
 /// Errors arising from parallel execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ParallelError {
@@ -71,6 +186,8 @@ pub enum ParallelError {
     BranchFailed { node_id: String, reason: String },
     #[error("parallel execution timed out")]
     Timeout,
+    #[error("context merge failed: {0}")]
+    MergeFailed(#[from] MergeError),
 }
 
 /// Execute a set of graph nodes concurrently via the handler registry.
@@ -154,6 +271,8 @@ pub struct ParallelHandler {
     #[allow(dead_code)]
     registry: Arc<HandlerRegistry>,
     config: ParallelConfig,
+    /// Strategy for merging context from parallel branches during fan-in.
+    pub merge_strategy: MergeStrategy,
 }
 
 impl ParallelHandler {
@@ -162,12 +281,30 @@ impl ParallelHandler {
         Self {
             registry,
             config: ParallelConfig::default(),
+            merge_strategy: MergeStrategy::default(),
         }
     }
 
     /// Create a handler with an explicit configuration.
     pub fn with_config(registry: Arc<HandlerRegistry>, config: ParallelConfig) -> Self {
-        Self { registry, config }
+        Self {
+            registry,
+            config,
+            merge_strategy: MergeStrategy::default(),
+        }
+    }
+
+    /// Create a handler with explicit configuration and merge strategy.
+    pub fn with_merge_strategy(
+        registry: Arc<HandlerRegistry>,
+        config: ParallelConfig,
+        merge_strategy: MergeStrategy,
+    ) -> Self {
+        Self {
+            registry,
+            config,
+            merge_strategy,
+        }
     }
 }
 
@@ -177,11 +314,7 @@ impl Handler for ParallelHandler {
         "parallel"
     }
 
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        _context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, node: &GraphNode, _context: &Context) -> Result<Outcome, HandlerError> {
         // Read optional overrides from node attributes.
         let max_concurrency = match node.attrs.get("max_concurrency") {
             Some(NodeAttrValue::Number(n)) => *n as usize,
@@ -193,10 +326,18 @@ impl Handler for ParallelHandler {
             _ => self.config.fail_fast,
         };
 
+        let merge_strategy_str = match self.merge_strategy {
+            MergeStrategy::LastWriteWins => "last_write_wins",
+            MergeStrategy::FirstWriteWins => "first_write_wins",
+            MergeStrategy::Collect => "collect",
+            MergeStrategy::Error => "error",
+        };
+
         Ok(Outcome::success_with(json!({
             "handler": "parallel",
             "max_concurrency": max_concurrency,
             "fail_fast": fail_fast,
+            "merge_strategy": merge_strategy_str,
         })))
     }
 
@@ -233,11 +374,7 @@ mod tests {
             "success"
         }
 
-        async fn execute(
-            &self,
-            node: &GraphNode,
-            _ctx: &Context,
-        ) -> Result<Outcome, HandlerError> {
+        async fn execute(&self, node: &GraphNode, _ctx: &Context) -> Result<Outcome, HandlerError> {
             Ok(Outcome::success_with(json!({"node": node.id})))
         }
 
@@ -255,11 +392,7 @@ mod tests {
             "failure"
         }
 
-        async fn execute(
-            &self,
-            node: &GraphNode,
-            _ctx: &Context,
-        ) -> Result<Outcome, HandlerError> {
+        async fn execute(&self, node: &GraphNode, _ctx: &Context) -> Result<Outcome, HandlerError> {
             Ok(Outcome::failure(format!("node {} failed", node.id)))
         }
 
@@ -277,11 +410,7 @@ mod tests {
             "selective"
         }
 
-        async fn execute(
-            &self,
-            node: &GraphNode,
-            _ctx: &Context,
-        ) -> Result<Outcome, HandlerError> {
+        async fn execute(&self, node: &GraphNode, _ctx: &Context) -> Result<Outcome, HandlerError> {
             if node.node_type == NodeType::Start {
                 Ok(Outcome::success_with(json!({"node": node.id})))
             } else {
@@ -306,11 +435,7 @@ mod tests {
             "slow"
         }
 
-        async fn execute(
-            &self,
-            node: &GraphNode,
-            _ctx: &Context,
-        ) -> Result<Outcome, HandlerError> {
+        async fn execute(&self, node: &GraphNode, _ctx: &Context) -> Result<Outcome, HandlerError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             Ok(Outcome::success_with(json!({"node": node.id})))
@@ -519,7 +644,7 @@ mod tests {
         };
 
         // Start nodes succeed, Generic nodes fail
-        let nodes = vec![
+        let nodes = [
             make_node("good1", NodeType::Start),
             make_node("bad1", NodeType::Generic),
             make_node("good2", NodeType::Start),
@@ -548,7 +673,7 @@ mod tests {
             fail_fast: false,
         };
 
-        let nodes = vec![
+        let nodes = [
             make_node("f1", NodeType::Generic),
             make_node("f2", NodeType::Generic),
         ];
@@ -696,7 +821,7 @@ mod tests {
         let ctx = Context::new();
         let config = ParallelConfig::default();
 
-        let nodes = vec![
+        let nodes = [
             make_node("x", NodeType::Generic),
             make_node("y", NodeType::Generic),
             make_node("z", NodeType::Generic),
@@ -709,18 +834,9 @@ mod tests {
 
         assert!(result.all_succeeded());
         // All three branches should have written to the shared context
-        assert_eq!(
-            ctx.get_string("branch_x"),
-            Some("from_x".to_string())
-        );
-        assert_eq!(
-            ctx.get_string("branch_y"),
-            Some("from_y".to_string())
-        );
-        assert_eq!(
-            ctx.get_string("branch_z"),
-            Some("from_z".to_string())
-        );
+        assert_eq!(ctx.get_string("branch_x"), Some("from_x".to_string()));
+        assert_eq!(ctx.get_string("branch_y"), Some("from_y".to_string()));
+        assert_eq!(ctx.get_string("branch_z"), Some("from_z".to_string()));
     }
 
     #[tokio::test]
@@ -812,14 +928,10 @@ mod tests {
         let handler = ParallelHandler::new(registry);
 
         let mut node = make_node("p2", NodeType::Parallel);
-        node.attrs.insert(
-            "max_concurrency".to_string(),
-            NodeAttrValue::Number(4.0),
-        );
-        node.attrs.insert(
-            "fail_fast".to_string(),
-            NodeAttrValue::Bool(true),
-        );
+        node.attrs
+            .insert("max_concurrency".to_string(), NodeAttrValue::Number(4.0));
+        node.attrs
+            .insert("fail_fast".to_string(), NodeAttrValue::Bool(true));
 
         let ctx = Context::new();
         let outcome = handler.execute(&node, &ctx).await.unwrap();
@@ -867,10 +979,8 @@ mod tests {
 
         let mut node = make_node("p4", NodeType::Parallel);
         // Override only max_concurrency; fail_fast should use handler default
-        node.attrs.insert(
-            "max_concurrency".to_string(),
-            NodeAttrValue::Number(20.0),
-        );
+        node.attrs
+            .insert("max_concurrency".to_string(), NodeAttrValue::Number(20.0));
 
         let ctx = Context::new();
         let outcome = handler.execute(&node, &ctx).await.unwrap();
@@ -910,5 +1020,330 @@ mod tests {
         assert_eq!(cloned.success_count(), 1);
         assert_eq!(cloned.failure_count(), 1);
         assert_eq!(cloned.outcomes.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // MergeStrategy default
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_strategy_default_is_last_write_wins() {
+        assert_eq!(MergeStrategy::default(), MergeStrategy::LastWriteWins);
+    }
+
+    #[test]
+    fn merge_strategy_clone_and_copy() {
+        let s = MergeStrategy::Collect;
+        let cloned = s;
+        let copied = s;
+        assert_eq!(cloned, MergeStrategy::Collect);
+        assert_eq!(copied, MergeStrategy::Collect);
+    }
+
+    // ---------------------------------------------------------------
+    // merge_contexts — empty and single branch
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_contexts_empty_branches_returns_empty() {
+        let result = merge_contexts(&[], MergeStrategy::LastWriteWins).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn merge_contexts_single_branch_returns_clone() {
+        let branch = HashMap::from([
+            ("key1".to_string(), "val1".to_string()),
+            ("key2".to_string(), "val2".to_string()),
+        ]);
+        let result = merge_contexts(std::slice::from_ref(&branch), MergeStrategy::Error).unwrap();
+        assert_eq!(result, branch);
+    }
+
+    // ---------------------------------------------------------------
+    // merge_contexts — LastWriteWins
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_last_write_wins_no_conflict() {
+        let b1 = HashMap::from([("a".to_string(), "1".to_string())]);
+        let b2 = HashMap::from([("b".to_string(), "2".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::LastWriteWins).unwrap();
+        assert_eq!(result.get("a"), Some(&"1".to_string()));
+        assert_eq!(result.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn merge_last_write_wins_conflict_uses_later_branch() {
+        let b1 = HashMap::from([("x".to_string(), "first".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "second".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::LastWriteWins).unwrap();
+        assert_eq!(result.get("x"), Some(&"second".to_string()));
+    }
+
+    #[test]
+    fn merge_last_write_wins_three_branches() {
+        let b1 = HashMap::from([("x".to_string(), "one".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "two".to_string())]);
+        let b3 = HashMap::from([("x".to_string(), "three".to_string())]);
+
+        let result = merge_contexts(&[b1, b2, b3], MergeStrategy::LastWriteWins).unwrap();
+        assert_eq!(result.get("x"), Some(&"three".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // merge_contexts — FirstWriteWins
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_first_write_wins_no_conflict() {
+        let b1 = HashMap::from([("a".to_string(), "1".to_string())]);
+        let b2 = HashMap::from([("b".to_string(), "2".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::FirstWriteWins).unwrap();
+        assert_eq!(result.get("a"), Some(&"1".to_string()));
+        assert_eq!(result.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn merge_first_write_wins_conflict_preserves_first() {
+        let b1 = HashMap::from([("x".to_string(), "first".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "second".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::FirstWriteWins).unwrap();
+        assert_eq!(result.get("x"), Some(&"first".to_string()));
+    }
+
+    #[test]
+    fn merge_first_write_wins_three_branches() {
+        let b1 = HashMap::from([("x".to_string(), "one".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "two".to_string())]);
+        let b3 = HashMap::from([("x".to_string(), "three".to_string())]);
+
+        let result = merge_contexts(&[b1, b2, b3], MergeStrategy::FirstWriteWins).unwrap();
+        assert_eq!(result.get("x"), Some(&"one".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // merge_contexts — Collect
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_collect_no_conflict_stays_scalar() {
+        let b1 = HashMap::from([("a".to_string(), "1".to_string())]);
+        let b2 = HashMap::from([("b".to_string(), "2".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Collect).unwrap();
+        assert_eq!(result.get("a"), Some(&"1".to_string()));
+        assert_eq!(result.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn merge_collect_same_value_stays_scalar() {
+        let b1 = HashMap::from([("x".to_string(), "same".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "same".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Collect).unwrap();
+        assert_eq!(result.get("x"), Some(&"same".to_string()));
+    }
+
+    #[test]
+    fn merge_collect_conflict_creates_json_array() {
+        let b1 = HashMap::from([("x".to_string(), "alpha".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "beta".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Collect).unwrap();
+        let collected = result.get("x").unwrap();
+        // Should be a JSON array of the values.
+        let parsed: Vec<String> = serde_json::from_str(collected).unwrap();
+        assert_eq!(parsed, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn merge_collect_three_branches_with_conflict() {
+        let b1 = HashMap::from([("x".to_string(), "a".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "b".to_string())]);
+        let b3 = HashMap::from([("x".to_string(), "c".to_string())]);
+
+        let result = merge_contexts(&[b1, b2, b3], MergeStrategy::Collect).unwrap();
+        let collected = result.get("x").unwrap();
+        let parsed: Vec<String> = serde_json::from_str(collected).unwrap();
+        assert_eq!(parsed, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_collect_mixed_conflict_and_unique() {
+        let b1 = HashMap::from([
+            ("shared".to_string(), "v1".to_string()),
+            ("unique_a".to_string(), "only_a".to_string()),
+        ]);
+        let b2 = HashMap::from([
+            ("shared".to_string(), "v2".to_string()),
+            ("unique_b".to_string(), "only_b".to_string()),
+        ]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Collect).unwrap();
+        // Unique keys are kept as-is.
+        assert_eq!(result.get("unique_a"), Some(&"only_a".to_string()));
+        assert_eq!(result.get("unique_b"), Some(&"only_b".to_string()));
+        // Conflicting key becomes a JSON array.
+        let shared = result.get("shared").unwrap();
+        let parsed: Vec<String> = serde_json::from_str(shared).unwrap();
+        assert_eq!(parsed, vec!["v1", "v2"]);
+    }
+
+    // ---------------------------------------------------------------
+    // merge_contexts — Error
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_error_no_conflict_succeeds() {
+        let b1 = HashMap::from([("a".to_string(), "1".to_string())]);
+        let b2 = HashMap::from([("b".to_string(), "2".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Error).unwrap();
+        assert_eq!(result.get("a"), Some(&"1".to_string()));
+        assert_eq!(result.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn merge_error_same_value_no_conflict() {
+        let b1 = HashMap::from([("x".to_string(), "same".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "same".to_string())]);
+
+        let result = merge_contexts(&[b1, b2], MergeStrategy::Error).unwrap();
+        assert_eq!(result.get("x"), Some(&"same".to_string()));
+    }
+
+    #[test]
+    fn merge_error_conflict_returns_error() {
+        let b1 = HashMap::from([("x".to_string(), "first".to_string())]);
+        let b2 = HashMap::from([("x".to_string(), "second".to_string())]);
+
+        let err = merge_contexts(&[b1, b2], MergeStrategy::Error).unwrap_err();
+        match &err {
+            MergeError::Conflict { keys } => {
+                assert_eq!(keys, &vec!["x".to_string()]);
+            }
+        }
+        assert!(err.to_string().contains("x"));
+    }
+
+    #[test]
+    fn merge_error_multiple_conflicts_lists_all_keys() {
+        let b1 = HashMap::from([
+            ("x".to_string(), "1".to_string()),
+            ("y".to_string(), "a".to_string()),
+        ]);
+        let b2 = HashMap::from([
+            ("x".to_string(), "2".to_string()),
+            ("y".to_string(), "b".to_string()),
+        ]);
+
+        let err = merge_contexts(&[b1, b2], MergeStrategy::Error).unwrap_err();
+        match &err {
+            MergeError::Conflict { keys } => {
+                assert!(keys.contains(&"x".to_string()));
+                assert!(keys.contains(&"y".to_string()));
+                assert_eq!(keys.len(), 2);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // MergeError display
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_error_display_shows_conflicting_keys() {
+        let err = MergeError::Conflict {
+            keys: vec!["alpha".to_string(), "beta".to_string()],
+        };
+        assert_eq!(err.to_string(), "merge conflict on keys: alpha, beta");
+    }
+
+    // ---------------------------------------------------------------
+    // ParallelHandler merge_strategy integration
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parallel_handler_default_merge_strategy_is_last_write_wins() {
+        let registry = Arc::new(HandlerRegistry::new());
+        let handler = ParallelHandler::new(registry);
+        assert_eq!(handler.merge_strategy, MergeStrategy::LastWriteWins);
+    }
+
+    #[test]
+    fn parallel_handler_with_merge_strategy_sets_strategy() {
+        let registry = Arc::new(HandlerRegistry::new());
+        let handler = ParallelHandler::with_merge_strategy(
+            registry,
+            ParallelConfig::default(),
+            MergeStrategy::Collect,
+        );
+        assert_eq!(handler.merge_strategy, MergeStrategy::Collect);
+    }
+
+    #[tokio::test]
+    async fn parallel_handler_execute_includes_merge_strategy_in_output() {
+        let registry = Arc::new(HandlerRegistry::new());
+        let handler = ParallelHandler::with_merge_strategy(
+            registry,
+            ParallelConfig::default(),
+            MergeStrategy::Error,
+        );
+        let node = make_node("p_merge", NodeType::Parallel);
+        let ctx = Context::new();
+
+        let outcome = handler.execute(&node, &ctx).await.unwrap();
+        match outcome {
+            Outcome::Success { data: Some(data) } => {
+                assert_eq!(data["merge_strategy"], "error");
+            }
+            other => panic!("expected success with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_handler_default_reports_last_write_wins_strategy() {
+        let registry = Arc::new(HandlerRegistry::new());
+        let handler = ParallelHandler::new(registry);
+        let node = make_node("p_default", NodeType::Parallel);
+        let ctx = Context::new();
+
+        let outcome = handler.execute(&node, &ctx).await.unwrap();
+        match outcome {
+            Outcome::Success { data: Some(data) } => {
+                assert_eq!(data["merge_strategy"], "last_write_wins");
+            }
+            other => panic!("expected success with data, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ParallelError::MergeFailed
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parallel_error_merge_failed_display() {
+        let merge_err = MergeError::Conflict {
+            keys: vec!["key1".to_string()],
+        };
+        let err = ParallelError::MergeFailed(merge_err);
+        assert_eq!(
+            err.to_string(),
+            "context merge failed: merge conflict on keys: key1"
+        );
+    }
+
+    #[test]
+    fn parallel_error_from_merge_error() {
+        let merge_err = MergeError::Conflict {
+            keys: vec!["a".to_string()],
+        };
+        let parallel_err: ParallelError = merge_err.into();
+        assert!(matches!(parallel_err, ParallelError::MergeFailed(_)));
     }
 }

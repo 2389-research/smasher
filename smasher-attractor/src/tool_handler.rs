@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::graph::{GraphNode, NodeAttrValue, NodeType};
 use crate::handler::{Handler, HandlerError};
@@ -50,11 +50,7 @@ impl Handler for ToolHandler {
         "tool"
     }
 
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         // Determine tool name: explicit attribute first, then label fallback.
         let tool_name = match node.attrs.get("tool") {
             Some(NodeAttrValue::String(s)) => s.clone(),
@@ -79,7 +75,10 @@ impl Handler for ToolHandler {
             _ => json!({}),
         };
 
-        let outcome = self.backend.execute_tool(&tool_name, &args, context).await?;
+        let outcome = self
+            .backend
+            .execute_tool(&tool_name, &args, context)
+            .await?;
 
         // Store the result in context for downstream nodes.
         let serialized = match &outcome {

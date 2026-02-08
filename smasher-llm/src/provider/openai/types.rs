@@ -241,11 +241,8 @@ pub fn convert_request(request: &Request) -> OpenAiRequest {
                 if has_tool_calls {
                     // For assistant messages with tool calls, include text if present,
                     // then the tool calls become part of the conversation history.
-                    let text_parts: Vec<&str> = message
-                        .content
-                        .iter()
-                        .filter_map(|p| p.as_text())
-                        .collect();
+                    let text_parts: Vec<&str> =
+                        message.content.iter().filter_map(|p| p.as_text()).collect();
                     if !text_parts.is_empty() {
                         input_items.push(OpenAiInputItem::Message {
                             role: "assistant".to_string(),
@@ -362,9 +359,7 @@ fn convert_content_parts(parts: &[ContentPart]) -> OpenAiContent {
     let openai_parts: Vec<OpenAiContentPart> = parts
         .iter()
         .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(OpenAiContentPart::InputText {
-                text: text.clone(),
-            }),
+            ContentPart::Text { text } => Some(OpenAiContentPart::InputText { text: text.clone() }),
             ContentPart::Image(ImageData {
                 source_type: ImageSourceType::Url,
                 data,
@@ -430,13 +425,11 @@ pub fn convert_response(response: OpenAiResponse) -> Result<Response, Error> {
             }
             OpenAiOutputItem::Reasoning { summary } => {
                 for s in summary {
-                    content.push(ContentPart::Thinking(
-                        crate::types::content::ThinkingData {
-                            thinking: s.text.clone(),
-                            signature: None,
-                            redacted: false,
-                        },
-                    ));
+                    content.push(ContentPart::Thinking(crate::types::content::ThinkingData {
+                        thinking: s.text.clone(),
+                        signature: None,
+                        redacted: false,
+                    }));
                 }
             }
         }
@@ -547,8 +540,8 @@ mod tests {
 
     #[test]
     fn convert_system_prompt_becomes_instructions() {
-        let req = Request::new("gpt-4o", vec![Message::user("Hi")])
-            .system_prompt("You are helpful.");
+        let req =
+            Request::new("gpt-4o", vec![Message::user("Hi")]).system_prompt("You are helpful.");
 
         let oai = convert_request(&req);
         assert_eq!(oai.instructions.as_deref(), Some("You are helpful."));
@@ -558,10 +551,7 @@ mod tests {
     fn convert_system_message_becomes_instructions() {
         let req = Request::new(
             "gpt-4o",
-            vec![
-                Message::system("System instructions"),
-                Message::user("Hi"),
-            ],
+            vec![Message::system("System instructions"), Message::user("Hi")],
         );
 
         let oai = convert_request(&req);
@@ -622,8 +612,7 @@ mod tests {
 
     #[test]
     fn convert_tool_choice_auto() {
-        let req =
-            Request::new("gpt-4o", vec![Message::user("Hi")]).tool_choice(ToolChoice::Auto);
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).tool_choice(ToolChoice::Auto);
 
         let oai = convert_request(&req);
         assert_eq!(oai.tool_choice, Some(json!("auto")));
@@ -631,8 +620,7 @@ mod tests {
 
     #[test]
     fn convert_tool_choice_none() {
-        let req =
-            Request::new("gpt-4o", vec![Message::user("Hi")]).tool_choice(ToolChoice::None);
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).tool_choice(ToolChoice::None);
 
         let oai = convert_request(&req);
         assert_eq!(oai.tool_choice, Some(json!("none")));
@@ -649,8 +637,8 @@ mod tests {
 
     #[test]
     fn convert_tool_choice_specific() {
-        let req = Request::new("gpt-4o", vec![Message::user("Hi")])
-            .tool_choice(ToolChoice::Specific {
+        let req =
+            Request::new("gpt-4o", vec![Message::user("Hi")]).tool_choice(ToolChoice::Specific {
                 name: "get_weather".into(),
             });
 
@@ -706,12 +694,13 @@ mod tests {
 
     #[test]
     fn convert_json_schema_response_format() {
-        let req = Request::new("gpt-4o", vec![Message::user("Hi")])
-            .response_format(ResponseFormat::JsonSchema {
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).response_format(
+            ResponseFormat::JsonSchema {
                 name: "person".into(),
                 schema: json!({"type": "object"}),
                 strict: true,
-            });
+            },
+        );
 
         let oai = convert_request(&req);
         let text_cfg = oai.text.unwrap();
@@ -732,8 +721,8 @@ mod tests {
 
     #[test]
     fn convert_text_response_format_is_none() {
-        let req = Request::new("gpt-4o", vec![Message::user("Hi")])
-            .response_format(ResponseFormat::Text);
+        let req =
+            Request::new("gpt-4o", vec![Message::user("Hi")]).response_format(ResponseFormat::Text);
 
         let oai = convert_request(&req);
         assert!(oai.text.is_none());
@@ -907,16 +896,12 @@ mod tests {
             model: "gpt-4o".into(),
             output: vec![OpenAiOutputItem::Message {
                 role: "assistant".into(),
-                content: vec![OpenAiOutputContent::OutputText {
-                    text: "Hi".into(),
-                }],
+                content: vec![OpenAiOutputContent::OutputText { text: "Hi".into() }],
             }],
             usage: Some(OpenAiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
-                input_tokens_details: Some(OpenAiInputTokensDetails {
-                    cached_tokens: 30,
-                }),
+                input_tokens_details: Some(OpenAiInputTokensDetails { cached_tokens: 30 }),
                 output_tokens_details: Some(OpenAiOutputTokensDetails {
                     reasoning_tokens: 20,
                 }),
@@ -1107,9 +1092,7 @@ mod tests {
         let resp: OpenAiResponse = serde_json::from_str(json_str).unwrap();
         assert_eq!(resp.output.len(), 1);
         match &resp.output[0] {
-            OpenAiOutputItem::FunctionCall {
-                call_id, name, ..
-            } => {
+            OpenAiOutputItem::FunctionCall { call_id, name, .. } => {
                 assert_eq!(call_id, "call_abc");
                 assert_eq!(name, "get_weather");
             }
@@ -1260,9 +1243,6 @@ mod tests {
         let serialized = serde_json::to_value(&oai.input[0]).unwrap();
         let parts = serialized["content"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "input_image");
-        assert_eq!(
-            parts[0]["image_url"],
-            "data:image/jpeg;base64,aWNvbg=="
-        );
+        assert_eq!(parts[0]["image_url"], "data:image/jpeg;base64,aWNvbg==");
     }
 }

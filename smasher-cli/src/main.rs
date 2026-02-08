@@ -2,9 +2,15 @@
 // ABOUTME: Routes to complete (one-shot), chat (interactive agent), and run (DOT pipeline).
 
 mod chat;
+#[cfg(test)]
+mod cli_spec;
 mod complete;
 mod error;
+#[cfg(test)]
+mod layout_check;
+mod render;
 mod run;
+pub mod tui;
 
 use std::path::PathBuf;
 
@@ -38,6 +44,9 @@ enum Command {
 
     /// Execute a DOT-based pipeline.
     Run(run::RunArgs),
+
+    /// Render a DOT pipeline file to SVG or PNG.
+    Render(render::RenderArgs),
 }
 
 fn main() {
@@ -50,7 +59,7 @@ fn main() {
     // If the user explicitly asked for a specific env file, load it now
     // (overrides any vars already set by the default .env).
     if let Some(ref path) = cli.env_file
-        && let Err(e) = dotenvy::from_path(path)
+        && let Err(e) = dotenvy::from_path_override(path)
     {
         eprintln!("error: failed to load env file {}: {e}", path.display());
         std::process::exit(1);
@@ -82,6 +91,7 @@ fn main() {
             Command::Complete(args) => complete::run(args).await,
             Command::Chat(args) => chat::run(args).await,
             Command::Run(args) => run::run(args).await,
+            Command::Render(args) => render::run(args).await,
         }
     });
 

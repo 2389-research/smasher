@@ -1,0 +1,52 @@
+# Pre-commit hooks for coven (Rust monorepo)
+# See https://pre-commit.com for more information
+# Use `prek install` to set up the git hook
+
+repos:
+  # Rust tools as local hooks
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust code with rustfmt
+        entry: cargo fmt
+        args: ["--all", "--", "--check"]
+        language: system
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust code compiles
+        entry: cargo check
+        args: ["--workspace", "--all-targets"]
+        language: system
+        pass_filenames: false
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+        description: Trim trailing whitespace
+
+      - id: end-of-file-fixer
+        name: fix end of files
+        description: Ensure files end with a newline
+
+      - id: check-yaml
+        name: check yaml
+        description: Check YAML syntax
+
+      - id: check-added-large-files
+        name: check for large files
+        description: Prevent committing large files
+        args: ["--maxkb=1000"]
+
+      - id: check-merge-conflict
+        name: check merge conflicts
+        description: Check for merge conflict markers
+
+      - id: check-toml
+        name: check toml
+        description: Check TOML syntax

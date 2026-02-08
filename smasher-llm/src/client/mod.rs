@@ -48,26 +48,17 @@ impl Client {
         let mut client = Self::new();
 
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            client.register_provider(
-                Provider::Anthropic,
-                Arc::new(AnthropicAdapter::new(key)),
-            );
+            client.register_provider(Provider::Anthropic, Arc::new(AnthropicAdapter::new(key)));
         }
 
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            client.register_provider(
-                Provider::OpenAi,
-                Arc::new(OpenAiAdapter::new(key)),
-            );
+            client.register_provider(Provider::OpenAi, Arc::new(OpenAiAdapter::new(key)));
         }
 
-        if let Ok(key) = std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        if let Ok(key) =
+            std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY"))
         {
-            client.register_provider(
-                Provider::Gemini,
-                Arc::new(GeminiAdapter::new(key)),
-            );
+            client.register_provider(Provider::Gemini, Arc::new(GeminiAdapter::new(key)));
         }
 
         client
@@ -124,11 +115,8 @@ impl Client {
     /// middleware to transform or log the error.
     pub async fn stream(&self, request: &Request) -> Result<StreamResponse, Error> {
         let adapter = self.adapter_for_model(&request.model)?;
-        let processed_request = execute_stream_middleware_chain(
-            &self.middlewares,
-            request.clone(),
-        )
-        .await?;
+        let processed_request =
+            execute_stream_middleware_chain(&self.middlewares, request.clone()).await?;
         match adapter.stream(&processed_request).await {
             Ok(stream) => Ok(stream),
             Err(error) => {
@@ -217,10 +205,7 @@ mod tests {
     async fn complete_routes_to_correct_provider() {
         let (client, count) = client_with_mock_anthropic();
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         let response = client.complete(request).await.unwrap();
 
         assert_eq!(response.id, "mock-resp");
@@ -241,10 +226,7 @@ mod tests {
     async fn complete_returns_error_for_unconfigured_provider() {
         let client = Client::new();
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         let result = client.complete(request).await;
 
         assert!(matches!(
@@ -307,10 +289,7 @@ mod tests {
             count: mw_count.clone(),
         });
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         let _ = client.complete(request).await;
 
         assert_eq!(mw_count.load(Ordering::SeqCst), 1);
@@ -349,10 +328,7 @@ mod tests {
             count: mw_count.clone(),
         });
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         // The mock adapter returns an error for stream, but middleware should still run
         let _ = client.stream(&request).await;
 
@@ -385,10 +361,7 @@ mod tests {
 
         client.add_middleware(BlockingStreamMiddleware);
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         let result = client.stream(&request).await;
 
         match result {
@@ -430,10 +403,7 @@ mod tests {
 
         client.add_middleware(ErrorTransformMiddleware);
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         // MockAdapter.stream() returns an error, which should be transformed
         let result = client.stream(&request).await;
 
@@ -474,10 +444,7 @@ mod tests {
             on_request_count: on_request_count.clone(),
         });
 
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("hello")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
         let _ = client.stream(&request).await;
 
         assert_eq!(

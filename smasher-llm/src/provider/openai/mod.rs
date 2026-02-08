@@ -53,9 +53,8 @@ impl ProviderAdapter for OpenAiAdapter {
         let oai_request = convert_request(request);
         let url = format!("{}/v1/responses", self.base_url);
 
-        let body = serde_json::to_string(&oai_request).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body =
+            serde_json::to_string(&oai_request).map_err(|e| Error::Serialization { source: e })?;
 
         let http_response = self
             .client
@@ -75,7 +74,9 @@ impl ProviderAdapter for OpenAiAdapter {
 
         if !(200..300).contains(&status) {
             let body_text = http_response.text().await.unwrap_or_default();
-            return Err(build_error_from_status("openai", status, &body_text, &headers));
+            return Err(build_error_from_status(
+                "openai", status, &body_text, &headers,
+            ));
         }
 
         let rate_limit = parse_rate_limit_headers(&headers);
@@ -102,9 +103,8 @@ impl ProviderAdapter for OpenAiAdapter {
 
         let url = format!("{}/v1/responses", self.base_url);
 
-        let body = serde_json::to_string(&oai_request).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body =
+            serde_json::to_string(&oai_request).map_err(|e| Error::Serialization { source: e })?;
 
         let http_response = self
             .client
@@ -124,7 +124,9 @@ impl ProviderAdapter for OpenAiAdapter {
 
         if !(200..300).contains(&status) {
             let body_text = http_response.text().await.unwrap_or_default();
-            return Err(build_error_from_status("openai", status, &body_text, &headers));
+            return Err(build_error_from_status(
+                "openai", status, &body_text, &headers,
+            ));
         }
 
         let byte_stream = http_response.bytes_stream();
@@ -151,10 +153,8 @@ mod tests {
 
     #[test]
     fn with_base_url_sets_url() {
-        let adapter = OpenAiAdapter::with_base_url(
-            "test-key".into(),
-            "https://custom.api.com".into(),
-        );
+        let adapter =
+            OpenAiAdapter::with_base_url("test-key".into(), "https://custom.api.com".into());
         assert_eq!(adapter.base_url, "https://custom.api.com");
     }
 
@@ -185,18 +185,12 @@ mod tests {
             .and(path("/v1/responses"))
             .and(header("Authorization", "Bearer test-api-key"))
             .and(header("Content-Type", "application/json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&response_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
             .expect(1)
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "test-api-key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("test-api-key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let response = adapter.complete(&request).await.unwrap();
@@ -214,17 +208,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_string("invalid api key"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "bad-key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("bad-key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let err = adapter.complete(&request).await.unwrap_err();
@@ -251,10 +239,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let err = adapter.complete(&request).await.unwrap_err();
@@ -277,17 +262,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(500)
-                    .set_body_string("internal server error"),
-            )
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let err = adapter.complete(&request).await.unwrap_err();
@@ -326,17 +305,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&response_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Weather?")]);
         let response = adapter.complete(&request).await.unwrap();
@@ -379,10 +352,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "stream-key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("stream-key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let stream = adapter.stream(&request).await.unwrap();
@@ -415,17 +385,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_string("unauthorized"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "bad-key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("bad-key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hello!")]);
         let result = adapter.stream(&request).await;
@@ -467,10 +431,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = OpenAiAdapter::with_base_url(
-            "key".into(),
-            server.uri(),
-        );
+        let adapter = OpenAiAdapter::with_base_url("key".into(), server.uri());
 
         let request = Request::new("gpt-4o", vec![Message::user("Hi")]);
         let response = adapter.complete(&request).await.unwrap();

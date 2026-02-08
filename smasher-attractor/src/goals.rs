@@ -61,9 +61,7 @@ impl GoalGate {
         let goals = graph
             .nodes
             .iter()
-            .filter(|node| {
-                matches!(node.attrs.get("goal"), Some(NodeAttrValue::Bool(true)))
-            })
+            .filter(|node| matches!(node.attrs.get("goal"), Some(NodeAttrValue::Bool(true))))
             .map(|node| node.id.clone())
             .collect();
         GoalGate { goals }
@@ -222,10 +220,7 @@ mod tests {
     // ---- Test 1: from_graph with no goal nodes ----
     #[test]
     fn from_graph_no_goal_nodes() {
-        let graph = make_graph(vec![
-            make_node("a", false),
-            make_node("b", false),
-        ]);
+        let graph = make_graph(vec![make_node("a", false), make_node("b", false)]);
         let gate = GoalGate::from_graph(&graph);
         assert!(gate.goals().is_empty());
         assert!(gate.is_empty());
@@ -278,10 +273,7 @@ mod tests {
     // ---- Test 5: goal=false is not treated as a goal ----
     #[test]
     fn goal_false_is_not_a_goal() {
-        let graph = make_graph(vec![
-            make_node_with_false_goal("a"),
-            make_node("b", true),
-        ]);
+        let graph = make_graph(vec![make_node_with_false_goal("a"), make_node("b", true)]);
         let gate = GoalGate::from_graph(&graph);
         assert_eq!(gate.goals().len(), 1);
         assert_eq!(gate.goals()[0], "b");
@@ -290,10 +282,7 @@ mod tests {
     // ---- Test 6: check with no goals met ----
     #[test]
     fn check_no_goals_met() {
-        let graph = make_graph(vec![
-            make_node("a", true),
-            make_node("b", true),
-        ]);
+        let graph = make_graph(vec![make_node("a", true), make_node("b", true)]);
         let gate = GoalGate::from_graph(&graph);
         let status = gate.check(&visited(&["x", "y"]));
         assert_eq!(status.total, 2);
@@ -321,10 +310,7 @@ mod tests {
     // ---- Test 8: check with all goals met ----
     #[test]
     fn check_all_goals_met() {
-        let graph = make_graph(vec![
-            make_node("a", true),
-            make_node("b", true),
-        ]);
+        let graph = make_graph(vec![make_node("a", true), make_node("b", true)]);
         let gate = GoalGate::from_graph(&graph);
         let status = gate.check(&visited(&["a", "b", "extra"]));
         assert_eq!(status.total, 2);
@@ -336,10 +322,7 @@ mod tests {
     // ---- Test 9: all_met returns true when all visited ----
     #[test]
     fn all_met_returns_true_when_all_visited() {
-        let graph = make_graph(vec![
-            make_node("g1", true),
-            make_node("g2", true),
-        ]);
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
         let gate = GoalGate::from_graph(&graph);
         assert!(gate.all_met(&visited(&["g1", "g2"])));
         assert!(gate.all_met(&visited(&["g1", "g2", "extra"])));
@@ -348,10 +331,7 @@ mod tests {
     // ---- Test 10: all_met returns false when some missing ----
     #[test]
     fn all_met_returns_false_when_missing() {
-        let graph = make_graph(vec![
-            make_node("g1", true),
-            make_node("g2", true),
-        ]);
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
         let gate = GoalGate::from_graph(&graph);
         assert!(!gate.all_met(&visited(&["g1"])));
         assert!(!gate.all_met(&visited(&[])));
@@ -388,10 +368,7 @@ mod tests {
     // ---- Test 13: enforce returns Ok when all met ----
     #[test]
     fn enforce_returns_ok_when_all_met() {
-        let graph = make_graph(vec![
-            make_node("g1", true),
-            make_node("g2", true),
-        ]);
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
         let gate = GoalGate::from_graph(&graph);
         let result = gate.enforce(&visited(&["g1", "g2"]));
         assert!(result.is_ok());
@@ -511,10 +488,7 @@ mod tests {
     // ---- Test 20: check_checkpoint all visited ----
     #[test]
     fn check_checkpoint_all_visited() {
-        let graph = make_graph(vec![
-            make_node("g1", true),
-            make_node("g2", true),
-        ]);
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
         let gate = GoalGate::from_graph(&graph);
 
         let ctx = Context::new();
@@ -530,16 +504,11 @@ mod tests {
     // ---- Test 21: is_empty for empty vs non-empty ----
     #[test]
     fn is_empty_for_empty_vs_non_empty() {
-        let empty_graph = make_graph(vec![
-            make_node("a", false),
-            make_node("b", false),
-        ]);
+        let empty_graph = make_graph(vec![make_node("a", false), make_node("b", false)]);
         let empty_gate = GoalGate::from_graph(&empty_graph);
         assert!(empty_gate.is_empty());
 
-        let nonempty_graph = make_graph(vec![
-            make_node("a", true),
-        ]);
+        let nonempty_graph = make_graph(vec![make_node("a", true)]);
         let nonempty_gate = GoalGate::from_graph(&nonempty_graph);
         assert!(!nonempty_gate.is_empty());
     }

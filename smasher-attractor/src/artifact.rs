@@ -186,7 +186,12 @@ mod tests {
     #[test]
     fn store_and_retrieve_artifact_by_id() {
         let store = ArtifactStore::new();
-        let id = store.store("node_1", "output", "application/json", json!({"key": "value"}));
+        let id = store.store(
+            "node_1",
+            "output",
+            "application/json",
+            json!({"key": "value"}),
+        );
         let artifact = store.get(&id).expect("artifact should exist");
         assert_eq!(artifact.id, id);
         assert_eq!(artifact.metadata.node_id, "node_1");
@@ -276,7 +281,12 @@ mod tests {
     #[test]
     fn list_returns_metadata_for_all_artifacts() {
         let store = ArtifactStore::new();
-        store.store("n1", "output", "application/json", json!({"big": "payload"}));
+        store.store(
+            "n1",
+            "output",
+            "application/json",
+            json!({"big": "payload"}),
+        );
         store.store("n2", "log", "text/plain", json!("log data"));
 
         let metadata_list = store.list();
@@ -372,12 +382,7 @@ mod tests {
             .map(|i| {
                 let store = store.clone();
                 std::thread::spawn(move || {
-                    let id = store.store(
-                        &format!("node_{i}"),
-                        "output",
-                        "text/plain",
-                        json!(i),
-                    );
+                    let id = store.store(&format!("node_{i}"), "output", "text/plain", json!(i));
                     // Immediately retrieve the artifact we just stored
                     let artifact = store.get(&id);
                     assert!(artifact.is_some(), "artifact {id} should be retrievable");
@@ -465,7 +470,10 @@ mod tests {
         assert_eq!(deserialized.metadata.tags, artifact.metadata.tags);
         assert_eq!(deserialized.data, artifact.data);
         // chrono DateTime roundtrips through serde
-        assert_eq!(deserialized.metadata.created_at, artifact.metadata.created_at);
+        assert_eq!(
+            deserialized.metadata.created_at,
+            artifact.metadata.created_at
+        );
     }
 
     #[test]

@@ -248,7 +248,9 @@ fn check_conditional_without_condition(graph: &Graph) -> Vec<LintWarning> {
 fn check_duplicate_edge(graph: &Graph) -> Vec<LintWarning> {
     let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
     for edge in &graph.edges {
-        *seen.entry((edge.from.as_str(), edge.to.as_str())).or_insert(0) += 1;
+        *seen
+            .entry((edge.from.as_str(), edge.to.as_str()))
+            .or_insert(0) += 1;
     }
 
     seen.into_iter()
@@ -282,8 +284,8 @@ fn check_missing_label(graph: &Graph) -> Vec<LintWarning> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::GraphEdge;
+    use super::*;
 
     /// Helper to create a simple GraphNode with defaults.
     fn make_node(id: &str, node_type: NodeType) -> GraphNode {
@@ -303,16 +305,13 @@ mod tests {
             label: None,
             condition: None,
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
 
     /// Helper to create a Graph with just nodes and edges.
-    fn make_graph_with(
-        name: Option<&str>,
-        nodes: Vec<GraphNode>,
-        edges: Vec<GraphEdge>,
-    ) -> Graph {
+    fn make_graph_with(name: Option<&str>, nodes: Vec<GraphNode>, edges: Vec<GraphEdge>) -> Graph {
         Graph {
             name: name.map(|s| s.to_string()),
             nodes,
@@ -345,11 +344,7 @@ mod tests {
 
     #[test]
     fn no_start_node_produces_error() {
-        let graph = make_graph_with(
-            None,
-            vec![make_node("a", NodeType::Generic)],
-            vec![],
-        );
+        let graph = make_graph_with(None, vec![make_node("a", NodeType::Generic)], vec![]);
         let warnings = validate(&graph);
         assert!(has_rule(&warnings, "no_start_node"));
         let w = warnings.iter().find(|w| w.rule == "no_start_node").unwrap();
@@ -358,11 +353,7 @@ mod tests {
 
     #[test]
     fn no_exit_node_produces_warning() {
-        let graph = make_graph_with(
-            None,
-            vec![make_node("start", NodeType::Start)],
-            vec![],
-        );
+        let graph = make_graph_with(None, vec![make_node("start", NodeType::Start)], vec![]);
         let warnings = validate(&graph);
         assert!(has_rule(&warnings, "no_exit_node"));
         let w = warnings.iter().find(|w| w.rule == "no_exit_node").unwrap();
@@ -449,10 +440,7 @@ mod tests {
                 make_node("process", NodeType::Generic),
                 make_node("exit", NodeType::Exit),
             ],
-            vec![
-                make_edge("start", "process"),
-                make_edge("process", "exit"),
-            ],
+            vec![make_edge("start", "process"), make_edge("process", "exit")],
         );
         let warnings = validate(&graph);
         let errors = rules_with_severity(&warnings, Severity::Error);
@@ -476,9 +464,11 @@ mod tests {
             .iter()
             .filter(|w| w.rule == "orphan_node")
             .collect();
-        assert!(orphans
-            .iter()
-            .any(|w| w.node_id.as_deref() == Some("orphan")));
+        assert!(
+            orphans
+                .iter()
+                .any(|w| w.node_id.as_deref() == Some("orphan"))
+        );
     }
 
     #[test]

@@ -1,0 +1,27 @@
+// ABOUTME: Simplest possible smasher pipeline: start node to exit node.
+// ABOUTME: Use this as a template for building pipelines.
+
+// A smasher pipeline is a standard DOT digraph. The engine determines
+// each node's role from its `shape` attribute:
+//
+//   shape=circle       → Start node (entry point)
+//   shape=doublecircle → Exit node (terminal)
+//   shape=diamond      → Conditional (branch on variables)
+//   shape=box          → Codergen (run an LLM agent)
+//   shape=hexagon      → Tool (execute a tool)
+//   shape=parallelogram→ Parallel (fan-out concurrent execution)
+//   shape=house        → Manager (coordinator node)
+//
+// Run this pipeline:
+//   smasher run examples/hello-world.dot
+
+digraph HelloWorld {
+    // The start node is the pipeline's entry point.
+    start [shape=circle, label="Begin"];
+
+    // The exit node terminates the pipeline.
+    done  [shape=doublecircle, label="Done"];
+
+    // A single edge connects start to exit.
+    start -> done;
+}

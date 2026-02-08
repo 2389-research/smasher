@@ -190,7 +190,10 @@ mod tests {
         let event = rx.recv().await.unwrap();
         match event {
             SessionEvent::TurnStarted { turn_number } => {
-                assert_eq!(turn_number, 2, "late subscriber should only see events after subscription");
+                assert_eq!(
+                    turn_number, 2,
+                    "late subscriber should only see events after subscription"
+                );
             }
             other => panic!("unexpected event: {:?}", other),
         }
@@ -505,7 +508,10 @@ mod tests {
 
         // Should still receive the buffered event
         let event = rx.recv().await.unwrap();
-        assert!(matches!(event, SessionEvent::TurnStarted { turn_number: 1 }));
+        assert!(matches!(
+            event,
+            SessionEvent::TurnStarted { turn_number: 1 }
+        ));
 
         // Next recv should fail with Closed
         let result = rx.recv().await;

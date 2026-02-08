@@ -45,8 +45,7 @@ impl RetryPolicy {
     /// Uses the formula: `min(initial_backoff_ms * backoff_multiplier^attempt, max_backoff_ms)`.
     /// When jitter is enabled, the delay is multiplied by a random factor in `[0.5, 1.0)`.
     pub fn compute_delay(&self, attempt: u32) -> Duration {
-        let base_ms =
-            self.initial_backoff_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
+        let base_ms = self.initial_backoff_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
         let capped_ms = base_ms.min(self.max_backoff_ms as f64);
 
         let final_ms = if self.jitter {
@@ -131,8 +130,8 @@ where
 mod tests {
     use super::*;
     use crate::types::Error;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn default_policy_has_expected_values() {
@@ -181,7 +180,7 @@ mod tests {
             let delay = policy.compute_delay(0);
             let ms = delay.as_millis() as u64;
             assert!(
-                ms >= 500 && ms < 1000,
+                (500..1000).contains(&ms),
                 "expected delay in [500, 1000) but got {ms}"
             );
         }

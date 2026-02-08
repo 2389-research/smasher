@@ -1,0 +1,48 @@
+// ABOUTME: Pipeline demonstrating retry logic with configurable max attempts.
+// ABOUTME: Shows how node attributes control retry behavior with exponential backoff.
+
+// Smasher nodes support built-in retry for transient failures. When a
+// handler returns a retryable failure, the engine re-executes the node
+// according to the retry policy extracted from node attributes:
+//
+//   retries=N          — number of retries (total attempts = N + 1)
+//   retry_delay="1s"   — base delay between retries (supports s, ms, m, h)
+//   max_retry_delay="30s" — upper bound on exponential backoff
+//   retry_jitter=true  — randomize delay to avoid thundering herd
+//
+// This pipeline checks a condition. If the condition fails, the "failure"
+// edge loops back to a retry gate that re-checks. The engine's max_steps
+// limit (default 1000) prevents infinite loops.
+//
+// Run examples:
+//   smasher run examples/retry-loop.dot --var status=ready
+//   smasher run examples/retry-loop.dot --var status=waiting --max-steps 10
+
+digraph RetryLoop {
+    // Entry
+    start [shape=circle, label="Start"];
+
+    // The operation node with retry attributes.
+    // In a real pipeline this might be a codergen or tool node.
+    // Here we use a conditional to demonstrate the retry pattern.
+    attempt [
+        shape=diamond,
+        label="Check Status",
+        condition="status=ready",
+        retries=3,
+        retry_delay="1s",
+        max_retry_delay="10s",
+        retry_jitter=false
+    ];
+
+    // Success path
+    done [shape=doublecircle, label="Success"];
+
+    // Failure path (retries exhausted)
+    failed [shape=doublecircle, label="Failed"];
+
+    // Wiring
+    start   -> attempt;
+    attempt -> done   [label="success"];
+    attempt -> failed [label="failure"];
+}

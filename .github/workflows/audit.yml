@@ -1,0 +1,16 @@
+# ABOUTME: Security audit workflow that scans Cargo dependencies for known vulnerabilities.
+# ABOUTME: Runs on push to main and weekly on Mondays via cron schedule.
+name: Security Audit
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/audit@v1

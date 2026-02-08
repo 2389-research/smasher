@@ -244,7 +244,9 @@ mod tests {
                 .unwrap();
 
         let captured = adapter.captured_request.lock().unwrap();
-        let req = captured.as_ref().expect("request should have been captured");
+        let req = captured
+            .as_ref()
+            .expect("request should have been captured");
 
         match &req.response_format {
             Some(ResponseFormat::JsonSchema {
@@ -339,10 +341,9 @@ mod tests {
             "required": ["name", "members"]
         });
 
-        let result: ObjectResult<Team> =
-            generate_object(&client, test_request(), "team", schema)
-                .await
-                .unwrap();
+        let result: ObjectResult<Team> = generate_object(&client, test_request(), "team", schema)
+            .await
+            .unwrap();
 
         assert_eq!(result.object.name, "Alpha");
         assert_eq!(result.object.members, vec!["Alice", "Bob", "Charlie"]);

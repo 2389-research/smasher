@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::types::{
-    ContentPart, FinishReason, ImageSourceType, Message, Request, Response, Role, ToolChoice,
-    Usage,
+    ContentPart, FinishReason, ImageSourceType, Message, Request, Response, Role, ToolChoice, Usage,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,15 +98,10 @@ pub enum AnthropicContentBlock {
     },
 
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
 
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
 }
 
 /// Image source payload for the Anthropic image content block.
@@ -311,12 +305,15 @@ pub fn convert_request(request: &Request) -> AnthropicRequest {
     };
 
     // Map tool choice (None variant omits tool_choice entirely).
-    let tool_choice = request.tool_choice.as_ref().and_then(|choice| match choice {
-        ToolChoice::Auto => Some(AnthropicToolChoice::Auto),
-        ToolChoice::None => None,
-        ToolChoice::Required => Some(AnthropicToolChoice::Any),
-        ToolChoice::Specific { name } => Some(AnthropicToolChoice::Tool { name: name.clone() }),
-    });
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| match choice {
+            ToolChoice::Auto => Some(AnthropicToolChoice::Auto),
+            ToolChoice::None => None,
+            ToolChoice::Required => Some(AnthropicToolChoice::Any),
+            ToolChoice::Specific { name } => Some(AnthropicToolChoice::Tool { name: name.clone() }),
+        });
 
     // Map thinking config.
     let thinking = request.thinking.as_ref().and_then(|config| {
@@ -371,11 +368,7 @@ pub fn inject_cache_control(request: &mut AnthropicRequest) {
     }
 
     // Mark the last content block of the last user-role message for caching.
-    if let Some(last_user_msg) = request
-        .messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.role == "user")
+    if let Some(last_user_msg) = request.messages.iter_mut().rev().find(|m| m.role == "user")
         && let Some(last_block) = last_user_msg.content.last_mut()
     {
         set_cache_control(last_block, ephemeral);
@@ -385,22 +378,10 @@ pub fn inject_cache_control(request: &mut AnthropicRequest) {
 /// Set cache_control on a content block. Thinking blocks do not support caching.
 fn set_cache_control(block: &mut AnthropicContentBlock, cc: CacheControl) {
     match block {
-        AnthropicContentBlock::Text {
-            cache_control,
-            ..
-        } => *cache_control = Some(cc),
-        AnthropicContentBlock::Image {
-            cache_control,
-            ..
-        } => *cache_control = Some(cc),
-        AnthropicContentBlock::ToolUse {
-            cache_control,
-            ..
-        } => *cache_control = Some(cc),
-        AnthropicContentBlock::ToolResult {
-            cache_control,
-            ..
-        } => *cache_control = Some(cc),
+        AnthropicContentBlock::Text { cache_control, .. } => *cache_control = Some(cc),
+        AnthropicContentBlock::Image { cache_control, .. } => *cache_control = Some(cc),
+        AnthropicContentBlock::ToolUse { cache_control, .. } => *cache_control = Some(cc),
+        AnthropicContentBlock::ToolResult { cache_control, .. } => *cache_control = Some(cc),
         AnthropicContentBlock::Thinking { .. } => {
             // Thinking blocks do not support cache_control.
         }
@@ -421,11 +402,7 @@ fn convert_message(msg: &Message) -> AnthropicMessage {
         Role::System => "user".to_string(),
     };
 
-    let content = msg
-        .content
-        .iter()
-        .map(convert_content_part)
-        .collect();
+    let content = msg.content.iter().map(convert_content_part).collect();
 
     AnthropicMessage { role, content }
 }
@@ -459,9 +436,8 @@ fn convert_content_part(part: &ContentPart) -> AnthropicContentBlock {
 
         ContentPart::ToolCall(tc) => {
             // Parse the arguments string to a JSON Value for Anthropic's `input` field.
-            let input = serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(
-                serde_json::Map::new(),
-            ));
+            let input = serde_json::from_str(&tc.arguments)
+                .unwrap_or(Value::Object(serde_json::Map::new()));
             AnthropicContentBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
@@ -485,7 +461,11 @@ fn convert_content_part(part: &ContentPart) -> AnthropicContentBlock {
         ContentPart::Audio(audio) => {
             // Anthropic doesn't support audio blocks natively; send description.
             AnthropicContentBlock::Text {
-                text: format!("[Audio: {} format, {} bytes]", audio.format, audio.data.len()),
+                text: format!(
+                    "[Audio: {} format, {} bytes]",
+                    audio.format,
+                    audio.data.len()
+                ),
                 cache_control: None,
             }
         }
@@ -560,14 +540,14 @@ fn convert_content_block_to_part(block: AnthropicContentBlock) -> ContentPart {
             })
         }
 
-        AnthropicContentBlock::ToolUse { id, name, input, .. } => {
-            ContentPart::ToolCall(crate::types::ToolCallData {
-                id,
-                name,
-                arguments: serde_json::to_string(&input).unwrap_or_default(),
-                raw_arguments: None,
-            })
-        }
+        AnthropicContentBlock::ToolUse {
+            id, name, input, ..
+        } => ContentPart::ToolCall(crate::types::ToolCallData {
+            id,
+            name,
+            arguments: serde_json::to_string(&input).unwrap_or_default(),
+            raw_arguments: None,
+        }),
 
         AnthropicContentBlock::ToolResult {
             tool_use_id,
@@ -684,10 +664,7 @@ mod tests {
     fn convert_request_both_system_prompt_and_system_message() {
         let req = Request::new(
             "claude-sonnet-4-20250514",
-            vec![
-                Message::system("From messages"),
-                Message::user("Hello"),
-            ],
+            vec![Message::system("From messages"), Message::user("Hello")],
         )
         .system_prompt("From field");
         let anthropic = convert_request(&req);
@@ -808,7 +785,9 @@ mod tests {
         let anthropic = convert_request(&req);
 
         match &anthropic.messages[0].content[0] {
-            AnthropicContentBlock::ToolUse { id, name, input, .. } => {
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_123");
                 assert_eq!(name, "search");
                 assert_eq!(input["query"], "rust");
@@ -905,10 +884,7 @@ mod tests {
 
         assert_eq!(anthropic.temperature, Some(0.7));
         assert_eq!(anthropic.top_p, Some(0.9));
-        assert_eq!(
-            anthropic.stop_sequences,
-            Some(vec!["STOP".to_string()])
-        );
+        assert_eq!(anthropic.stop_sequences, Some(vec!["STOP".to_string()]));
     }
 
     // -- Response conversion tests --
@@ -975,7 +951,10 @@ mod tests {
         assert_eq!(map_stop_reason("end_turn"), FinishReason::Stop);
         assert_eq!(map_stop_reason("max_tokens"), FinishReason::Length);
         assert_eq!(map_stop_reason("tool_use"), FinishReason::ToolUse);
-        assert_eq!(map_stop_reason("content_filter"), FinishReason::ContentFilter);
+        assert_eq!(
+            map_stop_reason("content_filter"),
+            FinishReason::ContentFilter
+        );
         assert_eq!(map_stop_reason("unknown_reason"), FinishReason::Stop);
     }
 
@@ -1208,7 +1187,9 @@ mod tests {
         let json = serde_json::to_string(&block).unwrap();
         let back: AnthropicContentBlock = serde_json::from_str(&json).unwrap();
         match back {
-            AnthropicContentBlock::ToolUse { id, name, input, .. } => {
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_1");
                 assert_eq!(name, "search");
                 assert_eq!(input["q"], "test");
@@ -1338,14 +1319,12 @@ mod tests {
         });
         let event: AnthropicStreamEvent = serde_json::from_value(json).unwrap();
         match event {
-            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
-                match delta {
-                    AnthropicDelta::InputJsonDelta { partial_json } => {
-                        assert_eq!(partial_json, "{\"q\":");
-                    }
-                    other => panic!("expected InputJsonDelta, got {:?}", other),
+            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => match delta {
+                AnthropicDelta::InputJsonDelta { partial_json } => {
+                    assert_eq!(partial_json, "{\"q\":");
                 }
-            }
+                other => panic!("expected InputJsonDelta, got {:?}", other),
+            },
             other => panic!("expected ContentBlockDelta, got {:?}", other),
         }
     }
@@ -1359,14 +1338,12 @@ mod tests {
         });
         let event: AnthropicStreamEvent = serde_json::from_value(json).unwrap();
         match event {
-            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
-                match delta {
-                    AnthropicDelta::ThinkingDelta { thinking } => {
-                        assert_eq!(thinking, "Let me think...");
-                    }
-                    other => panic!("expected ThinkingDelta, got {:?}", other),
+            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => match delta {
+                AnthropicDelta::ThinkingDelta { thinking } => {
+                    assert_eq!(thinking, "Let me think...");
                 }
-            }
+                other => panic!("expected ThinkingDelta, got {:?}", other),
+            },
             other => panic!("expected ContentBlockDelta, got {:?}", other),
         }
     }
@@ -1571,10 +1548,7 @@ mod tests {
 
     #[test]
     fn request_without_system_prompt_still_works() {
-        let req = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hello")],
-        );
+        let req = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hello")]);
         let mut anthropic_req = convert_request(&req);
         inject_cache_control(&mut anthropic_req);
 
@@ -1672,10 +1646,7 @@ mod tests {
 
     #[test]
     fn cache_control_with_empty_messages() {
-        let req = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![],
-        );
+        let req = Request::new("claude-sonnet-4-20250514", vec![]);
         let mut anthropic_req = convert_request(&req);
         // Should not panic on empty messages.
         inject_cache_control(&mut anthropic_req);

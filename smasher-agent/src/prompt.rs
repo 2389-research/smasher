@@ -20,14 +20,38 @@ pub struct ProjectDocSpec {
 /// Files with `provider: None` are loaded for all providers. Files with a
 /// specific provider name are only loaded when the active profile matches.
 pub const PROJECT_DOC_SPECS: &[ProjectDocSpec] = &[
-    ProjectDocSpec { filename: "CLAUDE.md", provider: Some("anthropic") },
-    ProjectDocSpec { filename: ".claude", provider: Some("anthropic") },
-    ProjectDocSpec { filename: "GEMINI.md", provider: Some("gemini") },
-    ProjectDocSpec { filename: ".cursorrules", provider: Some("openai") },
-    ProjectDocSpec { filename: "AGENTS.md", provider: None },
-    ProjectDocSpec { filename: ".github/copilot-instructions.md", provider: None },
-    ProjectDocSpec { filename: "CONVENTIONS.md", provider: None },
-    ProjectDocSpec { filename: "AI_INSTRUCTIONS.md", provider: None },
+    ProjectDocSpec {
+        filename: "CLAUDE.md",
+        provider: Some("anthropic"),
+    },
+    ProjectDocSpec {
+        filename: ".claude",
+        provider: Some("anthropic"),
+    },
+    ProjectDocSpec {
+        filename: "GEMINI.md",
+        provider: Some("gemini"),
+    },
+    ProjectDocSpec {
+        filename: ".cursorrules",
+        provider: Some("openai"),
+    },
+    ProjectDocSpec {
+        filename: "AGENTS.md",
+        provider: None,
+    },
+    ProjectDocSpec {
+        filename: ".github/copilot-instructions.md",
+        provider: None,
+    },
+    ProjectDocSpec {
+        filename: "CONVENTIONS.md",
+        provider: None,
+    },
+    ProjectDocSpec {
+        filename: "AI_INSTRUCTIONS.md",
+        provider: None,
+    },
 ];
 
 /// Well-known project documentation files that may contain agent instructions.
@@ -257,8 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_system_prompt_includes_custom_instructions_from_config() {
-        let config = SessionConfig::default()
-            .with_system_prompt("Always write tests first");
+        let config = SessionConfig::default().with_system_prompt("Always write tests first");
         let profile = AnthropicProfile;
 
         let prompt = build_system_prompt(&config, &profile, None).await;
@@ -546,8 +569,7 @@ mod tests {
         let wd = tmp.path().to_str().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "Project-specific rules").unwrap();
 
-        let config = SessionConfig::default()
-            .with_system_prompt("Custom instructions from config");
+        let config = SessionConfig::default().with_system_prompt("Custom instructions from config");
         let profile = AnthropicProfile;
 
         let prompt = build_system_prompt(&config, &profile, Some(wd)).await;
@@ -735,10 +757,7 @@ mod tests {
 
         let result =
             discover_project_docs_for_provider(tmp.path().to_str().unwrap(), "gemini").await;
-        assert!(
-            result.is_none(),
-            "Gemini should not see CLAUDE.md"
-        );
+        assert!(result.is_none(), "Gemini should not see CLAUDE.md");
     }
 
     #[tokio::test]

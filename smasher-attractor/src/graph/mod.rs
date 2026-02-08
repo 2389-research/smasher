@@ -27,6 +27,8 @@ pub enum NodeType {
     Parallel,
     /// Manager/coordinator node.
     Manager,
+    /// Sub-pipeline node referencing an external DOT file for inline composition.
+    SubPipeline,
     /// Generic processing node.
     Generic,
 }
@@ -57,6 +59,9 @@ pub struct GraphEdge {
     pub label: Option<String>,
     pub condition: Option<String>,
     pub priority: Option<i32>,
+    /// When true, traversing this edge resets node-specific context entries
+    /// for the source node and increments the loop counter.
+    pub loop_restart: bool,
     pub attrs: HashMap<String, NodeAttrValue>,
 }
 
@@ -151,14 +156,14 @@ fn convert_attrs(attrs: &[DotAttr]) -> HashMap<String, NodeAttrValue> {
 /// Determine the NodeType from a shape string.
 fn node_type_from_shape(shape: &str) -> NodeType {
     match shape {
-        "circle" | "point" => NodeType::Start,
-        "doublecircle" => NodeType::Exit,
+        "circle" | "point" | "Mdiamond" => NodeType::Start,
+        "doublecircle" | "Msquare" => NodeType::Exit,
         "box" | "rectangle" => NodeType::Codergen,
         "diamond" => NodeType::Conditional,
-        "hexagon" => NodeType::Tool,
-        "oval" | "ellipse" => NodeType::Interviewer,
-        "parallelogram" => NodeType::Parallel,
+        "hexagon" | "oval" | "ellipse" => NodeType::Interviewer,
+        "parallelogram" | "tripleoctagon" => NodeType::Parallel,
         "house" => NodeType::Manager,
+        "component" => NodeType::SubPipeline,
         _ => NodeType::Generic,
     }
 }
@@ -199,7 +204,9 @@ fn extract_condition(attrs: &HashMap<String, NodeAttrValue>) -> Option<String> {
 }
 
 /// Extract priority from edge attributes.
-fn extract_priority(attrs: &HashMap<String, NodeAttrValue>) -> Result<Option<i32>, ResolutionError> {
+fn extract_priority(
+    attrs: &HashMap<String, NodeAttrValue>,
+) -> Result<Option<i32>, ResolutionError> {
     match attrs.get("priority") {
         Some(NodeAttrValue::Number(n)) => Ok(Some(*n as i32)),
         Some(other) => Err(ResolutionError::InvalidAttribute {
@@ -207,6 +214,18 @@ fn extract_priority(attrs: &HashMap<String, NodeAttrValue>) -> Result<Option<i32
             message: format!("expected a number, got {other:?}"),
         }),
         None => Ok(None),
+    }
+}
+
+/// Extract the loop_restart flag from edge attributes.
+///
+/// Accepts both Bool(true) and String("true") representations since
+/// DOT attributes may be quoted or unquoted.
+fn extract_loop_restart(attrs: &HashMap<String, NodeAttrValue>) -> bool {
+    match attrs.get("loop_restart") {
+        Some(NodeAttrValue::Bool(b)) => *b,
+        Some(NodeAttrValue::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
     }
 }
 
@@ -252,7 +271,7 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
             let node_type = shape
                 .as_deref()
                 .map(node_type_from_shape)
-                .unwrap_or(NodeType::Generic);
+                .unwrap_or(NodeType::Codergen);
             let label = extract_label(&all_attrs);
 
             // Store non-reserved attributes.
@@ -281,11 +300,12 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
             let label = extract_label(&all_attrs);
             let condition = extract_condition(&all_attrs);
             let priority = extract_priority(&all_attrs)?;
+            let loop_restart = extract_loop_restart(&all_attrs);
 
             // Store non-reserved attributes.
             let mut extra_attrs = HashMap::new();
             for (k, v) in &all_attrs {
-                if k != "label" && k != "condition" && k != "priority" {
+                if k != "label" && k != "condition" && k != "priority" && k != "loop_restart" {
                     extra_attrs.insert(k.clone(), v.clone());
                 }
             }
@@ -296,6 +316,7 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
                 label,
                 condition,
                 priority,
+                loop_restart,
                 attrs: extra_attrs,
             });
         }
@@ -309,7 +330,7 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
                 let node_type = shape
                     .as_deref()
                     .map(node_type_from_shape)
-                    .unwrap_or(NodeType::Generic);
+                    .unwrap_or(NodeType::Codergen);
 
                 let idx = nodes.len();
                 seen_node_ids.insert(node_id.clone(), idx);
@@ -401,15 +422,19 @@ mod tests {
         let cases = vec![
             ("circle", NodeType::Start),
             ("point", NodeType::Start),
+            ("Mdiamond", NodeType::Start),
             ("doublecircle", NodeType::Exit),
+            ("Msquare", NodeType::Exit),
             ("box", NodeType::Codergen),
             ("rectangle", NodeType::Codergen),
             ("diamond", NodeType::Conditional),
-            ("hexagon", NodeType::Tool),
+            ("hexagon", NodeType::Interviewer),
             ("oval", NodeType::Interviewer),
             ("ellipse", NodeType::Interviewer),
             ("parallelogram", NodeType::Parallel),
+            ("tripleoctagon", NodeType::Parallel),
             ("house", NodeType::Manager),
+            ("component", NodeType::SubPipeline),
             ("unknownshape", NodeType::Generic),
         ];
 
@@ -426,11 +451,7 @@ mod tests {
     // ---- Test 4: Edge extracts from/to ----
     #[test]
     fn resolve_edge_from_to() {
-        let dot = make_graph(vec![
-            plain_node("a"),
-            plain_node("b"),
-            plain_edge("a", "b"),
-        ]);
+        let dot = make_graph(vec![plain_node("a"), plain_node("b"), plain_edge("a", "b")]);
         let g = resolve(&dot).unwrap();
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].from, "a");
@@ -735,7 +756,7 @@ mod tests {
             Some(&NodeAttrValue::Number(3.0))
         );
         // shape and label should not be in extra attrs
-        assert!(g.nodes[0].attrs.get("shape").is_none());
+        assert!(!g.nodes[0].attrs.contains_key("shape"));
     }
 
     // ---- Default edge attributes stored in graph ----
@@ -752,6 +773,110 @@ mod tests {
         );
     }
 
+    // ---- Edge with loop_restart=true (Bool) is parsed correctly ----
+    #[test]
+    fn resolve_edge_loop_restart_bool() {
+        let dot = make_graph(vec![
+            plain_node("a"),
+            plain_node("b"),
+            DotStatement::Edge(DotEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "loop_restart".to_string(),
+                    value: DotValue::Bool(true),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        assert!(g.edges[0].loop_restart);
+    }
+
+    // ---- Edge with loop_restart="true" (String) is parsed correctly ----
+    #[test]
+    fn resolve_edge_loop_restart_string() {
+        let dot = make_graph(vec![
+            plain_node("a"),
+            plain_node("b"),
+            DotStatement::Edge(DotEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "loop_restart".to_string(),
+                    value: DotValue::String("true".to_string()),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        assert!(g.edges[0].loop_restart);
+    }
+
+    // ---- Edge with loop_restart="TRUE" (case-insensitive) is parsed correctly ----
+    #[test]
+    fn resolve_edge_loop_restart_case_insensitive() {
+        let dot = make_graph(vec![
+            plain_node("a"),
+            plain_node("b"),
+            DotStatement::Edge(DotEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "loop_restart".to_string(),
+                    value: DotValue::String("TRUE".to_string()),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        assert!(g.edges[0].loop_restart);
+    }
+
+    // ---- Edge without loop_restart defaults to false ----
+    #[test]
+    fn resolve_edge_loop_restart_defaults_false() {
+        let dot = make_graph(vec![plain_node("a"), plain_node("b"), plain_edge("a", "b")]);
+        let g = resolve(&dot).unwrap();
+        assert!(!g.edges[0].loop_restart);
+    }
+
+    // ---- Edge with loop_restart=false is parsed as false ----
+    #[test]
+    fn resolve_edge_loop_restart_false() {
+        let dot = make_graph(vec![
+            plain_node("a"),
+            plain_node("b"),
+            DotStatement::Edge(DotEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "loop_restart".to_string(),
+                    value: DotValue::Bool(false),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        assert!(!g.edges[0].loop_restart);
+    }
+
+    // ---- loop_restart is excluded from extra attrs ----
+    #[test]
+    fn resolve_edge_loop_restart_not_in_extra_attrs() {
+        let dot = make_graph(vec![
+            plain_node("a"),
+            plain_node("b"),
+            DotStatement::Edge(DotEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "loop_restart".to_string(),
+                    value: DotValue::Bool(true),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        assert!(g.edges[0].loop_restart);
+        assert!(!g.edges[0].attrs.contains_key("loop_restart"));
+    }
+
     // ---- Auto-created nodes use default shape ----
     #[test]
     fn auto_created_nodes_use_default_shape() {
@@ -765,7 +890,7 @@ mod tests {
         let g = resolve(&dot).unwrap();
         assert_eq!(g.nodes.len(), 2);
         for node in &g.nodes {
-            assert_eq!(node.node_type, NodeType::Tool);
+            assert_eq!(node.node_type, NodeType::Interviewer);
         }
     }
 }

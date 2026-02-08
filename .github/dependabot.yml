@@ -1,0 +1,12 @@
+# ABOUTME: Dependabot configuration for automated dependency update PRs.
+# ABOUTME: Monitors Cargo crate versions and GitHub Actions versions weekly.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

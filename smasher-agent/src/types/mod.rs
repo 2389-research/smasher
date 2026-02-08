@@ -62,9 +62,12 @@ pub enum SessionEvent {
     /// Session ended with an error.
     SessionError { session_id: String, error: String },
     /// Loop detection triggered.
-    LoopDetected {
-        pattern: String,
-        window_size: usize,
+    LoopDetected { pattern: String, window_size: usize },
+    /// Context window usage crossed a warning threshold.
+    ContextWindowWarning {
+        used: usize,
+        limit: usize,
+        fraction: f64,
     },
 }
 
@@ -93,6 +96,8 @@ pub struct SessionConfig {
     pub default_command_timeout_ms: Option<u64>,
     /// Maximum allowed timeout in milliseconds for shell tool commands.
     pub max_command_timeout_ms: Option<u64>,
+    /// Size of the model's context window in tokens (for usage tracking).
+    pub context_window_size: Option<usize>,
 }
 
 impl Default for SessionConfig {
@@ -109,6 +114,7 @@ impl Default for SessionConfig {
             env_vars: None,
             default_command_timeout_ms: None,
             max_command_timeout_ms: None,
+            context_window_size: None,
         }
     }
 }
@@ -171,6 +177,12 @@ impl SessionConfig {
     /// Set the maximum allowed timeout for shell tool commands (in milliseconds).
     pub fn with_max_command_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.max_command_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Set the context window size in tokens (for usage tracking).
+    pub fn with_context_window_size(mut self, size: usize) -> Self {
+        self.context_window_size = Some(size);
         self
     }
 }
@@ -312,6 +324,7 @@ mod tests {
         assert!(config.env_vars.is_none());
         assert!(config.default_command_timeout_ms.is_none());
         assert!(config.max_command_timeout_ms.is_none());
+        assert!(config.context_window_size.is_none());
     }
 
     // ── SessionConfig builder methods ─────────────────────────────────
@@ -546,9 +559,7 @@ mod tests {
 
     #[test]
     fn turn_user_input_construction() {
-        let turn = Turn::UserInput {
-            text: "hi".into(),
-        };
+        let turn = Turn::UserInput { text: "hi".into() };
         assert!(matches!(turn, Turn::UserInput { text } if text == "hi"));
     }
 
@@ -570,7 +581,13 @@ mod tests {
             is_error: false,
             duration_ms: 42,
         };
-        assert!(matches!(turn, Turn::ToolExecution { duration_ms: 42, .. }));
+        assert!(matches!(
+            turn,
+            Turn::ToolExecution {
+                duration_ms: 42,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -714,7 +731,7 @@ mod tests {
     #[test]
     fn session_phase_clone_and_copy() {
         let phase = SessionPhase::AwaitingInput;
-        let cloned = phase.clone();
+        let cloned = phase;
         let copied = phase;
         assert_eq!(phase, cloned);
         assert_eq!(phase, copied);
@@ -762,5 +779,69 @@ mod tests {
         assert_eq!(config.max_turns, 25);
         assert_eq!(config.default_command_timeout_ms, Some(5_000));
         assert_eq!(config.max_command_timeout_ms, Some(300_000));
+    }
+
+    // ── SessionConfig context_window_size ────────────────────────────────
+
+    #[test]
+    fn session_config_with_context_window_size() {
+        let config = SessionConfig::default().with_context_window_size(200_000);
+        assert_eq!(config.context_window_size, Some(200_000));
+    }
+
+    #[test]
+    fn session_config_context_window_size_chains_with_other_builders() {
+        let config = SessionConfig::default()
+            .with_model("gpt-4o")
+            .with_context_window_size(128_000)
+            .with_max_turns(50);
+        assert_eq!(config.model, "gpt-4o");
+        assert_eq!(config.context_window_size, Some(128_000));
+        assert_eq!(config.max_turns, 50);
+    }
+
+    // ── SessionEvent::ContextWindowWarning ──────────────────────────────
+
+    #[test]
+    fn session_event_context_window_warning() {
+        let event = SessionEvent::ContextWindowWarning {
+            used: 80_000,
+            limit: 100_000,
+            fraction: 0.8,
+        };
+        match event {
+            SessionEvent::ContextWindowWarning {
+                used,
+                limit,
+                fraction,
+            } => {
+                assert_eq!(used, 80_000);
+                assert_eq!(limit, 100_000);
+                assert!((fraction - 0.8).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_event_context_window_warning_clone() {
+        let event = SessionEvent::ContextWindowWarning {
+            used: 95_000,
+            limit: 100_000,
+            fraction: 0.95,
+        };
+        let cloned = event.clone();
+        match cloned {
+            SessionEvent::ContextWindowWarning {
+                used,
+                limit,
+                fraction,
+            } => {
+                assert_eq!(used, 95_000);
+                assert_eq!(limit, 100_000);
+                assert!((fraction - 0.95).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected cloned event: {:?}", other),
+        }
     }
 }

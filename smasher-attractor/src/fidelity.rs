@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::Context;
 
+/// Default maximum character length for truncated context values.
+const DEFAULT_TRUNCATE_MAX_LEN: usize = 1000;
+
+/// Suffix appended to values that have been truncated.
+const TRUNCATED_SUFFIX: &str = "...[truncated]";
+
 /// Controls how much context is carried from one pipeline node to the next.
 ///
 /// Different modes trade off between continuity (the downstream node can see
@@ -168,21 +174,11 @@ impl FidelityProcessor {
                 let snapshot = context.snapshot();
                 Context::from(snapshot)
             }
-            FidelityMode::Truncate => {
-                self.clone_with_marker(context, "truncate")
-            }
-            FidelityMode::Compact => {
-                self.clone_with_marker(context, "compact")
-            }
-            FidelityMode::SummaryLow => {
-                self.clone_with_marker(context, "summary:low")
-            }
-            FidelityMode::SummaryMedium => {
-                self.clone_with_marker(context, "summary:medium")
-            }
-            FidelityMode::SummaryHigh => {
-                self.clone_with_marker(context, "summary:high")
-            }
+            FidelityMode::Truncate => self.clone_with_marker(context, "truncate"),
+            FidelityMode::Compact => self.clone_with_marker(context, "compact"),
+            FidelityMode::SummaryLow => self.clone_with_marker(context, "summary:low"),
+            FidelityMode::SummaryMedium => self.clone_with_marker(context, "summary:medium"),
+            FidelityMode::SummaryHigh => self.clone_with_marker(context, "summary:high"),
             FidelityMode::Reset => Context::new(),
             FidelityMode::ResultOnly => {
                 let snapshot = context.snapshot();
@@ -204,6 +200,132 @@ impl FidelityProcessor {
             serde_json::Value::String(marker.to_string()),
         );
         new_ctx
+    }
+}
+
+/// Apply fidelity-based compaction to a string-keyed context map.
+///
+/// Each `FidelityMode` applies a different reduction strategy:
+/// - `Full` — returns the context unchanged.
+/// - `Truncate` — truncates each value to `DEFAULT_TRUNCATE_MAX_LEN` characters,
+///   appending a `"...[truncated]"` suffix when clipped.
+/// - `Compact` — removes keys starting with `_` (internal state) and truncates
+///   remaining values.
+/// - `ResultOnly` — keeps only keys ending in `_result` or `_output`.
+/// - `Reset` — returns an empty map (fresh start).
+/// - Summary modes (`SummaryLow`, `SummaryMedium`, `SummaryHigh`) behave the same
+///   as `Truncate` for compaction purposes — the actual summarization happens
+///   elsewhere via an LLM call.
+pub fn compact_context(
+    context: &HashMap<String, String>,
+    mode: &FidelityMode,
+) -> HashMap<String, String> {
+    match mode {
+        FidelityMode::Full => context.clone(),
+
+        FidelityMode::Truncate
+        | FidelityMode::SummaryLow
+        | FidelityMode::SummaryMedium
+        | FidelityMode::SummaryHigh => context
+            .iter()
+            .map(|(k, v)| (k.clone(), truncate_value(v, DEFAULT_TRUNCATE_MAX_LEN)))
+            .collect(),
+
+        FidelityMode::Compact => context
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| (k.clone(), truncate_value(v, DEFAULT_TRUNCATE_MAX_LEN)))
+            .collect(),
+
+        FidelityMode::ResultOnly => context
+            .iter()
+            .filter(|(k, _)| k.ends_with("_result") || k.ends_with("_output"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+
+        FidelityMode::Reset => HashMap::new(),
+    }
+}
+
+/// Generate a human-readable preamble summarizing the context for a node prompt.
+///
+/// The format varies by fidelity mode so downstream nodes get an appropriate
+/// level of context visibility:
+/// - `Full` — full `key=value` listing, one per line.
+/// - `Truncate` / `Compact` / Summary modes — abbreviated listing showing
+///   retained keys, with a `[N keys hidden]` note for any removed keys.
+/// - `ResultOnly` — only result/output values are listed.
+/// - `Reset` — the string `"[context reset]"`.
+pub fn generate_preamble(context: &HashMap<String, String>, mode: &FidelityMode) -> String {
+    match mode {
+        FidelityMode::Full => {
+            if context.is_empty() {
+                return String::from("[no context]");
+            }
+            let mut lines: Vec<String> = context.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            lines.sort();
+            lines.join("\n")
+        }
+
+        FidelityMode::Truncate
+        | FidelityMode::SummaryLow
+        | FidelityMode::SummaryMedium
+        | FidelityMode::SummaryHigh => {
+            let compacted = compact_context(context, mode);
+            if compacted.is_empty() {
+                return String::from("[no context]");
+            }
+            let mut lines: Vec<String> =
+                compacted.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            lines.sort();
+            let hidden = context.len().saturating_sub(compacted.len());
+            if hidden > 0 {
+                lines.push(format!("[{hidden} keys hidden]"));
+            }
+            lines.join("\n")
+        }
+
+        FidelityMode::Compact => {
+            let compacted = compact_context(context, mode);
+            let hidden = context.len().saturating_sub(compacted.len());
+            if compacted.is_empty() && hidden == 0 {
+                return String::from("[no context]");
+            }
+            let mut lines: Vec<String> =
+                compacted.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            lines.sort();
+            if hidden > 0 {
+                lines.push(format!("[{hidden} keys hidden]"));
+            }
+            if lines.is_empty() {
+                return String::from("[no context]");
+            }
+            lines.join("\n")
+        }
+
+        FidelityMode::ResultOnly => {
+            let compacted = compact_context(context, mode);
+            if compacted.is_empty() {
+                return String::from("[no results]");
+            }
+            let mut lines: Vec<String> =
+                compacted.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            lines.sort();
+            lines.join("\n")
+        }
+
+        FidelityMode::Reset => String::from("[context reset]"),
+    }
+}
+
+/// Truncate a string value to `max_len` characters, appending a suffix if clipped.
+fn truncate_value(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else {
+        let mut truncated = value[..max_len].to_string();
+        truncated.push_str(TRUNCATED_SUFFIX);
+        truncated
     }
 }
 
@@ -314,8 +436,11 @@ mod tests {
 
     #[test]
     fn fidelity_config_mode_for_edge_returns_override_when_present() {
-        let config = FidelityConfig::new(FidelityMode::Full)
-            .with_edge_override("parse", "validate", FidelityMode::Reset);
+        let config = FidelityConfig::new(FidelityMode::Full).with_edge_override(
+            "parse",
+            "validate",
+            FidelityMode::Reset,
+        );
 
         assert_eq!(
             config.mode_for_edge("parse", "validate"),
@@ -513,8 +638,11 @@ mod tests {
 
     #[test]
     fn processor_uses_edge_override_over_default() {
-        let config = FidelityConfig::new(FidelityMode::Full)
-            .with_edge_override("node_1", "node_2", FidelityMode::Reset);
+        let config = FidelityConfig::new(FidelityMode::Full).with_edge_override(
+            "node_1",
+            "node_2",
+            FidelityMode::Reset,
+        );
         let processor = FidelityProcessor::new(config);
 
         let ctx = Context::new();
@@ -556,9 +684,16 @@ mod tests {
 
             assert_eq!(result.get("alpha"), Some(json!(1)), "failed for {mode}");
             assert_eq!(result.get("beta"), Some(json!("two")), "failed for {mode}");
-            assert_eq!(result.get("_system"), Some(json!(true)), "failed for {mode}");
+            assert_eq!(
+                result.get("_system"),
+                Some(json!(true)),
+                "failed for {mode}"
+            );
             // The marker key should also be present
-            assert!(result.get("_fidelity_mode").is_some(), "missing marker for {mode}");
+            assert!(
+                result.get("_fidelity_mode").is_some(),
+                "missing marker for {mode}"
+            );
         }
     }
 
@@ -580,26 +715,74 @@ mod tests {
 
     #[test]
     fn fidelity_mode_serializes_to_expected_json_strings() {
-        assert_eq!(serde_json::to_string(&FidelityMode::Full).unwrap(), "\"full\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::Truncate).unwrap(), "\"truncate\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::Compact).unwrap(), "\"compact\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::SummaryLow).unwrap(), "\"summary_low\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::SummaryMedium).unwrap(), "\"summary_medium\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::SummaryHigh).unwrap(), "\"summary_high\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::Reset).unwrap(), "\"reset\"");
-        assert_eq!(serde_json::to_string(&FidelityMode::ResultOnly).unwrap(), "\"result_only\"");
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::Full).unwrap(),
+            "\"full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::Truncate).unwrap(),
+            "\"truncate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::Compact).unwrap(),
+            "\"compact\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::SummaryLow).unwrap(),
+            "\"summary_low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::SummaryMedium).unwrap(),
+            "\"summary_medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::SummaryHigh).unwrap(),
+            "\"summary_high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::Reset).unwrap(),
+            "\"reset\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FidelityMode::ResultOnly).unwrap(),
+            "\"result_only\""
+        );
     }
 
     #[test]
     fn fidelity_mode_deserializes_from_json_strings() {
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"full\"").unwrap(), FidelityMode::Full);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"truncate\"").unwrap(), FidelityMode::Truncate);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"compact\"").unwrap(), FidelityMode::Compact);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"summary_low\"").unwrap(), FidelityMode::SummaryLow);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"summary_medium\"").unwrap(), FidelityMode::SummaryMedium);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"summary_high\"").unwrap(), FidelityMode::SummaryHigh);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"reset\"").unwrap(), FidelityMode::Reset);
-        assert_eq!(serde_json::from_str::<FidelityMode>("\"result_only\"").unwrap(), FidelityMode::ResultOnly);
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"full\"").unwrap(),
+            FidelityMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"truncate\"").unwrap(),
+            FidelityMode::Truncate
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"compact\"").unwrap(),
+            FidelityMode::Compact
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"summary_low\"").unwrap(),
+            FidelityMode::SummaryLow
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"summary_medium\"").unwrap(),
+            FidelityMode::SummaryMedium
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"summary_high\"").unwrap(),
+            FidelityMode::SummaryHigh
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"reset\"").unwrap(),
+            FidelityMode::Reset
+        );
+        assert_eq!(
+            serde_json::from_str::<FidelityMode>("\"result_only\"").unwrap(),
+            FidelityMode::ResultOnly
+        );
     }
 
     // ---------------------------------------------------------------
@@ -608,8 +791,11 @@ mod tests {
 
     #[test]
     fn processor_edge_override_with_compact_mode() {
-        let config = FidelityConfig::new(FidelityMode::Full)
-            .with_edge_override("parse", "transform", FidelityMode::Compact);
+        let config = FidelityConfig::new(FidelityMode::Full).with_edge_override(
+            "parse",
+            "transform",
+            FidelityMode::Compact,
+        );
         let processor = FidelityProcessor::new(config);
 
         let ctx = Context::new();
@@ -624,5 +810,429 @@ mod tests {
         let result2 = processor.process("parse", "validate", &ctx);
         assert_eq!(result2.get("_fidelity_mode"), None);
         assert_eq!(result2.get("data"), Some(json!("raw")));
+    }
+
+    // ===============================================================
+    // compact_context and generate_preamble tests
+    // ===============================================================
+
+    // ---------------------------------------------------------------
+    // Helper: build a test context as HashMap<String, String>
+    // ---------------------------------------------------------------
+
+    fn test_string_context() -> HashMap<String, String> {
+        let mut ctx = HashMap::new();
+        ctx.insert("greeting".to_string(), "hello world".to_string());
+        ctx.insert("count".to_string(), "42".to_string());
+        ctx.insert("_internal".to_string(), "hidden state".to_string());
+        ctx.insert("task_result".to_string(), "success".to_string());
+        ctx.insert("log_output".to_string(), "some logs".to_string());
+        ctx
+    }
+
+    fn long_value(len: usize) -> String {
+        "x".repeat(len)
+    }
+
+    // ---------------------------------------------------------------
+    // truncate_value helper
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn truncate_value_short_string_unchanged() {
+        let result = truncate_value("hello", 1000);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn truncate_value_exact_length_unchanged() {
+        let val = long_value(1000);
+        let result = truncate_value(&val, 1000);
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn truncate_value_long_string_gets_suffix() {
+        let val = long_value(1500);
+        let result = truncate_value(&val, 1000);
+        assert_eq!(result.len(), 1000 + TRUNCATED_SUFFIX.len());
+        assert!(result.ends_with(TRUNCATED_SUFFIX));
+        assert!(result.starts_with(&"x".repeat(1000)));
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: Full mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_full_returns_context_unchanged() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Full);
+        assert_eq!(result, ctx);
+    }
+
+    #[test]
+    fn compact_full_preserves_internal_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Full);
+        assert!(result.contains_key("_internal"));
+    }
+
+    #[test]
+    fn compact_full_empty_context_returns_empty() {
+        let ctx = HashMap::new();
+        let result = compact_context(&ctx, &FidelityMode::Full);
+        assert!(result.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: Truncate mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_truncate_short_values_unchanged() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Truncate);
+        assert_eq!(result.get("greeting"), Some(&"hello world".to_string()));
+        assert_eq!(result.get("count"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn compact_truncate_preserves_all_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Truncate);
+        assert_eq!(result.len(), ctx.len());
+        for key in ctx.keys() {
+            assert!(result.contains_key(key), "missing key: {key}");
+        }
+    }
+
+    #[test]
+    fn compact_truncate_clips_long_values() {
+        let mut ctx = HashMap::new();
+        ctx.insert("big".to_string(), long_value(2000));
+        let result = compact_context(&ctx, &FidelityMode::Truncate);
+        let val = result.get("big").unwrap();
+        assert!(val.ends_with(TRUNCATED_SUFFIX));
+        assert_eq!(val.len(), DEFAULT_TRUNCATE_MAX_LEN + TRUNCATED_SUFFIX.len());
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: Compact mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_compact_removes_underscore_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Compact);
+        assert!(!result.contains_key("_internal"));
+    }
+
+    #[test]
+    fn compact_compact_keeps_non_underscore_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Compact);
+        assert!(result.contains_key("greeting"));
+        assert!(result.contains_key("count"));
+        assert!(result.contains_key("task_result"));
+        assert!(result.contains_key("log_output"));
+    }
+
+    #[test]
+    fn compact_compact_truncates_remaining_values() {
+        let mut ctx = HashMap::new();
+        ctx.insert("data".to_string(), long_value(2000));
+        ctx.insert("_secret".to_string(), "should be removed".to_string());
+        let result = compact_context(&ctx, &FidelityMode::Compact);
+        assert!(!result.contains_key("_secret"));
+        let val = result.get("data").unwrap();
+        assert!(val.ends_with(TRUNCATED_SUFFIX));
+    }
+
+    #[test]
+    fn compact_compact_all_underscore_keys_returns_empty() {
+        let mut ctx = HashMap::new();
+        ctx.insert("_a".to_string(), "val".to_string());
+        ctx.insert("_b".to_string(), "val".to_string());
+        let result = compact_context(&ctx, &FidelityMode::Compact);
+        assert!(result.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: ResultOnly mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_result_only_keeps_result_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert!(result.contains_key("task_result"));
+    }
+
+    #[test]
+    fn compact_result_only_keeps_output_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert!(result.contains_key("log_output"));
+    }
+
+    #[test]
+    fn compact_result_only_drops_other_keys() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert!(!result.contains_key("greeting"));
+        assert!(!result.contains_key("count"));
+        assert!(!result.contains_key("_internal"));
+    }
+
+    #[test]
+    fn compact_result_only_exact_count() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn compact_result_only_no_matching_keys_returns_empty() {
+        let mut ctx = HashMap::new();
+        ctx.insert("greeting".to_string(), "hello".to_string());
+        ctx.insert("_internal".to_string(), "state".to_string());
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compact_result_only_preserves_values_untruncated() {
+        let mut ctx = HashMap::new();
+        let big = long_value(2000);
+        ctx.insert("big_result".to_string(), big.clone());
+        let result = compact_context(&ctx, &FidelityMode::ResultOnly);
+        assert_eq!(result.get("big_result"), Some(&big));
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: Reset mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_reset_returns_empty() {
+        let ctx = test_string_context();
+        let result = compact_context(&ctx, &FidelityMode::Reset);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compact_reset_empty_input_returns_empty() {
+        let ctx = HashMap::new();
+        let result = compact_context(&ctx, &FidelityMode::Reset);
+        assert!(result.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // compact_context: Summary modes (behave like Truncate)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_summary_modes_behave_like_truncate() {
+        let mut ctx = HashMap::new();
+        ctx.insert("data".to_string(), long_value(2000));
+        ctx.insert("_internal".to_string(), "kept".to_string());
+
+        for mode in &[
+            FidelityMode::SummaryLow,
+            FidelityMode::SummaryMedium,
+            FidelityMode::SummaryHigh,
+        ] {
+            let result = compact_context(&ctx, mode);
+            // All keys should be present (unlike Compact, underscore keys are kept)
+            assert_eq!(result.len(), 2, "wrong key count for {mode}");
+            assert!(
+                result.contains_key("_internal"),
+                "missing _internal for {mode}"
+            );
+            // Long values should be truncated
+            let val = result.get("data").unwrap();
+            assert!(val.ends_with(TRUNCATED_SUFFIX), "not truncated for {mode}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: Full mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_full_lists_all_key_values_sorted() {
+        let mut ctx = HashMap::new();
+        ctx.insert("beta".to_string(), "2".to_string());
+        ctx.insert("alpha".to_string(), "1".to_string());
+        let preamble = generate_preamble(&ctx, &FidelityMode::Full);
+        assert_eq!(preamble, "alpha=1\nbeta=2");
+    }
+
+    #[test]
+    fn preamble_full_empty_context() {
+        let ctx = HashMap::new();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Full);
+        assert_eq!(preamble, "[no context]");
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: Truncate mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_truncate_shows_truncated_values() {
+        let mut ctx = HashMap::new();
+        ctx.insert("data".to_string(), long_value(2000));
+        let preamble = generate_preamble(&ctx, &FidelityMode::Truncate);
+        assert!(preamble.contains("data="));
+        assert!(preamble.contains(TRUNCATED_SUFFIX));
+    }
+
+    #[test]
+    fn preamble_truncate_empty_context() {
+        let ctx = HashMap::new();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Truncate);
+        assert_eq!(preamble, "[no context]");
+    }
+
+    #[test]
+    fn preamble_truncate_no_hidden_keys_note_when_all_kept() {
+        let mut ctx = HashMap::new();
+        ctx.insert("a".to_string(), "1".to_string());
+        let preamble = generate_preamble(&ctx, &FidelityMode::Truncate);
+        assert!(!preamble.contains("keys hidden"));
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: Compact mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_compact_shows_hidden_count() {
+        let ctx = test_string_context();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Compact);
+        // _internal should be hidden
+        assert!(preamble.contains("[1 keys hidden]"));
+        assert!(!preamble.contains("_internal="));
+    }
+
+    #[test]
+    fn preamble_compact_no_hidden_note_when_no_underscore_keys() {
+        let mut ctx = HashMap::new();
+        ctx.insert("visible".to_string(), "yes".to_string());
+        let preamble = generate_preamble(&ctx, &FidelityMode::Compact);
+        assert!(!preamble.contains("keys hidden"));
+        assert!(preamble.contains("visible=yes"));
+    }
+
+    #[test]
+    fn preamble_compact_all_keys_hidden() {
+        let mut ctx = HashMap::new();
+        ctx.insert("_a".to_string(), "1".to_string());
+        ctx.insert("_b".to_string(), "2".to_string());
+        let preamble = generate_preamble(&ctx, &FidelityMode::Compact);
+        assert!(preamble.contains("[2 keys hidden]"));
+    }
+
+    #[test]
+    fn preamble_compact_empty_context() {
+        let ctx = HashMap::new();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Compact);
+        assert_eq!(preamble, "[no context]");
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: ResultOnly mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_result_only_shows_result_keys() {
+        let ctx = test_string_context();
+        let preamble = generate_preamble(&ctx, &FidelityMode::ResultOnly);
+        assert!(preamble.contains("task_result=success"));
+        assert!(preamble.contains("log_output=some logs"));
+        assert!(!preamble.contains("greeting"));
+    }
+
+    #[test]
+    fn preamble_result_only_no_results_available() {
+        let mut ctx = HashMap::new();
+        ctx.insert("data".to_string(), "no results here".to_string());
+        let preamble = generate_preamble(&ctx, &FidelityMode::ResultOnly);
+        assert_eq!(preamble, "[no results]");
+    }
+
+    #[test]
+    fn preamble_result_only_empty_context() {
+        let ctx = HashMap::new();
+        let preamble = generate_preamble(&ctx, &FidelityMode::ResultOnly);
+        assert_eq!(preamble, "[no results]");
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: Reset mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_reset_returns_reset_marker() {
+        let ctx = test_string_context();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Reset);
+        assert_eq!(preamble, "[context reset]");
+    }
+
+    #[test]
+    fn preamble_reset_empty_context_still_reset() {
+        let ctx = HashMap::new();
+        let preamble = generate_preamble(&ctx, &FidelityMode::Reset);
+        assert_eq!(preamble, "[context reset]");
+    }
+
+    // ---------------------------------------------------------------
+    // generate_preamble: Summary modes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preamble_summary_modes_produce_abbreviated_listing() {
+        let mut ctx = HashMap::new();
+        ctx.insert("alpha".to_string(), "1".to_string());
+        ctx.insert("beta".to_string(), long_value(2000));
+
+        for mode in &[
+            FidelityMode::SummaryLow,
+            FidelityMode::SummaryMedium,
+            FidelityMode::SummaryHigh,
+        ] {
+            let preamble = generate_preamble(&ctx, mode);
+            assert!(preamble.contains("alpha=1"), "missing alpha for {mode}");
+            assert!(
+                preamble.contains(TRUNCATED_SUFFIX),
+                "not truncated for {mode}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Integration: compact_context + generate_preamble round-trip
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_then_preamble_full_mode_consistent() {
+        let ctx = test_string_context();
+        let compacted = compact_context(&ctx, &FidelityMode::Full);
+        let preamble = generate_preamble(&compacted, &FidelityMode::Full);
+        // All keys should appear in the preamble
+        for key in ctx.keys() {
+            assert!(preamble.contains(key), "missing {key} in preamble");
+        }
+    }
+
+    #[test]
+    fn compact_then_preamble_reset_mode_consistent() {
+        let ctx = test_string_context();
+        let compacted = compact_context(&ctx, &FidelityMode::Reset);
+        assert!(compacted.is_empty());
+        let preamble = generate_preamble(&compacted, &FidelityMode::Full);
+        assert_eq!(preamble, "[no context]");
     }
 }

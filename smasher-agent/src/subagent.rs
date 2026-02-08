@@ -1,8 +1,8 @@
 // ABOUTME: Subagent support for spawning child sessions with independent conversation histories.
 // ABOUTME: Provides config, result types, and a manager that enforces depth and concurrency limits.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::events::EventEmitter;
 use crate::session::{Session, SessionError};
@@ -317,10 +317,7 @@ mod tests {
 
         assert_eq!(config.task, "Do stuff");
         assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-20250514"));
-        assert_eq!(
-            config.system_prompt.as_deref(),
-            Some("You are helpful.")
-        );
+        assert_eq!(config.system_prompt.as_deref(), Some("You are helpful."));
         assert_eq!(config.max_turns, 5);
     }
 
@@ -367,7 +364,9 @@ mod tests {
         let tool_registry = ToolRegistry::new();
         let event_emitter = EventEmitter::default();
 
-        let result = manager.spawn(config, client, tool_registry, event_emitter).await;
+        let result = manager
+            .spawn(config, client, tool_registry, event_emitter)
+            .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             SubagentError::DepthLimitExceeded { max_depth } => {
@@ -388,7 +387,9 @@ mod tests {
         let tool_registry = ToolRegistry::new();
         let event_emitter = EventEmitter::default();
 
-        let result = manager.spawn(config, client, tool_registry, event_emitter).await;
+        let result = manager
+            .spawn(config, client, tool_registry, event_emitter)
+            .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             SubagentError::ConcurrencyLimitReached { max_concurrent } => {
@@ -460,9 +461,6 @@ mod tests {
         assert!(result.error.is_none());
         // Session ID should be a valid UUID (36 chars with 4 dashes)
         assert_eq!(result.session_id.len(), 36);
-        assert_eq!(
-            result.session_id.chars().filter(|c| *c == '-').count(),
-            4
-        );
+        assert_eq!(result.session_id.chars().filter(|c| *c == '-').count(), 4);
     }
 }

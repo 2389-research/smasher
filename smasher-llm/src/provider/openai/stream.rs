@@ -187,8 +187,8 @@ pub fn translate_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
     use futures::StreamExt;
+    use futures::stream;
 
     /// Helper to create an SSE event with a given event type and JSON data.
     fn sse(event_type: &str, data: &str) -> Result<SseEvent, Error> {
@@ -200,9 +200,7 @@ mod tests {
     }
 
     /// Collect all stream events from a translated stream.
-    async fn collect_events(
-        events: Vec<Result<SseEvent, Error>>,
-    ) -> Vec<StreamEvent> {
+    async fn collect_events(events: Vec<Result<SseEvent, Error>>) -> Vec<StreamEvent> {
         let sse_stream: Pin<Box<dyn Stream<Item = Result<SseEvent, Error>> + Send>> =
             Box::pin(stream::iter(events));
 
@@ -243,10 +241,16 @@ mod tests {
         assert_eq!(result[0].response_id.as_deref(), Some("resp_1"));
         assert_eq!(result[0].model.as_deref(), Some("gpt-4o"));
 
-        assert_eq!(result[1].event_type, crate::types::StreamEventType::ContentDelta);
+        assert_eq!(
+            result[1].event_type,
+            crate::types::StreamEventType::ContentDelta
+        );
         assert_eq!(result[1].text_delta.as_deref(), Some("Hello"));
 
-        assert_eq!(result[2].event_type, crate::types::StreamEventType::ContentDelta);
+        assert_eq!(
+            result[2].event_type,
+            crate::types::StreamEventType::ContentDelta
+        );
         assert_eq!(result[2].text_delta.as_deref(), Some(" world"));
 
         assert_eq!(result[3].event_type, crate::types::StreamEventType::End);
@@ -286,12 +290,18 @@ mod tests {
         assert_eq!(result[0].event_type, crate::types::StreamEventType::Start);
 
         // First tool call delta should include the name.
-        assert_eq!(result[1].event_type, crate::types::StreamEventType::ToolCallDelta);
+        assert_eq!(
+            result[1].event_type,
+            crate::types::StreamEventType::ToolCallDelta
+        );
         assert_eq!(result[1].tool_call_id.as_deref(), Some("call_abc"));
         assert_eq!(result[1].tool_name.as_deref(), Some("get_weather"));
 
         // Second delta should not repeat the name.
-        assert_eq!(result[2].event_type, crate::types::StreamEventType::ToolCallDelta);
+        assert_eq!(
+            result[2].event_type,
+            crate::types::StreamEventType::ToolCallDelta
+        );
         assert_eq!(result[2].tool_call_id.as_deref(), Some("call_abc"));
         assert!(result[2].tool_name.is_none());
 
@@ -322,7 +332,10 @@ mod tests {
         // Start + ThinkingDelta + End = 3
         assert_eq!(result.len(), 3);
 
-        assert_eq!(result[1].event_type, crate::types::StreamEventType::ThinkingDelta);
+        assert_eq!(
+            result[1].event_type,
+            crate::types::StreamEventType::ThinkingDelta
+        );
         assert_eq!(result[1].thinking_delta.as_deref(), Some("Thinking..."));
 
         let usage = result[2].usage.as_ref().unwrap();

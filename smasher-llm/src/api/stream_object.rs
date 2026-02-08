@@ -166,10 +166,7 @@ mod tests {
 
     fn test_client(events: Vec<StreamEvent>) -> Client {
         let mut client = Client::new();
-        client.register_provider(
-            Provider::Anthropic,
-            Arc::new(StreamMockAdapter { events }),
-        );
+        client.register_provider(Provider::Anthropic, Arc::new(StreamMockAdapter { events }));
         client
     }
 
@@ -233,7 +230,11 @@ mod tests {
         }
 
         // We should have received multiple partial events with growing raw text.
-        assert!(raw_texts.len() >= 2, "expected at least 2 partial events, got {}", raw_texts.len());
+        assert!(
+            raw_texts.len() >= 2,
+            "expected at least 2 partial events, got {}",
+            raw_texts.len()
+        );
 
         // Each successive raw_text should be longer than or equal to the previous.
         for window in raw_texts.windows(2) {
@@ -247,8 +248,14 @@ mod tests {
 
         // The last raw_text should contain the full JSON.
         let last = raw_texts.last().unwrap();
-        assert!(last.contains("Alice"), "final raw text should contain 'Alice': {last}");
-        assert!(last.contains("30"), "final raw text should contain '30': {last}");
+        assert!(
+            last.contains("Alice"),
+            "final raw text should contain 'Alice': {last}"
+        );
+        assert!(
+            last.contains("30"),
+            "final raw text should contain '30': {last}"
+        );
 
         // Wait for the spawned task to complete.
         let _ = handle.await.unwrap().unwrap();
@@ -275,7 +282,10 @@ mod tests {
 
         // All events before the last should not be marked as complete.
         for event in &events[..events.len() - 1] {
-            assert!(!event.is_complete, "non-final event should not be marked as complete");
+            assert!(
+                !event.is_complete,
+                "non-final event should not be marked as complete"
+            );
         }
 
         let _ = handle.await.unwrap().unwrap();
@@ -322,7 +332,7 @@ mod tests {
     async fn partial_is_none_when_json_incomplete() {
         let events = vec![
             StreamEvent::start("resp_1", "claude-sonnet-4"),
-            StreamEvent::text_delta(r#"{"name""#),   // incomplete JSON
+            StreamEvent::text_delta(r#"{"name""#), // incomplete JSON
             StreamEvent::text_delta(r#": "Bob", "age": 42}"#), // completes it
             StreamEvent::end(Some(FinishReason::Stop), None),
         ];
@@ -348,7 +358,10 @@ mod tests {
 
         // A later event should have a successful parse.
         let has_some = events_received.iter().any(|e| e.partial.is_some());
-        assert!(has_some, "at least one event should have a successful partial parse");
+        assert!(
+            has_some,
+            "at least one event should have a successful partial parse"
+        );
 
         let _ = handle.await.unwrap().unwrap();
     }
@@ -395,7 +408,9 @@ mod tests {
         let _ = handle.await.unwrap().unwrap();
 
         let captured = adapter.captured_request.lock().unwrap();
-        let req = captured.as_ref().expect("request should have been captured");
+        let req = captured
+            .as_ref()
+            .expect("request should have been captured");
 
         match &req.response_format {
             Some(ResponseFormat::JsonSchema {

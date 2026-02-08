@@ -1,0 +1,38 @@
+// ABOUTME: Linear pipeline with multiple conditional steps gated by variables.
+// ABOUTME: Demonstrates chaining conditional nodes with edge-label-based routing.
+
+// This pipeline flows through two sequential conditional gates.
+// Each gate checks a different variable. The pipeline only reaches
+// the final success exit if both conditions pass.
+//
+// Run examples:
+//   smasher run examples/multi-step.dot --var auth=valid --var quota=ok
+//   smasher run examples/multi-step.dot --var auth=invalid --var quota=ok
+//   smasher run examples/multi-step.dot --var auth=valid --var quota=exceeded
+
+digraph MultiStep {
+    // Entry
+    start [shape=circle, label="Start"];
+
+    // Step 1: Authentication check
+    auth_check [shape=diamond, label="Auth Check", condition="auth=valid"];
+
+    // Step 2: Quota check (only reached if auth passes)
+    quota_check [shape=diamond, label="Quota Check", condition="quota=ok"];
+
+    // Terminal nodes
+    done        [shape=doublecircle, label="All Clear"];
+    auth_failed [shape=doublecircle, label="Auth Failed"];
+    over_quota  [shape=doublecircle, label="Over Quota"];
+
+    // Flow
+    start -> auth_check;
+
+    // Auth gate
+    auth_check -> quota_check  [label="success"];
+    auth_check -> auth_failed  [label="failure"];
+
+    // Quota gate
+    quota_check -> done       [label="success"];
+    quota_check -> over_quota [label="failure"];
+}

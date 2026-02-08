@@ -1,0 +1,57 @@
+// ABOUTME: Pipeline demonstrating explicit loop semantics with loop_restart edges.
+// ABOUTME: Shows how a processing loop runs until a condition is met, then exits cleanly.
+
+// The loop_restart edge attribute controls iterative processing patterns.
+// When an edge has loop_restart=true, traversing it:
+//   1. Resets node-specific context entries for the target node
+//   2. Increments a loop counter tracked by the engine
+//   3. Re-enters the target node for another iteration
+//
+// This differs from retry-loop.dot in two key ways:
+//   - Retries are automatic re-execution on transient failures (built into nodes)
+//   - Loop restarts are explicit graph-level iteration controlled by conditions
+//
+// The engine's max_steps limit (default 1000) prevents infinite loops.
+// Use --max-steps to control how many iterations are allowed.
+//
+// Run this pipeline:
+//   smasher run examples/loop-with-exit.dot --var status=done
+//   smasher run examples/loop-with-exit.dot --var status=pending --max-steps 20
+
+digraph LoopWithExit {
+    // Entry point
+    start [shape=circle, label="Start"];
+
+    // The processing node that runs on each iteration.
+    // In a real pipeline this might be a codergen or tool node
+    // that modifies the context on each pass.
+    process [shape=box, label="Process Iteration", prompt="Process the next item."];
+
+    // Check whether the loop should continue or exit.
+    // Evaluates the `status` variable against the expected value.
+    check [
+        shape=diamond,
+        label="Done?",
+        condition="status=done"
+    ];
+
+    // Terminal node: reached when the condition is satisfied
+    done [shape=doublecircle, label="Complete"];
+
+    // Terminal node: reached if max_steps is hit (safety valve)
+    timed_out [shape=doublecircle, label="Timed Out"];
+
+    // Flow: start enters the processing loop
+    start -> process;
+
+    // After processing, evaluate the exit condition
+    process -> check;
+
+    // Exit the loop when condition is met
+    check -> done [label="success"];
+
+    // Loop back when condition is not met.
+    // The loop_restart=true attribute signals the engine to reset
+    // the process node's context and increment the loop counter.
+    check -> process [label="failure", loop_restart=true];
+}

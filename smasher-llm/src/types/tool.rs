@@ -262,10 +262,7 @@ mod tests {
         let json_str = serde_json::to_string(&choice).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
-        assert_eq!(
-            value,
-            json!({"specific": {"name": "get_weather"}})
-        );
+        assert_eq!(value, json!({"specific": {"name": "get_weather"}}));
     }
 
     #[test]
@@ -352,10 +349,7 @@ mod tests {
         assert_eq!(back.id, "call_rt");
         assert_eq!(back.name, "search");
         assert_eq!(back.arguments, r#"{"q":"rust"}"#);
-        assert_eq!(
-            back.raw_arguments.as_deref(),
-            Some(r#"{ "q" : "rust" }"#)
-        );
+        assert_eq!(back.raw_arguments.as_deref(), Some(r#"{ "q" : "rust" }"#));
     }
 
     #[test]

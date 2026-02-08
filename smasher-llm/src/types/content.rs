@@ -468,7 +468,8 @@ mod tests {
 
     #[test]
     fn deserialize_tool_result_from_json() {
-        let json = r#"{"kind":"tool_result","tool_call_id":"call_1","content":"4","is_error":false}"#;
+        let json =
+            r#"{"kind":"tool_result","tool_call_id":"call_1","content":"4","is_error":false}"#;
         let part: ContentPart = serde_json::from_str(json).unwrap();
         assert_eq!(
             part,
@@ -506,7 +507,12 @@ mod tests {
     #[test]
     fn text_convenience_constructor() {
         let part = ContentPart::text("test");
-        assert_eq!(part, ContentPart::Text { text: "test".into() });
+        assert_eq!(
+            part,
+            ContentPart::Text {
+                text: "test".into()
+            }
+        );
     }
 
     #[test]
@@ -751,9 +757,7 @@ mod tests {
             arguments: "{}".into(),
             raw_arguments: None,
         };
-        let value: serde_json::Value = serde_json::to_value(
-            ContentPart::ToolCall(data)
-        ).unwrap();
+        let value: serde_json::Value = serde_json::to_value(ContentPart::ToolCall(data)).unwrap();
         let obj = value.as_object().unwrap();
         assert!(!obj.contains_key("raw_arguments"));
     }
@@ -766,9 +770,7 @@ mod tests {
             arguments: "{}".into(),
             raw_arguments: Some("{ }".into()),
         };
-        let value: serde_json::Value = serde_json::to_value(
-            ContentPart::ToolCall(data)
-        ).unwrap();
+        let value: serde_json::Value = serde_json::to_value(ContentPart::ToolCall(data)).unwrap();
         assert_eq!(value["raw_arguments"], "{ }");
     }
 

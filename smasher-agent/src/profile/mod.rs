@@ -50,7 +50,10 @@ impl ProviderProfile for AnthropicProfile {
     fn system_prompt(&self, config: &SystemPromptConfig) -> String {
         let mut sections = Vec::new();
 
-        sections.push("You are an AI coding assistant. You help users with software engineering tasks.".to_string());
+        sections.push(
+            "You are an AI coding assistant. You help users with software engineering tasks."
+                .to_string(),
+        );
 
         // Environment section
         let mut env_lines = Vec::new();
@@ -91,7 +94,14 @@ impl ProviderProfile for AnthropicProfile {
     }
 
     fn tool_names(&self) -> Vec<&str> {
-        vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]
+        vec![
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "grep",
+            "glob_files",
+        ]
     }
 
     fn supports_thinking(&self) -> bool {
@@ -159,7 +169,14 @@ impl ProviderProfile for OpenAiProfile {
     }
 
     fn tool_names(&self) -> Vec<&str> {
-        vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]
+        vec![
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "grep",
+            "glob_files",
+        ]
     }
 
     fn supports_thinking(&self) -> bool {
@@ -227,7 +244,14 @@ impl ProviderProfile for GeminiProfile {
     }
 
     fn tool_names(&self) -> Vec<&str> {
-        vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]
+        vec![
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "grep",
+            "glob_files",
+        ]
     }
 
     fn supports_thinking(&self) -> bool {
@@ -291,7 +315,17 @@ mod tests {
     fn anthropic_profile_tool_names() {
         let profile = AnthropicProfile;
         let tools = profile.tool_names();
-        assert_eq!(tools, vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]);
+        assert_eq!(
+            tools,
+            vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "shell",
+                "grep",
+                "glob_files"
+            ]
+        );
     }
 
     // --- AnthropicProfile system prompt ---
@@ -371,7 +405,17 @@ mod tests {
     fn openai_profile_tool_names() {
         let profile = OpenAiProfile;
         let tools = profile.tool_names();
-        assert_eq!(tools, vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]);
+        assert_eq!(
+            tools,
+            vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "shell",
+                "grep",
+                "glob_files"
+            ]
+        );
     }
 
     // --- GeminiProfile basic properties ---
@@ -404,7 +448,17 @@ mod tests {
     fn gemini_profile_tool_names() {
         let profile = GeminiProfile;
         let tools = profile.tool_names();
-        assert_eq!(tools, vec!["read_file", "write_file", "edit_file", "shell", "grep", "glob_files"]);
+        assert_eq!(
+            tools,
+            vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "shell",
+                "grep",
+                "glob_files"
+            ]
+        );
     }
 
     // --- profile_for_model ---

@@ -71,9 +71,8 @@ impl ProviderAdapter for GeminiAdapter {
         let gemini_req = convert_request(request);
         let url = self.complete_url(&request.model);
 
-        let body = serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body =
+            serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization { source: e })?;
 
         let http_response = self
             .client
@@ -117,9 +116,8 @@ impl ProviderAdapter for GeminiAdapter {
         let gemini_req = convert_request(request);
         let url = self.stream_url(&request.model);
 
-        let body = serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body =
+            serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization { source: e })?;
 
         let http_response = self
             .client
@@ -230,13 +228,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello!")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello!")]);
 
         let response = adapter.complete(&request).await.unwrap();
 
@@ -284,8 +278,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
         let request = Request::new(
             "gemini-2.0-flash",
@@ -306,19 +299,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:generateContent"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_string("API key not valid"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("API key not valid"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("bad-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("bad-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::Authentication { .. }));
@@ -330,19 +317,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:generateContent"))
-            .respond_with(
-                ResponseTemplate::new(429).set_body_string("Too many requests"),
-            )
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too many requests"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::RateLimited { .. }));
@@ -354,19 +335,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:generateContent"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_string("Internal Server Error"),
-            )
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::ServerError { .. }));
@@ -386,13 +361,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::ResponseParse { .. }));
@@ -427,10 +398,7 @@ mod tests {
             }
         });
 
-        let sse_body = format!(
-            "data: {}\n\ndata: {}\n\n",
-            chunk1, chunk2
-        );
+        let sse_body = format!("data: {}\n\ndata: {}\n\n", chunk1, chunk2);
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:streamGenerateContent"))
@@ -442,13 +410,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Stream please")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Stream please")]);
 
         let stream = adapter.stream(&request).await.unwrap();
         let events: Vec<_> = stream
@@ -462,10 +426,7 @@ mod tests {
         assert!(events.len() >= 3);
 
         // First is Start.
-        assert_eq!(
-            events[0].event_type,
-            crate::types::StreamEventType::Start
-        );
+        assert_eq!(events[0].event_type, crate::types::StreamEventType::Start);
 
         // Check we got content deltas.
         let text_deltas: Vec<_> = events
@@ -488,19 +449,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:streamGenerateContent"))
-            .respond_with(
-                ResponseTemplate::new(403).set_body_string("Forbidden"),
-            )
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Stream this")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Stream this")]);
 
         let result = adapter.stream(&request).await;
         match result {
@@ -535,15 +490,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Test request")],
-        )
-        .system_prompt("You are helpful.")
-        .max_tokens(100);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Test request")])
+            .system_prompt("You are helpful.")
+            .max_tokens(100);
 
         let response = adapter.complete(&request).await.unwrap();
         assert_eq!(response.text().as_deref(), Some("ok"));
@@ -555,19 +506,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:generateContent"))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_string("Model not found"),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_string("Model not found"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "nonexistent-model",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("nonexistent-model", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::ModelNotFound { .. }));
@@ -579,19 +524,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path_regex(r"/v1beta/models/.*:generateContent"))
-            .respond_with(
-                ResponseTemplate::new(400).set_body_string("Invalid request body"),
-            )
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid request body"))
             .mount(&mock_server)
             .await;
 
-        let adapter =
-            GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
+        let adapter = GeminiAdapter::with_base_url("test-key".to_string(), mock_server.uri());
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));

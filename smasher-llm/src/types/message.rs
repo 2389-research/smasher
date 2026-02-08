@@ -484,7 +484,10 @@ mod tests {
             name: None,
             tool_call_id: None,
         };
-        assert_eq!(msg.text().as_deref(), Some("Here are the results:And some more text"));
+        assert_eq!(
+            msg.text().as_deref(),
+            Some("Here are the results:And some more text")
+        );
         assert_eq!(msg.tool_calls().len(), 1);
         assert!(msg.has_tool_calls());
         assert!(msg.is_assistant());
@@ -574,9 +577,7 @@ mod tests {
 
     #[test]
     fn with_name_overwrites_previous_name() {
-        let msg = Message::user("hi")
-            .with_name("first")
-            .with_name("second");
+        let msg = Message::user("hi").with_name("first").with_name("second");
         assert_eq!(msg.name.as_deref(), Some("second"));
     }
 
@@ -598,8 +599,7 @@ mod tests {
 
     #[test]
     fn with_tool_call_id_sets_tool_call_id() {
-        let msg = Message::user("result for call")
-            .with_tool_call_id("call_abc");
+        let msg = Message::user("result for call").with_tool_call_id("call_abc");
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_abc"));
     }
 
@@ -659,10 +659,7 @@ mod tests {
     fn text_concatenates_all_text_parts() {
         let msg = Message {
             role: Role::Assistant,
-            content: vec![
-                ContentPart::text("Hello, "),
-                ContentPart::text("world!"),
-            ],
+            content: vec![ContentPart::text("Hello, "), ContentPart::text("world!")],
             name: None,
             tool_call_id: None,
         };

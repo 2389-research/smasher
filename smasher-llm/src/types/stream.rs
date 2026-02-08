@@ -246,10 +246,7 @@ impl StreamEvent {
     }
 
     /// Create a ProviderEvent for provider-specific events.
-    pub fn provider_event(
-        event_type: impl Into<String>,
-        raw: serde_json::Value,
-    ) -> Self {
+    pub fn provider_event(event_type: impl Into<String>, raw: serde_json::Value) -> Self {
         Self {
             provider_event_type: Some(event_type.into()),
             raw: Some(raw),
@@ -288,11 +285,8 @@ mod tests {
 
     #[test]
     fn tool_call_delta_event() {
-        let event = StreamEvent::tool_call_delta(
-            "call_abc",
-            Some("read_file".into()),
-            r#"{"path":"#,
-        );
+        let event =
+            StreamEvent::tool_call_delta("call_abc", Some("read_file".into()), r#"{"path":"#);
         assert_eq!(event.event_type, StreamEventType::ToolCallDelta);
         assert_eq!(event.tool_call_id.as_deref(), Some("call_abc"));
         assert_eq!(event.tool_name.as_deref(), Some("read_file"));
@@ -551,8 +545,8 @@ mod tests {
     #[test]
     fn tool_call_lifecycle_content_index() {
         let start = StreamEvent::tool_call_start("call_1", "search", 0);
-        let delta = StreamEvent::tool_call_delta("call_1", None, r#"{"q":"rust"}"#)
-            .with_content_index(0);
+        let delta =
+            StreamEvent::tool_call_delta("call_1", None, r#"{"q":"rust"}"#).with_content_index(0);
         let end = StreamEvent::tool_call_end("call_1");
 
         assert_eq!(start.content_index, Some(0));

@@ -182,13 +182,10 @@ mod tests {
     #[async_trait]
     impl ToolExecutor for MockToolExecutor {
         async fn execute(&self, name: &str, _arguments: &str) -> Result<(String, bool), Error> {
-            self.results
-                .get(name)
-                .cloned()
-                .ok_or_else(|| Error::Other {
-                    message: format!("unknown tool: {}", name),
-                    retryable: false,
-                })
+            self.results.get(name).cloned().ok_or_else(|| Error::Other {
+                message: format!("unknown tool: {}", name),
+                retryable: false,
+            })
         }
     }
 
@@ -235,10 +232,7 @@ mod tests {
         Response {
             id: "resp_tool".into(),
             model: "claude-sonnet-4-20250514".into(),
-            content: tool_calls
-                .into_iter()
-                .map(ContentPart::ToolCall)
-                .collect(),
+            content: tool_calls.into_iter().map(ContentPart::ToolCall).collect(),
             finish_reason: Some(FinishReason::ToolUse),
             usage: Usage {
                 input_tokens,
@@ -312,7 +306,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.response.text(), Some("The weather is sunny.".to_string()));
+        assert_eq!(
+            result.response.text(),
+            Some("The weather is sunny.".to_string())
+        );
         assert_eq!(result.iterations, 1);
         assert_eq!(result.history.len(), 1);
         assert!(result.history[0].has_tool_calls());
@@ -350,11 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn generate_with_no_tool_executor_returns_even_with_tool_calls() {
-        let client = make_client(vec![tool_call_response(
-            vec![search_tool_call()],
-            10,
-            15,
-        )]);
+        let client = make_client(vec![tool_call_response(vec![search_tool_call()], 10, 15)]);
 
         let result = generate(&client, sample_request(), None, None)
             .await
@@ -409,14 +402,9 @@ mod tests {
             parallel_tool_calls: true,
         };
 
-        let result = generate(
-            &client,
-            sample_request(),
-            Some(&executor),
-            Some(options),
-        )
-        .await
-        .unwrap();
+        let result = generate(&client, sample_request(), Some(&executor), Some(options))
+            .await
+            .unwrap();
 
         assert_eq!(result.response.text(), Some("all done".to_string()));
         assert_eq!(result.iterations, 1);
@@ -442,16 +430,14 @@ mod tests {
             parallel_tool_calls: false,
         };
 
-        let result = generate(
-            &client,
-            sample_request(),
-            Some(&executor),
-            Some(options),
-        )
-        .await
-        .unwrap();
+        let result = generate(&client, sample_request(), Some(&executor), Some(options))
+            .await
+            .unwrap();
 
-        assert_eq!(result.response.text(), Some("all done sequentially".to_string()));
+        assert_eq!(
+            result.response.text(),
+            Some("all done sequentially".to_string())
+        );
         assert_eq!(result.iterations, 1);
         assert_eq!(result.history.len(), 1);
     }
@@ -465,17 +451,17 @@ mod tests {
 
         // The tool executor returns an error result (is_error=true), not a Rust error.
         let executor = MockToolExecutor {
-            results: HashMap::from([(
-                "search".into(),
-                ("API key expired".into(), true),
-            )]),
+            results: HashMap::from([("search".into(), ("API key expired".into(), true))]),
         };
 
         let result = generate(&client, sample_request(), Some(&executor), None)
             .await
             .unwrap();
 
-        assert_eq!(result.response.text(), Some("I see the tool errored".to_string()));
+        assert_eq!(
+            result.response.text(),
+            Some("I see the tool errored".to_string())
+        );
         assert_eq!(result.iterations, 1);
         // The history should contain the tool-call response.
         assert_eq!(result.history.len(), 1);

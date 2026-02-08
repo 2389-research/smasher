@@ -70,6 +70,7 @@ pub fn node_type_name(node_type: &NodeType) -> &str {
         NodeType::Interviewer => "interviewer",
         NodeType::Parallel => "parallel",
         NodeType::Manager => "manager",
+        NodeType::SubPipeline => "subpipeline",
         NodeType::Generic => "generic",
     }
 }
@@ -414,7 +415,11 @@ mod tests {
     use std::time::Duration;
 
     /// Helper: build a GraphNode with the given fields.
-    fn make_node(id: &str, node_type: NodeType, attrs: HashMap<String, NodeAttrValue>) -> GraphNode {
+    fn make_node(
+        id: &str,
+        node_type: NodeType,
+        attrs: HashMap<String, NodeAttrValue>,
+    ) -> GraphNode {
         GraphNode {
             id: id.to_string(),
             node_type,
@@ -431,7 +436,10 @@ mod tests {
     /// Helper: build a GraphNode with a class attribute.
     fn node_with_class(id: &str, node_type: NodeType, class: &str) -> GraphNode {
         let mut attrs = HashMap::new();
-        attrs.insert("class".to_string(), NodeAttrValue::String(class.to_string()));
+        attrs.insert(
+            "class".to_string(),
+            NodeAttrValue::String(class.to_string()),
+        );
         make_node(id, node_type, attrs)
     }
 
@@ -455,7 +463,10 @@ mod tests {
         let input = r#"codergen { model: "claude-sonnet-4-20250514"; }"#;
         let ss = Stylesheet::parse(input).unwrap();
         assert_eq!(ss.rules.len(), 1);
-        assert_eq!(ss.rules[0].selector, Selector::NodeType("codergen".to_string()));
+        assert_eq!(
+            ss.rules[0].selector,
+            Selector::NodeType("codergen".to_string())
+        );
         assert_eq!(ss.rules[0].declarations.len(), 1);
         assert_eq!(ss.rules[0].declarations[0].property, "model");
         assert_eq!(
@@ -478,7 +489,10 @@ mod tests {
         "#;
         let ss = Stylesheet::parse(input).unwrap();
         assert_eq!(ss.rules.len(), 2);
-        assert_eq!(ss.rules[0].selector, Selector::NodeType("codergen".to_string()));
+        assert_eq!(
+            ss.rules[0].selector,
+            Selector::NodeType("codergen".to_string())
+        );
         assert_eq!(ss.rules[0].declarations.len(), 2);
         assert_eq!(ss.rules[1].selector, Selector::NodeType("tool".to_string()));
         assert_eq!(ss.rules[1].declarations.len(), 1);
@@ -499,7 +513,10 @@ mod tests {
         let input = ".critical { retries: 3; }";
         let ss = Stylesheet::parse(input).unwrap();
         assert_eq!(ss.rules.len(), 1);
-        assert_eq!(ss.rules[0].selector, Selector::Class("critical".to_string()));
+        assert_eq!(
+            ss.rules[0].selector,
+            Selector::Class("critical".to_string())
+        );
     }
 
     // ---- Test 7: Parse wildcard selector (*) ----
@@ -538,7 +555,10 @@ mod tests {
     fn parse_number_value() {
         let input = "codergen { max_tokens: 4096; temperature: 0.7; }";
         let ss = Stylesheet::parse(input).unwrap();
-        assert_eq!(ss.rules[0].declarations[0].value, StyleValue::Number(4096.0));
+        assert_eq!(
+            ss.rules[0].declarations[0].value,
+            StyleValue::Number(4096.0)
+        );
         assert_eq!(ss.rules[0].declarations[1].value, StyleValue::Number(0.7));
     }
 
@@ -584,7 +604,10 @@ mod tests {
         "#;
         let ss = Stylesheet::parse(input).unwrap();
         assert_eq!(ss.rules.len(), 2);
-        assert_eq!(ss.rules[0].selector, Selector::NodeType("codergen".to_string()));
+        assert_eq!(
+            ss.rules[0].selector,
+            Selector::NodeType("codergen".to_string())
+        );
         assert_eq!(ss.rules[0].declarations.len(), 2);
         assert_eq!(ss.rules[1].selector, Selector::Id("special".to_string()));
     }
@@ -600,9 +623,14 @@ mod tests {
 
         assert_eq!(
             attrs.get("model"),
-            Some(&NodeAttrValue::String("claude-sonnet-4-20250514".to_string()))
+            Some(&NodeAttrValue::String(
+                "claude-sonnet-4-20250514".to_string()
+            ))
         );
-        assert_eq!(attrs.get("max_tokens"), Some(&NodeAttrValue::Number(4096.0)));
+        assert_eq!(
+            attrs.get("max_tokens"),
+            Some(&NodeAttrValue::Number(4096.0))
+        );
     }
 
     // ---- Test 15: Apply rule to non-matching node ----
@@ -679,7 +707,7 @@ mod tests {
         // Node without the class should not match.
         let node2 = node_with_class("gen2", NodeType::Codergen, "fast production");
         let attrs2 = ss.apply(&node2);
-        assert!(attrs2.get("retries").is_none());
+        assert!(!attrs2.contains_key("retries"));
     }
 
     // ---- Test 19: Invalid input returns error ----
@@ -715,7 +743,10 @@ mod tests {
         // Should match: * (All), codergen (NodeType), #gen1 (Id). NOT tool.
         assert_eq!(matches.len(), 3);
         assert_eq!(matches[0].selector, Selector::All);
-        assert_eq!(matches[1].selector, Selector::NodeType("codergen".to_string()));
+        assert_eq!(
+            matches[1].selector,
+            Selector::NodeType("codergen".to_string())
+        );
         assert_eq!(matches[2].selector, Selector::Id("gen1".to_string()));
     }
 
@@ -866,9 +897,6 @@ mod tests {
     fn id_selector_with_hyphenated_name() {
         let input = "#my-node-1 { retries: 5; }";
         let ss = Stylesheet::parse(input).unwrap();
-        assert_eq!(
-            ss.rules[0].selector,
-            Selector::Id("my-node-1".to_string())
-        );
+        assert_eq!(ss.rules[0].selector, Selector::Id("my-node-1".to_string()));
     }
 }

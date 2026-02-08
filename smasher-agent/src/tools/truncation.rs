@@ -35,7 +35,9 @@ pub fn truncate_output(content: &str, max_chars: usize) -> String {
     // Calculate how much content was omitted for the marker text.
     let preliminary_head = max_chars * 2 / 3;
     let preliminary_tail = max_chars / 4;
-    let omitted = content.len().saturating_sub(preliminary_head + preliminary_tail);
+    let omitted = content
+        .len()
+        .saturating_sub(preliminary_head + preliminary_tail);
     let marker = format!("\n\n[... truncated {} characters ...]\n\n", omitted);
 
     // Now recalculate head and tail sizes accounting for the marker itself.
@@ -47,7 +49,12 @@ pub fn truncate_output(content: &str, max_chars: usize) -> String {
     let head_end = floor_char_boundary(content, head_size);
     let tail_start = ceil_char_boundary(content, content.len().saturating_sub(tail_size));
 
-    format!("{}{}{}", &content[..head_end], marker, &content[tail_start..])
+    format!(
+        "{}{}{}",
+        &content[..head_end],
+        marker,
+        &content[tail_start..]
+    )
 }
 
 #[cfg(test)]
@@ -112,7 +119,7 @@ mod tests {
         let content = "\u{1F600}".repeat(500); // 2000 bytes
         let result = truncate_output(&content, 200);
         // Should not panic and should be valid UTF-8.
-        assert!(result.len() > 0);
+        assert!(!result.is_empty());
         // Verify it's valid UTF-8 by iterating chars.
         let _: Vec<char> = result.chars().collect();
     }

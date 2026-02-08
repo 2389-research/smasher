@@ -126,11 +126,7 @@ mod tests {
     }
 
     /// Helper: build a GraphNode with string attributes.
-    fn node_with_str_attrs(
-        id: &str,
-        label: Option<&str>,
-        attrs: Vec<(&str, &str)>,
-    ) -> GraphNode {
+    fn node_with_str_attrs(id: &str, label: Option<&str>, attrs: Vec<(&str, &str)>) -> GraphNode {
         let mut attr_map = HashMap::new();
         for (k, v) in attrs {
             attr_map.insert(k.to_string(), NodeAttrValue::String(v.to_string()));
@@ -263,10 +259,7 @@ mod tests {
 
         expand_variables(&mut graph, &vars);
 
-        assert_eq!(
-            graph.nodes[0].label,
-            Some("Step: Initialize".to_string())
-        );
+        assert_eq!(graph.nodes[0].label, Some("Step: Initialize".to_string()));
     }
 
     // ---- Test 7: expand_variables does not affect non-string attrs ----
@@ -309,8 +302,8 @@ mod tests {
     // ---- Test 8: apply_stylesheet merges attrs from stylesheet ----
     #[test]
     fn apply_stylesheet_merges_attrs() {
-        let ss = Stylesheet::parse(r#"codergen { model: "claude-sonnet"; max_tokens: 4096; }"#)
-            .unwrap();
+        let ss =
+            Stylesheet::parse(r#"codergen { model: "claude-sonnet"; max_tokens: 4096; }"#).unwrap();
         let node = simple_node("gen1", NodeType::Codergen);
         let mut graph = make_graph(vec![node]);
 
@@ -329,8 +322,8 @@ mod tests {
     // ---- Test 9: apply_stylesheet node attrs take precedence ----
     #[test]
     fn apply_stylesheet_node_attrs_take_precedence() {
-        let ss = Stylesheet::parse(r#"codergen { model: "default-model"; temperature: 0.5; }"#)
-            .unwrap();
+        let ss =
+            Stylesheet::parse(r#"codergen { model: "default-model"; temperature: 0.5; }"#).unwrap();
         let mut attrs = HashMap::new();
         attrs.insert(
             "model".to_string(),
@@ -418,8 +411,7 @@ mod tests {
     // ---- Test 12: apply_transforms stylesheet-applied values get variable-expanded ----
     #[test]
     fn apply_transforms_stylesheet_values_get_expanded() {
-        let ss =
-            Stylesheet::parse(r#"codergen { system_prompt: "You are {{role}}"; }"#).unwrap();
+        let ss = Stylesheet::parse(r#"codergen { system_prompt: "You are {{role}}"; }"#).unwrap();
         let node = simple_node("gen1", NodeType::Codergen);
         let mut graph = make_graph(vec![node]);
 

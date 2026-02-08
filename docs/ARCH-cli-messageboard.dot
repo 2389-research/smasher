@@ -1,0 +1,411 @@
+// ABOUTME: Graphviz DOT file visualizing the THUNDERBOARD 3000 (BBS) architecture.
+// ABOUTME: Renders package dependencies, data models, interfaces, and data flow.
+
+digraph THUNDERBOARD_3000 {
+    // ── Global Settings ──────────────────────────────────────────────
+    rankdir=TB;
+    fontname="Helvetica";
+    fontsize=14;
+    label="\n\nTHUNDERBOARD 3000 — Architecture\n";
+    labelloc=t;
+    labeljust=c;
+    compound=true;
+    nodesep=0.6;
+    ranksep=0.8;
+    splines=polyline;
+
+    node [
+        fontname="Helvetica"
+        fontsize=11
+        shape=record
+        style="filled,rounded"
+        fillcolor="#f8f9fa"
+        color="#495057"
+        penwidth=1.5
+    ];
+
+    edge [
+        fontname="Helvetica"
+        fontsize=9
+        color="#868e96"
+        arrowsize=0.8
+    ];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 0 — External Users / Consumers
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_users {
+        label="Consumers";
+        style="dashed,rounded";
+        color="#adb5bd";
+        fontcolor="#495057";
+
+        human [
+            label="Human User"
+            shape=ellipse
+            fillcolor="#d0ebff"
+            color="#1971c2"
+        ];
+
+        agent [
+            label="AI Agent\n(Claude, etc.)"
+            shape=ellipse
+            fillcolor="#d3f9d8"
+            color="#2f9e44"
+        ];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 1 — Entry Points (cmd/bbs)
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_cmd {
+        label="cmd/bbs";
+        style="filled,rounded";
+        fillcolor="#e7f5ff";
+        color="#1971c2";
+        fontcolor="#1864ab";
+
+        main_go [
+            label="{main.go|Entry point\lExecutes rootCmd\l}"
+            fillcolor="#d0ebff"
+        ];
+
+        root_cmd [
+            label="{root.go|rootCmd\l--as flag\lglobalStore lifecycle\l}"
+            fillcolor="#d0ebff"
+        ];
+
+        subgraph cluster_cli_commands {
+            label="CLI Commands";
+            style="rounded";
+            fillcolor="#a5d8ff";
+            color="#1971c2";
+
+            topic_cmd [label="{topic.go|list · new\larchive · show\l}" fillcolor="#d0ebff"];
+            thread_cmd [label="{thread.go|list · new\lshow · sticky\l}" fillcolor="#d0ebff"];
+            post_cmd [label="{post.go|post · edit\l}" fillcolor="#d0ebff"];
+            export_cmd [label="{export.go|export md/yaml/json\limport yaml\l}" fillcolor="#d0ebff"];
+            migrate_cmd [label="{migrate.go|migrate --to backend\l}" fillcolor="#d0ebff"];
+            mcp_cmd [label="{mcp.go|Start MCP server\l(stdio mode)\l}" fillcolor="#d0ebff"];
+            whoami_cmd [label="{whoami.go|Show identity\l}" fillcolor="#d0ebff"];
+            version_cmd [label="{version.go|Show version\l}" fillcolor="#d0ebff"];
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 2 — Application Services
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── TUI ──────────────────────────────────────────────────────────
+    subgraph cluster_tui {
+        label="internal/tui  (Bubble Tea)";
+        style="filled,rounded";
+        fillcolor="#fff3bf";
+        color="#e67700";
+        fontcolor="#e67700";
+
+        tui_app [
+            label="{app.go — Model|activePane : Pane\lstore : Storage\lidentity : string\l|Init() · Update() · View()\l}"
+            fillcolor="#fff9db"
+        ];
+
+        tui_topics [label="{topics.go|TopicsModel\lcursor · items\l}" fillcolor="#fff9db"];
+        tui_threads [label="{threads.go|ThreadsModel\lcursor · items\l}" fillcolor="#fff9db"];
+        tui_messages [label="{messages.go|MessagesModel\lcursor · items\l}" fillcolor="#fff9db"];
+    }
+
+    // ── MCP Server ───────────────────────────────────────────────────
+    subgraph cluster_mcp {
+        label="internal/mcp  (MCP Protocol)";
+        style="filled,rounded";
+        fillcolor="#d3f9d8";
+        color="#2f9e44";
+        fontcolor="#2b8a3e";
+
+        mcp_server [
+            label="{server.go — Server|store : Storage\lmcp : mcp.Server\l|NewServer() · Serve()\l}"
+            fillcolor="#ebfbee"
+        ];
+
+        mcp_tools [
+            label="{tools.go|list_topics · create_topic\larchive_topic · list_threads\lcreate_thread · sticky_thread\llist_messages · post_message\ledit_message\l}"
+            fillcolor="#ebfbee"
+        ];
+
+        mcp_resources [
+            label="{resources.go|bbs://topics\lbbs://recent\lbbs://topics/\{t\}/threads\lbbs://threads/\{t\}/messages\l}"
+            fillcolor="#ebfbee"
+        ];
+
+        mcp_prompts [
+            label="{prompts.go|post-update\lsummarize-thread\l}"
+            fillcolor="#ebfbee"
+        ];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 3 — Core Domain
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── Config ───────────────────────────────────────────────────────
+    subgraph cluster_config {
+        label="internal/config";
+        style="filled,rounded";
+        fillcolor="#f3f0ff";
+        color="#7048e8";
+        fontcolor="#6741d9";
+
+        config [
+            label="{config.go — Config|Backend : string\lDataDir : string\l|Load() · Save()\lOpenStorage() → Storage\lGetBackend() · GetDataDir()\l}"
+            fillcolor="#e5dbff"
+        ];
+    }
+
+    // ── Identity ─────────────────────────────────────────────────────
+    subgraph cluster_identity {
+        label="internal/identity";
+        style="filled,rounded";
+        fillcolor="#ffe3e3";
+        color="#e03131";
+        fontcolor="#c92a2a";
+
+        identity [
+            label="{identity.go|GetIdentity(override, source)\l→ user@source\l\lParseIdentity(id)\l→ (username, source)\l}"
+            fillcolor="#fff5f5"
+        ];
+    }
+
+    // ── Models ───────────────────────────────────────────────────────
+    subgraph cluster_models {
+        label="internal/models";
+        style="filled,rounded";
+        fillcolor="#fff4e6";
+        color="#e8590c";
+        fontcolor="#d9480f";
+
+        topic_model [
+            label="{Topic|ID : UUID\lName : string\lDescription : string\lCreatedAt · CreatedBy\lArchived : bool\l}"
+            fillcolor="#ffe8cc"
+        ];
+
+        thread_model [
+            label="{Thread|ID : UUID\lTopicID : UUID\lSubject : string\lCreatedAt · CreatedBy\lUpdatedAt\lSticky : bool\l}"
+            fillcolor="#ffe8cc"
+        ];
+
+        message_model [
+            label="{Message|ID : UUID\lThreadID : UUID\lContent : string\lCreatedAt · CreatedBy\lEditedAt\l}"
+            fillcolor="#ffe8cc"
+        ];
+
+        attachment_model [
+            label="{Attachment|ID : UUID\lMessageID : UUID\lFilename · MimeType\lData : []byte\lCreatedAt\l}"
+            fillcolor="#ffe8cc"
+        ];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 4 — Storage Layer
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_storage {
+        label="internal/storage";
+        style="filled,rounded";
+        fillcolor="#f1f3f5";
+        color="#495057";
+        fontcolor="#343a40";
+
+        storage_iface [
+            label="{«interface» Storage|Topic CRUD\lThread CRUD\lMessage CRUD\lAttachment CRUD\lResolve helpers\lClose()\l}"
+            shape=record
+            style="filled,bold,rounded"
+            fillcolor="#dee2e6"
+            color="#343a40"
+            penwidth=2
+        ];
+
+        subgraph cluster_sqlite {
+            label="SQLite Backend";
+            style="filled,rounded";
+            fillcolor="#e9ecef";
+            color="#868e96";
+
+            sqlite_store [
+                label="{SqliteStore|db : *sql.DB\l|WAL mode\lForeign keys + CASCADE\lUUID as TEXT\lRFC3339Nano timestamps\l}"
+                fillcolor="#dee2e6"
+            ];
+        }
+
+        subgraph cluster_markdown {
+            label="Markdown Backend";
+            style="filled,rounded";
+            fillcolor="#e9ecef";
+            color="#868e96";
+
+            markdown_store [
+                label="{MarkdownStore|dataDir : string\l|YAML frontmatter\lFile-level locking\lAtomic writes\lSlugified filenames\l}"
+                fillcolor="#dee2e6"
+            ];
+        }
+
+        migrate [
+            label="{migrate.go|MigrateData(src, dst)\l→ MigrateSummary\l}"
+            fillcolor="#dee2e6"
+        ];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LAYER 5 — External Dependencies
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_deps {
+        label="External Dependencies";
+        style="dashed,rounded";
+        color="#adb5bd";
+        fontcolor="#495057";
+
+        dep_cobra [label="spf13/cobra" shape=component fillcolor="#e9ecef"];
+        dep_bubbletea [label="charmbracelet/\nbubbletea" shape=component fillcolor="#e9ecef"];
+        dep_lipgloss [label="charmbracelet/\nlipgloss" shape=component fillcolor="#e9ecef"];
+        dep_mcp_sdk [label="modelcontextprotocol/\ngo-sdk" shape=component fillcolor="#e9ecef"];
+        dep_sqlite [label="modernc.org/\nsqlite" shape=component fillcolor="#e9ecef"];
+        dep_uuid [label="google/uuid" shape=component fillcolor="#e9ecef"];
+        dep_yaml [label="gopkg.in/\nyaml.v3" shape=component fillcolor="#e9ecef"];
+        dep_color [label="fatih/color" shape=component fillcolor="#e9ecef"];
+        dep_mdstore [label="harper/suite/\nmdstore" shape=component fillcolor="#e9ecef"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Data Model Relationships
+    // ══════════════════════════════════════════════════════════════════
+    topic_model -> thread_model [
+        label="1:N"
+        style=bold
+        color="#e8590c"
+        fontcolor="#e8590c"
+    ];
+    thread_model -> message_model [
+        label="1:N"
+        style=bold
+        color="#e8590c"
+        fontcolor="#e8590c"
+    ];
+    message_model -> attachment_model [
+        label="1:N"
+        style=bold
+        color="#e8590c"
+        fontcolor="#e8590c"
+    ];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Consumer → Entry Points
+    // ══════════════════════════════════════════════════════════════════
+    human -> root_cmd [label="CLI / TUI" color="#1971c2" fontcolor="#1971c2"];
+    agent -> mcp_server [label="MCP stdio" color="#2f9e44" fontcolor="#2f9e44"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — cmd/bbs internal wiring
+    // ══════════════════════════════════════════════════════════════════
+    main_go -> root_cmd;
+    root_cmd -> topic_cmd;
+    root_cmd -> thread_cmd;
+    root_cmd -> post_cmd;
+    root_cmd -> export_cmd;
+    root_cmd -> migrate_cmd;
+    root_cmd -> mcp_cmd;
+    root_cmd -> whoami_cmd;
+    root_cmd -> version_cmd;
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — cmd → internal packages
+    // ══════════════════════════════════════════════════════════════════
+    root_cmd -> config [label="Load()" style=dashed lhead=cluster_config];
+    root_cmd -> tui_app [label="Launch TUI" color="#e67700" fontcolor="#e67700"];
+    mcp_cmd -> mcp_server [label="Serve()" color="#2f9e44" fontcolor="#2f9e44"];
+    whoami_cmd -> identity [color="#e03131"];
+    migrate_cmd -> migrate [label="MigrateData()"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — TUI internals
+    // ══════════════════════════════════════════════════════════════════
+    tui_app -> tui_topics;
+    tui_app -> tui_threads;
+    tui_app -> tui_messages;
+    tui_app -> storage_iface [label="CRUD" style=dashed color="#e67700"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — MCP internals
+    // ══════════════════════════════════════════════════════════════════
+    mcp_server -> mcp_tools;
+    mcp_server -> mcp_resources;
+    mcp_server -> mcp_prompts;
+    mcp_tools -> storage_iface [label="CRUD" style=dashed color="#2f9e44"];
+    mcp_resources -> storage_iface [label="Read" style=dashed color="#2f9e44"];
+    mcp_tools -> identity [style=dashed color="#e03131"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Config → Storage factory
+    // ══════════════════════════════════════════════════════════════════
+    config -> storage_iface [label="OpenStorage()" style=bold color="#7048e8" fontcolor="#7048e8"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Storage interface → implementations
+    // ══════════════════════════════════════════════════════════════════
+    storage_iface -> sqlite_store [
+        label="implements"
+        style=dashed
+        arrowhead=empty
+        color="#343a40"
+    ];
+    storage_iface -> markdown_store [
+        label="implements"
+        style=dashed
+        arrowhead=empty
+        color="#343a40"
+    ];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Storage → Models
+    // ══════════════════════════════════════════════════════════════════
+    storage_iface -> topic_model [style=dotted color="#868e96" arrowhead=open];
+    storage_iface -> thread_model [style=dotted color="#868e96" arrowhead=open];
+    storage_iface -> message_model [style=dotted color="#868e96" arrowhead=open];
+    storage_iface -> attachment_model [style=dotted color="#868e96" arrowhead=open];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — CLI commands → Storage
+    // ══════════════════════════════════════════════════════════════════
+    topic_cmd -> storage_iface [style=dotted color="#868e96"];
+    thread_cmd -> storage_iface [style=dotted color="#868e96"];
+    post_cmd -> storage_iface [style=dotted color="#868e96"];
+    export_cmd -> storage_iface [style=dotted color="#868e96"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — External dependencies
+    // ══════════════════════════════════════════════════════════════════
+    root_cmd -> dep_cobra [style=dotted color="#adb5bd"];
+    root_cmd -> dep_color [style=dotted color="#adb5bd"];
+    tui_app -> dep_bubbletea [style=dotted color="#adb5bd"];
+    tui_app -> dep_lipgloss [style=dotted color="#adb5bd"];
+    mcp_server -> dep_mcp_sdk [style=dotted color="#adb5bd"];
+    sqlite_store -> dep_sqlite [style=dotted color="#adb5bd"];
+    markdown_store -> dep_mdstore [style=dotted color="#adb5bd"];
+    markdown_store -> dep_yaml [style=dotted color="#adb5bd"];
+    topic_model -> dep_uuid [style=dotted color="#adb5bd"];
+    export_cmd -> dep_yaml [style=dotted color="#adb5bd"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LEGEND
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_legend {
+        label="Legend";
+        style="rounded";
+        color="#ced4da";
+        fontcolor="#495057";
+        fillcolor="#f8f9fa";
+
+        legend [
+            shape=box
+            fillcolor="#f8f9fa"
+            label="Legend:\n━ Primary flow\n- - Uses/depends\n· · Lightweight ref\n◁- - Implements"
+        ];
+    }
+}

@@ -148,8 +148,8 @@ pub enum RetryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::graph::{GraphNode, NodeAttrValue, NodeType};
+    use std::collections::HashMap;
 
     /// Helper: build a GraphNode with the given attributes.
     fn make_node(attrs: HashMap<String, NodeAttrValue>) -> GraphNode {
@@ -380,7 +380,7 @@ mod tests {
             let delay = compute_delay(&policy, 1);
             let ms = delay.as_millis();
             assert!(
-                ms >= 1000 && ms < 3000,
+                (1000..3000).contains(&ms),
                 "expected delay in [1000ms, 3000ms) for attempt 1, got {ms}ms"
             );
         }
@@ -390,7 +390,7 @@ mod tests {
             let delay = compute_delay(&policy, 3);
             let ms = delay.as_millis();
             assert!(
-                ms >= 4000 && ms < 12000,
+                (4000..12000).contains(&ms),
                 "expected delay in [4000ms, 12000ms) for attempt 3, got {ms}ms"
             );
         }
@@ -481,7 +481,7 @@ mod tests {
             let delay = compute_delay(&policy, 5);
             let ms = delay.as_millis();
             assert!(
-                ms >= 2000 && ms < 6000,
+                (2000..6000).contains(&ms),
                 "expected delay in [2000ms, 6000ms) for capped+jittered attempt 5, got {ms}ms"
             );
         }

@@ -1,0 +1,53 @@
+// ABOUTME: Pipeline demonstrating a human approval gate before proceeding.
+// ABOUTME: Uses a Manager node (shape=house) to model human-in-the-loop decisions.
+
+// Human gates are modeled as Manager nodes (shape=house). The engine pauses
+// execution at a Manager node and presents the `question` attribute to a
+// human operator. The operator's response determines which outgoing edge
+// is followed.
+//
+// This pattern is essential for:
+//   - Code review approval before deployment
+//   - Budget or resource allocation sign-off
+//   - Safety-critical operations requiring human oversight
+//
+// The Manager handler reads the `question` attribute and prompts the user
+// interactively. Their response is matched against outgoing edge labels.
+//
+// Run this pipeline:
+//   smasher run examples/human-gate.dot
+
+digraph HumanGate {
+    // Entry point
+    start [shape=circle, label="Start"];
+
+    // Processing step — could be any codergen or tool operation.
+    // Here it represents some preparatory work before the gate.
+    process [shape=box, label="Process Changes"];
+
+    // Human approval gate — the engine pauses here and asks the operator.
+    // The `question` attribute is displayed to the human.
+    human_gate [
+        shape=house,
+        label="Approval Gate",
+        question="Do you approve this change?"
+    ];
+
+    // Approved path: taken when the operator approves
+    approved [shape=box, label="Apply Changes"];
+
+    // Terminal nodes
+    exit_success [shape=doublecircle, label="Completed"];
+    exit_rejected [shape=doublecircle, label="Rejected"];
+
+    // Flow: start -> process -> human gate
+    start -> process;
+    process -> human_gate;
+
+    // Gate routing: operator response determines the path
+    human_gate -> approved      [label="success"];
+    human_gate -> exit_rejected [label="failure"];
+
+    // After approval, proceed to exit
+    approved -> exit_success;
+}

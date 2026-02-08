@@ -3,6 +3,7 @@
 
 use super::ast::{DotAttr, DotEdge, DotGraph, DotNode, DotStatement, DotValue};
 use super::lexer::{self, LexerError, Token};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// Errors that can occur during parsing.
@@ -27,11 +28,17 @@ pub fn parse(input: &str) -> Result<DotGraph, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Buffer for statements expanded from edge chains and graph default attrs.
+    pending_stmts: VecDeque<DotStatement>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            pending_stmts: VecDeque::new(),
+        }
     }
 
     /// Peek at the current token without consuming it.
@@ -111,6 +118,11 @@ impl Parser {
         let mut stmts = Vec::new();
 
         loop {
+            // Drain any buffered statements from edge chains or graph defaults
+            while let Some(pending) = self.pending_stmts.pop_front() {
+                stmts.push(pending);
+            }
+
             match self.peek() {
                 Token::RBrace | Token::Eof => break,
                 _ => {
@@ -124,10 +136,17 @@ impl Parser {
             }
         }
 
+        // Drain any remaining buffered statements
+        while let Some(pending) = self.pending_stmts.pop_front() {
+            stmts.push(pending);
+        }
+
         Ok(stmts)
     }
 
-    /// Parse a single statement: default_stmt | edge_stmt | node_stmt | attr_stmt | subgraph
+    /// Parse one or more statements from a single source construct.
+    /// Edge chains like `a -> b -> c` expand into multiple edge statements.
+    /// `graph [k=v, ...]` expands into multiple attribute statements.
     fn parse_stmt(&mut self) -> Result<DotStatement, ParseError> {
         match self.peek() {
             Token::Node => {
@@ -140,6 +159,24 @@ impl Parser {
                 let attrs = self.parse_attr_list()?;
                 Ok(DotStatement::DefaultEdge(attrs))
             }
+            Token::Graph => {
+                self.advance();
+                // graph [...] — default graph attributes, expanded into Attr statements
+                if matches!(self.peek(), Token::LBracket) {
+                    let attrs = self.parse_attr_list()?;
+                    self.pending_stmts
+                        .extend(attrs.into_iter().map(DotStatement::Attr));
+                    // Return the first one; the rest are buffered in pending_stmts
+                    self.pending_stmts
+                        .pop_front()
+                        .ok_or(ParseError::UnexpectedEof)
+                } else {
+                    Err(ParseError::Expected {
+                        expected: "[".to_string(),
+                        found: self.peek().clone(),
+                    })
+                }
+            }
             Token::Subgraph => {
                 let subgraph = self.parse_subgraph()?;
                 Ok(DotStatement::Subgraph(subgraph))
@@ -147,20 +184,9 @@ impl Parser {
             Token::Ident(_) | Token::StringLit(_) => {
                 let id = self.parse_id()?;
 
-                // Check if this is an edge statement
+                // Check if this is an edge statement (possibly chained)
                 if matches!(self.peek(), Token::Arrow | Token::DashDash) {
-                    self.advance();
-                    let to = self.parse_id()?;
-                    let attrs = if matches!(self.peek(), Token::LBracket) {
-                        self.parse_attr_list()?
-                    } else {
-                        vec![]
-                    };
-                    Ok(DotStatement::Edge(DotEdge {
-                        from: id,
-                        to,
-                        attrs,
-                    }))
+                    self.parse_edge_chain(id)
                 }
                 // Check if this is a graph-level attribute: ident = value
                 else if matches!(self.peek(), Token::Equals) {
@@ -183,6 +209,48 @@ impl Parser {
                 found: other.clone(),
             }),
         }
+    }
+
+    /// Parse an edge chain like `a -> b -> c [attrs]`.
+    /// Produces multiple DotEdge statements; the first is returned directly,
+    /// the rest are buffered in pending_stmts.
+    fn parse_edge_chain(&mut self, first: String) -> Result<DotStatement, ParseError> {
+        let mut nodes = vec![first];
+
+        // Collect all chained nodes: consume `->` id pairs
+        while matches!(self.peek(), Token::Arrow | Token::DashDash) {
+            self.advance();
+            let next = self.parse_id()?;
+            nodes.push(next);
+        }
+
+        // Attributes on the chain apply only to the last edge
+        let trailing_attrs = if matches!(self.peek(), Token::LBracket) {
+            self.parse_attr_list()?
+        } else {
+            vec![]
+        };
+
+        // Build edge statements for each consecutive pair
+        let last_idx = nodes.len() - 2;
+        for i in 0..=last_idx {
+            let attrs = if i == last_idx {
+                trailing_attrs.clone()
+            } else {
+                vec![]
+            };
+            let edge = DotStatement::Edge(DotEdge {
+                from: nodes[i].clone(),
+                to: nodes[i + 1].clone(),
+                attrs,
+            });
+            self.pending_stmts.push_back(edge);
+        }
+
+        // Return the first edge; the rest are buffered
+        self.pending_stmts
+            .pop_front()
+            .ok_or(ParseError::UnexpectedEof)
     }
 
     /// Parse a subgraph: "subgraph" [ident] "{" stmt_list "}"
@@ -537,6 +605,154 @@ mod tests {
     }
 
     #[test]
+    fn parse_graph_default_attributes() {
+        let graph = parse(r#"digraph { graph [goal="Run tests"] }"#).unwrap();
+        assert_eq!(graph.statements.len(), 1);
+        match &graph.statements[0] {
+            DotStatement::Attr(attr) => {
+                assert_eq!(attr.key, "goal");
+                assert_eq!(attr.value, DotValue::String("Run tests".to_string()));
+            }
+            other => panic!("expected Attr from graph default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_graph_default_multiple_attributes() {
+        let graph = parse(
+            r#"digraph {
+            graph [goal="Build", retry_target="implement"]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(graph.statements.len(), 2);
+        match &graph.statements[0] {
+            DotStatement::Attr(attr) => assert_eq!(attr.key, "goal"),
+            other => panic!("expected Attr, got {other:?}"),
+        }
+        match &graph.statements[1] {
+            DotStatement::Attr(attr) => assert_eq!(attr.key, "retry_target"),
+            other => panic!("expected Attr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edge_chain() {
+        let graph = parse("digraph { a -> b -> c }").unwrap();
+        assert_eq!(graph.statements.len(), 2);
+        match &graph.statements[0] {
+            DotStatement::Edge(edge) => {
+                assert_eq!(edge.from, "a");
+                assert_eq!(edge.to, "b");
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        match &graph.statements[1] {
+            DotStatement::Edge(edge) => {
+                assert_eq!(edge.from, "b");
+                assert_eq!(edge.to, "c");
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edge_chain_with_trailing_attrs() {
+        let graph = parse(r#"digraph { a -> b -> c [label="end"] }"#).unwrap();
+        assert_eq!(graph.statements.len(), 2);
+        match &graph.statements[0] {
+            DotStatement::Edge(edge) => {
+                assert_eq!(edge.from, "a");
+                assert_eq!(edge.to, "b");
+                assert!(edge.attrs.is_empty());
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        match &graph.statements[1] {
+            DotStatement::Edge(edge) => {
+                assert_eq!(edge.from, "b");
+                assert_eq!(edge.to, "c");
+                assert_eq!(edge.attrs.len(), 1);
+                assert_eq!(edge.attrs[0].key, "label");
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_long_edge_chain() {
+        let graph = parse("digraph { start -> plan -> implement -> validate -> exit }").unwrap();
+        assert_eq!(graph.statements.len(), 4);
+        let expected = [
+            ("start", "plan"),
+            ("plan", "implement"),
+            ("implement", "validate"),
+            ("validate", "exit"),
+        ];
+        for (i, (from, to)) in expected.iter().enumerate() {
+            match &graph.statements[i] {
+                DotStatement::Edge(edge) => {
+                    assert_eq!(edge.from, *from);
+                    assert_eq!(edge.to, *to);
+                }
+                other => panic!("expected Edge at position {i}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_makeatron_simple() {
+        let input = r#"digraph simple {
+            graph [goal="Run tests and report results"]
+            rankdir=LR
+
+            start [shape=Mdiamond, label="Start"]
+            exit  [shape=Msquare, label="Exit"]
+
+            run_tests [label="Run Tests", prompt="Run the test suite and report results"]
+            report    [label="Report", prompt="Summarize the test results"]
+
+            start -> run_tests -> report -> exit
+        }"#;
+        let graph = parse(input).unwrap();
+        assert_eq!(graph.name, Some("simple".to_string()));
+        // graph attr + rankdir + 4 nodes + 3 edges = 8
+        assert!(
+            graph.statements.len() >= 8,
+            "got {} statements",
+            graph.statements.len()
+        );
+    }
+
+    #[test]
+    fn parse_makeatron_human_gate() {
+        let input = r#"digraph human_gate {
+            rankdir=LR
+
+            start [shape=Mdiamond, label="Start"]
+            exit  [shape=Msquare, label="Exit"]
+
+            implement [shape=box, label="Implement", prompt="Write the code"]
+            ship_it   [shape=box, label="Ship It", prompt="Prepare the release"]
+            fixes     [shape=box, label="Apply Fixes", prompt="Fix the review feedback"]
+
+            review_gate [
+                shape=hexagon,
+                label="Review Changes",
+                type="wait.human"
+            ]
+
+            start -> implement -> review_gate
+            review_gate -> ship_it [label="[A] Approve"]
+            review_gate -> fixes   [label="[F] Fix"]
+            ship_it -> exit
+            fixes -> review_gate
+        }"#;
+        let graph = parse(input).unwrap();
+        assert_eq!(graph.name, Some("human_gate".to_string()));
+    }
+
+    #[test]
     fn parse_error_invalid_syntax() {
         let result = parse("digraph {");
         assert!(result.is_err());
@@ -595,10 +811,10 @@ mod tests {
 
     #[test]
     fn parse_number_attribute_value() {
-        let graph = parse("digraph { a [weight=3.14] }").unwrap();
+        let graph = parse("digraph { a [weight=3.15] }").unwrap();
         match &graph.statements[0] {
             DotStatement::Node(node) => {
-                assert_eq!(node.attrs[0].value, DotValue::Number(3.14));
+                assert_eq!(node.attrs[0].value, DotValue::Number(3.15));
             }
             other => panic!("expected Node, got {other:?}"),
         }

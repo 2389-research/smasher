@@ -10,6 +10,87 @@ use crate::profile::{ProviderProfile, SystemPromptConfig, profile_for_model};
 use crate::tools::ToolRegistry;
 use crate::types::{SessionConfig, SessionEvent, SessionPhase, SessionState, Turn};
 
+/// Estimate token count from a text string using the heuristic of 1 token per 4 characters.
+///
+/// This is a rough approximation suitable for context window budget tracking;
+/// it is not intended to replicate any specific tokenizer.
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+/// Tracks approximate context window usage across an agent session.
+///
+/// Callers feed token counts in via `add_tokens`, then check `is_warning()`
+/// and `is_critical()` to decide whether to emit events or take corrective action.
+#[derive(Debug)]
+pub struct ContextWindowTracker {
+    /// Total size of the context window in tokens.
+    context_window_size: usize,
+    /// Cumulative tokens used so far.
+    tokens_used: usize,
+    /// Whether the warning threshold (80%) has already been emitted.
+    warning_emitted: bool,
+}
+
+impl ContextWindowTracker {
+    /// Create a tracker for a context window of the given size.
+    pub fn new(context_window_size: usize) -> Self {
+        Self {
+            context_window_size,
+            tokens_used: 0,
+            warning_emitted: false,
+        }
+    }
+
+    /// Record additional token usage.
+    pub fn add_tokens(&mut self, n: usize) {
+        self.tokens_used = self.tokens_used.saturating_add(n);
+    }
+
+    /// Return the fraction of the context window that has been consumed (0.0 ..= 1.0+).
+    pub fn usage_fraction(&self) -> f64 {
+        if self.context_window_size == 0 {
+            return 0.0;
+        }
+        self.tokens_used as f64 / self.context_window_size as f64
+    }
+
+    /// Returns `true` when usage is at or above 80% of the context window.
+    pub fn is_warning(&self) -> bool {
+        self.usage_fraction() >= 0.80
+    }
+
+    /// Returns `true` when usage is at or above 95% of the context window.
+    pub fn is_critical(&self) -> bool {
+        self.usage_fraction() >= 0.95
+    }
+
+    /// Return the cumulative tokens used.
+    pub fn tokens_used(&self) -> usize {
+        self.tokens_used
+    }
+
+    /// Return the configured context window size.
+    pub fn context_window_size(&self) -> usize {
+        self.context_window_size
+    }
+
+    /// Set the cumulative token count directly (used when re-estimating from full conversation).
+    pub fn set_tokens_used(&mut self, n: usize) {
+        self.tokens_used = n;
+    }
+
+    /// Check whether the warning event needs to be emitted (crosses 80% for the first time).
+    /// Returns `true` exactly once when the threshold is first crossed.
+    pub fn should_emit_warning(&mut self) -> bool {
+        if self.is_warning() && !self.warning_emitted {
+            self.warning_emitted = true;
+            return true;
+        }
+        false
+    }
+}
+
 /// Output returned by a successful `process_input` call.
 #[derive(Debug)]
 pub struct SessionOutput {
@@ -48,6 +129,7 @@ pub struct Session {
     event_emitter: EventEmitter,
     profile: Box<dyn ProviderProfile>,
     cancel_token: CancellationToken,
+    context_tracker: Option<ContextWindowTracker>,
 }
 
 impl Session {
@@ -64,6 +146,7 @@ impl Session {
         let session_id = uuid::Uuid::new_v4().to_string();
         let state = SessionState::new(session_id);
         let profile = profile_for_model(&config.model);
+        let context_tracker = config.context_window_size.map(ContextWindowTracker::new);
 
         Self {
             config,
@@ -73,6 +156,7 @@ impl Session {
             event_emitter,
             profile,
             cancel_token: CancellationToken::new(),
+            context_tracker,
         }
     }
 
@@ -119,13 +203,12 @@ impl Session {
         // Apply steering: drain queued steering messages and add as user messages
         let steering_msgs = self.state.drain_steering();
         for msg in &steering_msgs {
-            self.state.messages.push(smasher_llm::types::Message::user(msg));
-            self.state.turns.push(Turn::Steering {
-                text: msg.clone(),
-            });
-            self.event_emitter.emit(SessionEvent::SteeringApplied {
-                text: msg.clone(),
-            });
+            self.state
+                .messages
+                .push(smasher_llm::types::Message::user(msg));
+            self.state.turns.push(Turn::Steering { text: msg.clone() });
+            self.event_emitter
+                .emit(SessionEvent::SteeringApplied { text: msg.clone() });
         }
 
         // Build the initial request
@@ -141,11 +224,9 @@ impl Session {
 
         let tool_defs = self.tool_registry.tool_definitions();
 
-        let mut request = smasher_llm::types::Request::new(
-            &self.config.model,
-            self.state.messages.clone(),
-        )
-        .system_prompt(system_prompt);
+        let mut request =
+            smasher_llm::types::Request::new(&self.config.model, self.state.messages.clone())
+                .system_prompt(system_prompt);
 
         if let Some(max_tokens) = self.config.max_tokens {
             request = request.max_tokens(max_tokens);
@@ -181,6 +262,34 @@ impl Session {
 
             // Record the response in state (updates turn counter, accumulates usage)
             self.state.add_assistant_response(&response);
+
+            // Update context window tracker with estimated tokens from this exchange
+            if let Some(ref mut tracker) = self.context_tracker {
+                // Estimate tokens from all messages currently in the conversation
+                let total_estimated: usize = self
+                    .state
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.content
+                            .iter()
+                            .map(|part| estimate_tokens(&format!("{:?}", part)))
+                            .sum::<usize>()
+                    })
+                    .sum();
+
+                // Reset and set to the current conversation size
+                tracker.set_tokens_used(total_estimated);
+
+                // Emit warning event when the 80% threshold is first crossed
+                if tracker.should_emit_warning() {
+                    self.event_emitter.emit(SessionEvent::ContextWindowWarning {
+                        used: tracker.tokens_used(),
+                        limit: tracker.context_window_size(),
+                        fraction: tracker.usage_fraction(),
+                    });
+                }
+            }
 
             // Check for tool calls
             let tool_calls = response.tool_calls();
@@ -302,6 +411,11 @@ impl Session {
     pub fn messages(&self) -> &[smasher_llm::types::Message] {
         &self.state.messages
     }
+
+    /// Return a reference to the context window tracker, if one is configured.
+    pub fn context_tracker(&self) -> Option<&ContextWindowTracker> {
+        self.context_tracker.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -310,8 +424,8 @@ mod tests {
     use async_trait::async_trait;
     use smasher_llm::provider::{ProviderAdapter, StreamResponse};
     use smasher_llm::types::{
-        ContentPart, Error as LlmError, FinishReason, Provider, Request, Response,
-        ToolCallData, Usage,
+        ContentPart, Error as LlmError, FinishReason, Provider, Request, Response, ToolCallData,
+        Usage,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -713,10 +827,7 @@ mod tests {
         session.follow_up("Please elaborate on that");
 
         assert_eq!(session.state.steering_queue.len(), 1);
-        assert_eq!(
-            session.state.steering_queue[0],
-            "Please elaborate on that"
-        );
+        assert_eq!(session.state.steering_queue[0], "Please elaborate on that");
     }
 
     #[test]
@@ -819,11 +930,7 @@ mod tests {
     async fn process_input_with_tool_call_executes_tool_and_loops() {
         let mut responses = VecDeque::new();
         // First response: tool call
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_1",
-            r#"{"text":"echoed"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_1", r#"{"text":"echoed"}"#));
         // Second response: final text
         responses.push_back(text_response("Done processing tool."));
 
@@ -838,11 +945,7 @@ mod tests {
     #[tokio::test]
     async fn process_input_tool_call_adds_tool_result_to_messages() {
         let mut responses = VecDeque::new();
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_42",
-            r#"{"text":"hi"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_42", r#"{"text":"hi"}"#));
         responses.push_back(text_response("Done."));
 
         let mut session = make_session(responses);
@@ -861,17 +964,9 @@ mod tests {
     async fn process_input_with_chained_tool_calls() {
         let mut responses = VecDeque::new();
         // Tool call 1
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_1",
-            r#"{"text":"first"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_1", r#"{"text":"first"}"#));
         // Tool call 2
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_2",
-            r#"{"text":"second"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_2", r#"{"text":"second"}"#));
         // Final text
         responses.push_back(text_response("All done."));
 
@@ -887,11 +982,7 @@ mod tests {
     async fn process_input_accumulates_usage_across_tool_loop() {
         let mut responses = VecDeque::new();
         // Tool call response: input=15, output=25
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_1",
-            r#"{"text":"x"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_1", r#"{"text":"x"}"#));
         // Final text: input=10, output=20
         responses.push_back(text_response("Done."));
 
@@ -1030,11 +1121,7 @@ mod tests {
     async fn process_input_handles_unknown_tool_gracefully() {
         let mut responses = VecDeque::new();
         // LLM tries to call a tool that doesn't exist
-        responses.push_back(tool_call_response(
-            "nonexistent_tool",
-            "call_bad",
-            r#"{}"#,
-        ));
+        responses.push_back(tool_call_response("nonexistent_tool", "call_bad", r#"{}"#));
         // After the error result, LLM produces final text
         responses.push_back(text_response("I see the tool failed."));
 
@@ -1063,9 +1150,9 @@ mod tests {
 
         // Verify steering message is in the conversation messages
         let messages = session.messages();
-        let has_steering = messages.iter().any(|m| {
-            m.is_user() && m.text() == Some("Be concise".to_string())
-        });
+        let has_steering = messages
+            .iter()
+            .any(|m| m.is_user() && m.text() == Some("Be concise".to_string()));
         assert!(has_steering, "Steering message should be in conversation");
     }
 
@@ -1149,21 +1236,24 @@ mod tests {
         }
 
         // Verify TurnStarted is emitted
-        let has_turn_started = events.iter().any(|e| {
-            matches!(e, SessionEvent::TurnStarted { .. })
-        });
+        let has_turn_started = events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TurnStarted { .. }));
         assert!(has_turn_started, "TurnStarted event should be emitted");
 
         // Verify AssistantMessage is emitted
-        let has_assistant_msg = events.iter().any(|e| {
-            matches!(e, SessionEvent::AssistantMessage { .. })
-        });
-        assert!(has_assistant_msg, "AssistantMessage event should be emitted");
+        let has_assistant_msg = events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::AssistantMessage { .. }));
+        assert!(
+            has_assistant_msg,
+            "AssistantMessage event should be emitted"
+        );
 
         // Verify SessionCompleted is emitted
-        let has_completed = events.iter().any(|e| {
-            matches!(e, SessionEvent::SessionCompleted { .. })
-        });
+        let has_completed = events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::SessionCompleted { .. }));
         assert!(has_completed, "SessionCompleted event should be emitted");
     }
 
@@ -1187,7 +1277,11 @@ mod tests {
         }
 
         // Expected order: TurnStarted -> AssistantMessage -> SessionCompleted
-        assert!(events.len() >= 3, "Should have at least 3 events, got {}", events.len());
+        assert!(
+            events.len() >= 3,
+            "Should have at least 3 events, got {}",
+            events.len()
+        );
         assert!(
             matches!(events[0], SessionEvent::TurnStarted { turn_number: 0 }),
             "First event should be TurnStarted, got {:?}",
@@ -1209,11 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn events_include_tool_call_details() {
         let mut responses = VecDeque::new();
-        responses.push_back(tool_call_response(
-            "echo",
-            "call_xyz",
-            r#"{"text":"hi"}"#,
-        ));
+        responses.push_back(tool_call_response("echo", "call_xyz", r#"{"text":"hi"}"#));
         responses.push_back(text_response("Done."));
 
         let client = make_client(responses);
@@ -1232,9 +1322,9 @@ mod tests {
         }
 
         // Verify ToolCallStarted has correct fields
-        let started = events.iter().find(|e| {
-            matches!(e, SessionEvent::ToolCallStarted { .. })
-        });
+        let started = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ToolCallStarted { .. }));
         assert!(started.is_some(), "Should have ToolCallStarted event");
         if let Some(SessionEvent::ToolCallStarted {
             tool_name,
@@ -1246,9 +1336,9 @@ mod tests {
         }
 
         // Verify ToolCallCompleted has correct fields
-        let completed = events.iter().find(|e| {
-            matches!(e, SessionEvent::ToolCallCompleted { .. })
-        });
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ToolCallCompleted { .. }));
         assert!(completed.is_some(), "Should have ToolCallCompleted event");
         if let Some(SessionEvent::ToolCallCompleted {
             tool_name,
@@ -1285,9 +1375,9 @@ mod tests {
             events.push(event);
         }
 
-        let steering_event = events.iter().find(|e| {
-            matches!(e, SessionEvent::SteeringApplied { .. })
-        });
+        let steering_event = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::SteeringApplied { .. }));
         assert!(
             steering_event.is_some(),
             "SteeringApplied event should be emitted"
@@ -1316,9 +1406,9 @@ mod tests {
             events.push(event);
         }
 
-        let completed = events.iter().find(|e| {
-            matches!(e, SessionEvent::SessionCompleted { .. })
-        });
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::SessionCompleted { .. }));
         assert!(completed.is_some());
         if let Some(SessionEvent::SessionCompleted {
             session_id,
@@ -1386,10 +1476,7 @@ mod tests {
         let config = SessionConfig::default();
         let mut session = Session::new(config, client, tool_registry, event_emitter);
 
-        let output = session
-            .process_input("Call both tools")
-            .await
-            .unwrap();
+        let output = session.process_input("Call both tools").await.unwrap();
 
         assert_eq!(output.text.as_deref(), Some("Both tools executed."));
 
@@ -1409,12 +1496,11 @@ mod tests {
         );
 
         // Verify tool results are in conversation (two tool result messages)
-        let tool_result_count = session
-            .messages()
-            .iter()
-            .filter(|m| m.is_tool())
-            .count();
-        assert_eq!(tool_result_count, 2, "Both tool results should be in messages");
+        let tool_result_count = session.messages().iter().filter(|m| m.is_tool()).count();
+        assert_eq!(
+            tool_result_count, 2,
+            "Both tool results should be in messages"
+        );
     }
 
     #[tokio::test]
@@ -1468,10 +1554,7 @@ mod tests {
         let mut session = Session::new(config, client, tool_registry, event_emitter);
 
         let output = session.process_input("Hello").await.unwrap();
-        assert_eq!(
-            output.text.as_deref(),
-            Some("Custom prompt acknowledged.")
-        );
+        assert_eq!(output.text.as_deref(), Some("Custom prompt acknowledged."));
     }
 
     // ── process_input: no text in response ───────────────────────────
@@ -1722,5 +1805,371 @@ mod tests {
 
         session.state.phase = SessionPhase::Active;
         assert_eq!(session.state.phase, SessionPhase::Active);
+    }
+
+    // ── estimate_tokens ─────────────────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_empty_string() {
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_single_char() {
+        // 1 char => ceil(1/4) = 1
+        assert_eq!(estimate_tokens("a"), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_four_chars() {
+        // 4 chars => exactly 1 token
+        assert_eq!(estimate_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_five_chars() {
+        // 5 chars => ceil(5/4) = 2
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_eight_chars() {
+        // 8 chars => 2 tokens
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_typical_sentence() {
+        let text = "Hello, this is a test sentence for token estimation.";
+        let expected = text.len().div_ceil(4);
+        assert_eq!(estimate_tokens(text), expected);
+    }
+
+    #[test]
+    fn estimate_tokens_large_text() {
+        let text = "x".repeat(10_000);
+        assert_eq!(estimate_tokens(&text), 2_500);
+    }
+
+    #[test]
+    fn estimate_tokens_unicode() {
+        // Multi-byte characters: "hello" in Japanese is 15 bytes in UTF-8
+        let text = "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}";
+        let expected = text.len().div_ceil(4);
+        assert_eq!(estimate_tokens(text), expected);
+    }
+
+    // ── ContextWindowTracker ────────────────────────────────────────
+
+    #[test]
+    fn tracker_new_starts_at_zero() {
+        let tracker = ContextWindowTracker::new(100_000);
+        assert_eq!(tracker.tokens_used(), 0);
+        assert_eq!(tracker.context_window_size(), 100_000);
+        assert!((tracker.usage_fraction() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tracker_add_tokens_accumulates() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(30);
+        assert_eq!(tracker.tokens_used(), 30);
+        tracker.add_tokens(20);
+        assert_eq!(tracker.tokens_used(), 50);
+    }
+
+    #[test]
+    fn tracker_set_tokens_used_replaces_value() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(50);
+        tracker.set_tokens_used(10);
+        assert_eq!(tracker.tokens_used(), 10);
+    }
+
+    #[test]
+    fn tracker_usage_fraction_at_half() {
+        let mut tracker = ContextWindowTracker::new(200);
+        tracker.add_tokens(100);
+        assert!((tracker.usage_fraction() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tracker_usage_fraction_at_full() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(100);
+        assert!((tracker.usage_fraction() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tracker_usage_fraction_zero_size_returns_zero() {
+        let tracker = ContextWindowTracker::new(0);
+        assert!((tracker.usage_fraction() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tracker_is_warning_below_80_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(79);
+        assert!(!tracker.is_warning());
+    }
+
+    #[test]
+    fn tracker_is_warning_at_80_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(80);
+        assert!(tracker.is_warning());
+    }
+
+    #[test]
+    fn tracker_is_warning_above_80_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(90);
+        assert!(tracker.is_warning());
+    }
+
+    #[test]
+    fn tracker_is_critical_below_95_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(94);
+        assert!(!tracker.is_critical());
+    }
+
+    #[test]
+    fn tracker_is_critical_at_95_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(95);
+        assert!(tracker.is_critical());
+    }
+
+    #[test]
+    fn tracker_is_critical_above_95_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(99);
+        assert!(tracker.is_critical());
+    }
+
+    #[test]
+    fn tracker_is_critical_at_100_percent() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(100);
+        assert!(tracker.is_critical());
+    }
+
+    #[test]
+    fn tracker_should_emit_warning_fires_once() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(80);
+        assert!(
+            tracker.should_emit_warning(),
+            "First call should return true"
+        );
+        assert!(
+            !tracker.should_emit_warning(),
+            "Second call should return false"
+        );
+    }
+
+    #[test]
+    fn tracker_should_emit_warning_not_yet_at_threshold() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(50);
+        assert!(
+            !tracker.should_emit_warning(),
+            "Should not emit below threshold"
+        );
+    }
+
+    #[test]
+    fn tracker_should_emit_warning_after_gradual_increase() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(50);
+        assert!(!tracker.should_emit_warning());
+        tracker.add_tokens(30);
+        assert!(
+            tracker.should_emit_warning(),
+            "Should emit once threshold crossed"
+        );
+        assert!(!tracker.should_emit_warning(), "Should not emit again");
+    }
+
+    #[test]
+    fn tracker_add_tokens_saturates_on_overflow() {
+        let mut tracker = ContextWindowTracker::new(100);
+        tracker.add_tokens(usize::MAX);
+        tracker.add_tokens(1);
+        assert_eq!(tracker.tokens_used(), usize::MAX);
+    }
+
+    #[test]
+    fn tracker_debug_is_implemented() {
+        let tracker = ContextWindowTracker::new(1000);
+        let debug_str = format!("{:?}", tracker);
+        assert!(debug_str.contains("ContextWindowTracker"));
+    }
+
+    // ── Session context tracker integration ─────────────────────────
+
+    #[test]
+    fn session_without_context_window_size_has_no_tracker() {
+        let session = make_session(VecDeque::new());
+        assert!(session.context_tracker().is_none());
+    }
+
+    #[test]
+    fn session_with_context_window_size_has_tracker() {
+        let client = make_client(VecDeque::new());
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default().with_context_window_size(200_000);
+        let session = Session::new(config, client, tool_registry, event_emitter);
+
+        let tracker = session.context_tracker().expect("tracker should exist");
+        assert_eq!(tracker.context_window_size(), 200_000);
+        assert_eq!(tracker.tokens_used(), 0);
+    }
+
+    fn make_session_with_context_window(
+        responses: VecDeque<Response>,
+        window_size: usize,
+    ) -> (Session, tokio::sync::broadcast::Receiver<SessionEvent>) {
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let rx = event_emitter.subscribe();
+        let config = SessionConfig::default().with_context_window_size(window_size);
+        let session = Session::new(config, client, tool_registry, event_emitter);
+        (session, rx)
+    }
+
+    #[tokio::test]
+    async fn context_tracker_updates_after_turn() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Hello!"));
+
+        let (mut session, _rx) = make_session_with_context_window(responses, 200_000);
+        session.process_input("Hi there").await.unwrap();
+
+        let tracker = session.context_tracker().expect("tracker should exist");
+        assert!(
+            tracker.tokens_used() > 0,
+            "Tracker should have counted some tokens after a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_window_warning_emitted_when_threshold_crossed() {
+        // Use a very small context window so the messages push us over 80%
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response(
+            "This is a response that should push us over the context window warning threshold.",
+        ));
+
+        // Context window of 10 tokens is tiny; any message will exceed 80%
+        let (mut session, mut rx) = make_session_with_context_window(responses, 10);
+        session.process_input("Hello").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let warning = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ContextWindowWarning { .. }));
+        assert!(
+            warning.is_some(),
+            "ContextWindowWarning event should be emitted when threshold is crossed"
+        );
+
+        if let Some(SessionEvent::ContextWindowWarning {
+            used,
+            limit,
+            fraction,
+        }) = warning
+        {
+            assert_eq!(*limit, 10);
+            assert!(*used > 0);
+            assert!(*fraction >= 0.80);
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_warning_not_emitted_when_below_threshold() {
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Ok."));
+
+        // Context window of 1_000_000 tokens is huge; messages won't approach 80%
+        let (mut session, mut rx) = make_session_with_context_window(responses, 1_000_000);
+        session.process_input("Hi").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let warning = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ContextWindowWarning { .. }));
+        assert!(
+            warning.is_none(),
+            "ContextWindowWarning should not be emitted when well below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_window_warning_emitted_only_once() {
+        // Two turns that both exceed the threshold
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("First response."));
+        responses.push_back(text_response("Second response."));
+
+        // Tiny window: both turns will exceed 80%
+        let (mut session, mut rx) = make_session_with_context_window(responses, 10);
+        session.process_input("First").await.unwrap();
+        session.process_input("Second").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let warning_count = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ContextWindowWarning { .. }))
+            .count();
+        assert_eq!(
+            warning_count, 1,
+            "ContextWindowWarning should be emitted exactly once, got {warning_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_tracker_means_no_warning_events() {
+        // Session without context_window_size configured
+        let mut responses = VecDeque::new();
+        responses.push_back(text_response("Hello!"));
+
+        let client = make_client(responses);
+        let tool_registry = ToolRegistry::new();
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default(); // no context_window_size
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Hi").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let warning = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ContextWindowWarning { .. }));
+        assert!(
+            warning.is_none(),
+            "No ContextWindowWarning should be emitted without tracker"
+        );
     }
 }

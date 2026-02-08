@@ -398,9 +398,7 @@ mod tests {
         let headers = HeaderMap::new();
         let err = build_error_from_status("anthropic", 429, "slow down", &headers);
         match err {
-            Error::RateLimited {
-                retry_after_ms, ..
-            } => {
+            Error::RateLimited { retry_after_ms, .. } => {
                 assert_eq!(retry_after_ms, None);
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -463,10 +461,7 @@ mod tests {
         let headers = HeaderMap::new();
         let err = build_error_from_status("openai", 301, "moved", &headers);
         match err {
-            Error::Other {
-                message,
-                retryable,
-            } => {
+            Error::Other { message, retryable } => {
                 assert!(!retryable);
                 assert!(message.contains("301"));
                 assert!(message.contains("openai"));

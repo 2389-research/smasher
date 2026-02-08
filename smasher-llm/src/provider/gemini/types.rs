@@ -295,8 +295,8 @@ fn convert_content_parts_to_gemini(
                 // they would need to be fetched first. Skip for now.
             }
             ContentPart::ToolCall(tc) => {
-                let args: Value =
-                    serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(Default::default()));
+                let args: Value = serde_json::from_str(&tc.arguments)
+                    .unwrap_or(Value::Object(Default::default()));
                 gemini_parts.push(GeminiPart::FunctionCall {
                     function_call: GeminiFunctionCall {
                         name: tc.name.clone(),
@@ -457,10 +457,10 @@ pub fn map_finish_reason(reason: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::tool::ToolDefinition;
     use crate::types::{
         ImageData, ImageSourceType, Message, ThinkingConfig, ThinkingData, ToolCallData,
     };
-    use crate::types::tool::ToolDefinition;
     use serde_json::json;
 
     // ── GeminiPart serde roundtrip tests ────────────────────────────────
@@ -546,13 +546,15 @@ mod tests {
         };
         let json = serde_json::to_value(&part).unwrap();
         assert_eq!(json["functionResponse"]["name"], "get_weather");
-        assert_eq!(json["functionResponse"]["response"]["content"], "72F and sunny");
+        assert_eq!(
+            json["functionResponse"]["response"]["content"],
+            "72F and sunny"
+        );
     }
 
     #[test]
     fn gemini_part_function_response_deserializes_correctly() {
-        let json =
-            json!({"functionResponse": {"name": "calc", "response": {"content": "42"}}});
+        let json = json!({"functionResponse": {"name": "calc", "response": {"content": "42"}}});
         let part: GeminiPart = serde_json::from_value(json).unwrap();
         match part {
             GeminiPart::FunctionResponse { function_response } => {
@@ -716,10 +718,7 @@ mod tests {
 
     #[test]
     fn convert_request_simple_text_message() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hello, Gemini!")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hello, Gemini!")]);
 
         let gemini_req = convert_request(&request);
 
@@ -735,11 +734,8 @@ mod tests {
 
     #[test]
     fn convert_request_system_prompt_field() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .system_prompt("You are a helpful assistant.");
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .system_prompt("You are a helpful assistant.");
 
         let gemini_req = convert_request(&request);
 
@@ -795,14 +791,11 @@ mod tests {
 
     #[test]
     fn convert_request_with_generation_config() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .max_tokens(512)
-        .temperature(0.8)
-        .top_p(0.95)
-        .stop_sequences(vec!["END".to_string()]);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .max_tokens(512)
+            .temperature(0.8)
+            .top_p(0.95)
+            .stop_sequences(vec!["END".to_string()]);
 
         let gemini_req = convert_request(&request);
 
@@ -815,11 +808,8 @@ mod tests {
 
     #[test]
     fn convert_request_with_json_response_format() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .response_format(ResponseFormat::JsonObject);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .response_format(ResponseFormat::JsonObject);
 
         let gemini_req = convert_request(&request);
 
@@ -834,15 +824,13 @@ mod tests {
     #[test]
     fn convert_request_with_json_schema_response_format() {
         let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .response_format(ResponseFormat::JsonSchema {
-            name: "person".to_string(),
-            schema: schema.clone(),
-            strict: true,
-        });
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")]).response_format(
+            ResponseFormat::JsonSchema {
+                name: "person".to_string(),
+                schema: schema.clone(),
+                strict: true,
+            },
+        );
 
         let gemini_req = convert_request(&request);
 
@@ -874,14 +862,11 @@ mod tests {
 
     #[test]
     fn convert_request_disabled_thinking_has_no_thinking_config() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .thinking(ThinkingConfig {
-            enabled: false,
-            budget_tokens: Some(8000),
-        });
+        let request =
+            Request::new("gemini-2.0-flash", vec![Message::user("Hi")]).thinking(ThinkingConfig {
+                enabled: false,
+                budget_tokens: Some(8000),
+            });
 
         let gemini_req = convert_request(&request);
 
@@ -913,11 +898,8 @@ mod tests {
 
     #[test]
     fn convert_request_tool_choice_auto() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .tool_choice(ToolChoice::Auto);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .tool_choice(ToolChoice::Auto);
 
         let gemini_req = convert_request(&request);
 
@@ -927,11 +909,8 @@ mod tests {
 
     #[test]
     fn convert_request_tool_choice_required() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .tool_choice(ToolChoice::Required);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .tool_choice(ToolChoice::Required);
 
         let gemini_req = convert_request(&request);
 
@@ -941,11 +920,8 @@ mod tests {
 
     #[test]
     fn convert_request_tool_choice_none() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        )
-        .tool_choice(ToolChoice::None);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")])
+            .tool_choice(ToolChoice::None);
 
         let gemini_req = convert_request(&request);
 
@@ -1154,8 +1130,7 @@ mod tests {
         assert_eq!(calls[0].name, "get_weather");
         // The ID should be a valid UUID.
         assert!(!calls[0].id.is_empty());
-        let parsed_args: serde_json::Value =
-            serde_json::from_str(&calls[0].arguments).unwrap();
+        let parsed_args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(parsed_args["location"], "NYC");
     }
 
@@ -1276,7 +1251,10 @@ mod tests {
 
         let response = convert_response(gemini_resp, "gemini-2.0-flash");
         assert_eq!(response.content.len(), 2);
-        assert_eq!(response.text().as_deref(), Some("Let me check the weather."));
+        assert_eq!(
+            response.text().as_deref(),
+            Some("Let me check the weather.")
+        );
         assert!(response.has_tool_calls());
     }
 
@@ -1303,17 +1281,12 @@ mod tests {
             json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         );
 
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![
-                Message::user("Search for Rust"),
-            ],
-        )
-        .system_prompt("You are a search assistant.")
-        .max_tokens(1024)
-        .temperature(0.5)
-        .tools(vec![tool])
-        .tool_choice(ToolChoice::Auto);
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Search for Rust")])
+            .system_prompt("You are a search assistant.")
+            .max_tokens(1024)
+            .temperature(0.5)
+            .tools(vec![tool])
+            .tool_choice(ToolChoice::Auto);
 
         let gemini_req = convert_request(&request);
         let json = serde_json::to_value(&gemini_req).unwrap();
@@ -1324,19 +1297,13 @@ mod tests {
         assert!(json["generationConfig"].is_object());
         assert!(json["tools"].is_array());
         assert!(json["toolConfig"].is_object());
-        assert_eq!(
-            json["toolConfig"]["functionCallingConfig"]["mode"],
-            "AUTO"
-        );
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 1024);
     }
 
     #[test]
     fn convert_request_no_generation_config_when_nothing_set() {
-        let request = Request::new(
-            "gemini-2.0-flash",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("gemini-2.0-flash", vec![Message::user("Hi")]);
 
         let gemini_req = convert_request(&request);
 
@@ -1367,10 +1334,7 @@ mod tests {
         match &gemini_req.contents[2].parts[0] {
             GeminiPart::FunctionResponse { function_response } => {
                 assert_eq!(function_response.name, "risky_fn");
-                assert_eq!(
-                    function_response.response["content"],
-                    "API key expired"
-                );
+                assert_eq!(function_response.response["content"], "API key expired");
             }
             other => panic!("expected FunctionResponse, got {other:?}"),
         }

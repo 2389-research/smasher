@@ -20,7 +20,9 @@ chrono.workspace = true
 tracing.workspace = true
 winnow.workspace = true
 rand.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
 tokio-test.workspace = true
+tempfile.workspace = true

@@ -959,8 +959,7 @@ mod tests {
 
     #[test]
     fn no_alias_conflicts_with_model_ids() {
-        let model_ids: std::collections::HashSet<&str> =
-            CATALOG.iter().map(|m| m.id).collect();
+        let model_ids: std::collections::HashSet<&str> = CATALOG.iter().map(|m| m.id).collect();
         for model in CATALOG.iter() {
             for alias in model.aliases {
                 assert!(
@@ -977,16 +976,24 @@ mod tests {
     #[test]
     fn reasoning_models_are_marked_correctly() {
         // Reasoning models
-        for id in &["claude-opus-4-6", "o3", "o3-mini", "o4-mini", "gemini-2.5-pro"] {
+        for id in &[
+            "claude-opus-4-6",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "gemini-2.5-pro",
+        ] {
             let info = lookup_model(id).unwrap();
-            assert!(
-                info.supports_reasoning,
-                "{} should support reasoning",
-                id
-            );
+            assert!(info.supports_reasoning, "{} should support reasoning", id);
         }
         // Non-reasoning models
-        for id in &["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini"] {
+        for id in &[
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.1-nano",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ] {
             let info = lookup_model(id).unwrap();
             assert!(
                 !info.supports_reasoning,

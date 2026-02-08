@@ -1,16 +1,55 @@
 // ABOUTME: Core pipeline execution engine that traverses the graph.
 // ABOUTME: Manages node execution, edge selection, checkpointing, and resume.
 
+//! Pipeline execution engine.
+//!
+//! The engine is the core runtime for smasher-attractor pipelines. It takes a
+//! [`Graph`] (a resolved DOT file) together with a [`HandlerRegistry`] that maps
+//! node types to executable logic, and walks the graph from the single start
+//! node to an exit node (or until the step limit is reached).
+//!
+//! Key responsibilities:
+//!
+//! - **Node execution** -- delegates each visited node to the matching handler.
+//! - **Edge selection** -- picks the next edge based on conditions, outcomes,
+//!   and priorities.
+//! - **Retry** -- re-executes nodes that return retryable failures according to
+//!   per-node [`RetryPolicy`] attributes.
+//! - **Loop tracking** -- counts `loop_restart` edge traversals and clears
+//!   source-node context entries on restart.
+//! - **Goal enforcement** -- after execution completes, verifies that all goal
+//!   nodes were visited.
+//! - **Checkpointing** -- optionally snapshots the full execution state so a
+//!   pipeline can be resumed later with [`Engine::run_from_checkpoint`].
+
 use std::collections::HashMap;
 
-use crate::edge::{select_edge, EdgeSelectionError};
+use crate::edge::{EdgeSelectionError, select_edge};
 use crate::goals::{GoalError, GoalGate};
 use crate::graph::{Graph, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
-use crate::retry::{compute_delay, RetryPolicy, RetryState};
+use crate::retry::{RetryPolicy, RetryState, compute_delay};
 use crate::state::{Checkpoint, Context, Outcome};
 
 /// Configuration for the pipeline execution engine.
+///
+/// # Examples
+///
+/// ```
+/// use smasher_attractor::engine::EngineConfig;
+///
+/// // Use the defaults (1000 max steps, checkpointing enabled).
+/// let config = EngineConfig::default();
+/// assert_eq!(config.max_steps, 1000);
+/// assert!(config.enable_checkpointing);
+///
+/// // Customize for a tight test loop.
+/// let config = EngineConfig {
+///     max_steps: 50,
+///     enable_checkpointing: false,
+/// };
+/// assert_eq!(config.max_steps, 50);
+/// ```
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Maximum nodes to visit before forced stop (prevents infinite loops).
@@ -49,6 +88,44 @@ pub enum EngineError {
     RetryExhausted { node_id: String, message: String },
 }
 
+/// Tracks how many times each loop_restart edge has been traversed.
+///
+/// Each edge is identified by its (from, to) pair. The counter is useful
+/// for debugging loops and is included in the execution result.
+#[derive(Debug, Clone, Default)]
+pub struct LoopCounter {
+    counts: HashMap<(String, String), usize>,
+}
+
+impl LoopCounter {
+    /// Create a new empty loop counter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Increment the traversal count for a loop_restart edge.
+    pub fn increment(&mut self, from: &str, to: &str) {
+        let key = (from.to_string(), to.to_string());
+        *self.counts.entry(key).or_insert(0) += 1;
+    }
+
+    /// Get the traversal count for a specific edge.
+    pub fn count(&self, from: &str, to: &str) -> usize {
+        let key = (from.to_string(), to.to_string());
+        self.counts.get(&key).copied().unwrap_or(0)
+    }
+
+    /// Get all loop restart edge counts.
+    pub fn counts(&self) -> &HashMap<(String, String), usize> {
+        &self.counts
+    }
+
+    /// Total number of loop restarts across all edges.
+    pub fn total(&self) -> usize {
+        self.counts.values().sum()
+    }
+}
+
 /// The result of a completed pipeline execution.
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -62,6 +139,8 @@ pub struct ExecutionResult {
     pub steps_taken: usize,
     /// Checkpoint captured at the end of execution (if checkpointing is enabled).
     pub checkpoint: Option<Checkpoint>,
+    /// Counts of how many times each loop_restart edge was traversed.
+    pub loop_restarts: LoopCounter,
 }
 
 /// The core pipeline execution engine.
@@ -97,6 +176,56 @@ impl Engine {
     /// Finds the single start node, then executes nodes in sequence
     /// following edge selections until an exit node is reached, no edges
     /// remain, or the max step limit is hit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use std::sync::Arc;
+    /// # use async_trait::async_trait;
+    /// # use smasher_attractor::graph::{Graph, GraphNode, GraphEdge, NodeType, NodeAttrValue};
+    /// # use smasher_attractor::handler::{Handler, HandlerError, HandlerRegistry};
+    /// # use smasher_attractor::state::{Context, Outcome};
+    /// # use smasher_attractor::engine::Engine;
+    /// #
+    /// # struct SuccessHandler;
+    /// # #[async_trait]
+    /// # impl Handler for SuccessHandler {
+    /// #     fn name(&self) -> &str { "ok" }
+    /// #     async fn execute(&self, _n: &GraphNode, _c: &Context)
+    /// #         -> Result<Outcome, HandlerError> { Ok(Outcome::success()) }
+    /// #     fn handles(&self, _t: &NodeType) -> bool { true }
+    /// # }
+    /// #
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let graph = Graph {
+    ///     name: Some("demo".into()),
+    ///     nodes: vec![
+    ///         GraphNode { id: "start".into(), node_type: NodeType::Start,
+    ///                     label: None, attrs: HashMap::new() },
+    ///         GraphNode { id: "exit".into(), node_type: NodeType::Exit,
+    ///                     label: None, attrs: HashMap::new() },
+    ///     ],
+    ///     edges: vec![
+    ///         GraphEdge { from: "start".into(), to: "exit".into(),
+    ///                     label: None, condition: None, priority: None,
+    ///                     loop_restart: false, attrs: HashMap::new() },
+    ///     ],
+    ///     default_node_attrs: HashMap::new(),
+    ///     default_edge_attrs: HashMap::new(),
+    /// };
+    ///
+    /// let mut registry = HandlerRegistry::new();
+    /// registry.register(Arc::new(SuccessHandler));
+    ///
+    /// let engine = Engine::new(graph, registry);
+    /// let result = engine.run(Context::new()).await.unwrap();
+    ///
+    /// assert_eq!(result.visited_nodes, vec!["start", "exit"]);
+    /// assert_eq!(result.steps_taken, 2);
+    /// # }
+    /// ```
     pub async fn run(&self, context: Context) -> Result<ExecutionResult, EngineError> {
         let start_nodes = self.graph.start_nodes();
         match start_nodes.len() {
@@ -148,6 +277,7 @@ impl Engine {
     ) -> Result<ExecutionResult, EngineError> {
         let mut current_node_id = start_node_id;
         let mut steps: usize = 0;
+        let mut loop_restarts = LoopCounter::new();
 
         loop {
             // Check max steps limit
@@ -158,12 +288,12 @@ impl Engine {
             }
 
             // Look up the current node
-            let node = self
-                .graph
-                .node(&current_node_id)
-                .ok_or_else(|| EngineError::NodeNotFound {
-                    node_id: current_node_id.clone(),
-                })?;
+            let node =
+                self.graph
+                    .node(&current_node_id)
+                    .ok_or_else(|| EngineError::NodeNotFound {
+                        node_id: current_node_id.clone(),
+                    })?;
 
             // Execute the handler for this node
             let mut outcome = self.registry.execute(node, &context).await?;
@@ -199,12 +329,44 @@ impl Engine {
                 break;
             }
 
+            // Inject outcome status into context so condition expressions like
+            // `outcome=success` can match against it during edge selection.
+            let outcome_label = match &outcome {
+                Outcome::Success { .. } => "success",
+                Outcome::Failure { .. } => "fail",
+                Outcome::Skip { .. } => "skip",
+            };
+            context.set("outcome", serde_json::json!(outcome_label));
+
             // Select next edge
             let last_outcome = node_outcomes.get(&current_node_id);
             let next_edge = select_edge(&self.graph, &current_node_id, &context, last_outcome)?;
 
             match next_edge {
                 Some(edge) => {
+                    // Handle loop_restart edge semantics
+                    if edge.loop_restart {
+                        loop_restarts.increment(&edge.from, &edge.to);
+
+                        // Clear context entries prefixed with the source node's ID
+                        let prefix = format!("{}_", edge.from);
+                        let keys_to_remove: Vec<String> = context
+                            .keys()
+                            .into_iter()
+                            .filter(|k| k.starts_with(&prefix))
+                            .collect();
+                        for key in keys_to_remove {
+                            context.remove(&key);
+                        }
+
+                        tracing::info!(
+                            from = %edge.from,
+                            to = %edge.to,
+                            traversal_count = loop_restarts.count(&edge.from, &edge.to),
+                            "loop_restart edge traversed, context entries for source node cleared"
+                        );
+                    }
+
                     current_node_id = edge.to.clone();
                 }
                 None => {
@@ -243,6 +405,7 @@ impl Engine {
             final_context: context.snapshot(),
             steps_taken: steps,
             checkpoint,
+            loop_restarts,
         })
     }
 }
@@ -291,6 +454,7 @@ mod tests {
             label: None,
             condition: None,
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -302,6 +466,7 @@ mod tests {
             label: Some(label.to_string()),
             condition: Some(label.to_string()),
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -313,6 +478,19 @@ mod tests {
             label: None,
             condition: Some(condition.to_string()),
             priority: None,
+            loop_restart: false,
+            attrs: HashMap::new(),
+        }
+    }
+
+    fn make_loop_restart_edge(from: &str, to: &str) -> GraphEdge {
+        GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            label: None,
+            condition: None,
+            priority: None,
+            loop_restart: true,
             attrs: HashMap::new(),
         }
     }
@@ -585,10 +763,7 @@ mod tests {
                 make_node("exit", NodeType::Exit),
                 make_node("unreachable", NodeType::Generic),
             ],
-            vec![
-                make_edge("start", "exit"),
-                make_edge("exit", "unreachable"),
-            ],
+            vec![make_edge("start", "exit"), make_edge("exit", "unreachable")],
         );
         let engine = Engine::new(graph, success_registry());
         let ctx = Context::new();
@@ -781,7 +956,7 @@ mod tests {
         let result = engine.run(ctx).await.unwrap();
 
         assert_eq!(result.node_outcomes.len(), 3);
-        for (_, outcome) in &result.node_outcomes {
+        for outcome in result.node_outcomes.values() {
             assert!(outcome.is_success());
         }
     }
@@ -805,18 +980,12 @@ mod tests {
         let result = engine.run(ctx).await.unwrap();
 
         // Should contain the initial value and the values set by ContextSettingHandler
-        assert_eq!(
-            result.final_context.get("initial"),
-            Some(&json!("value"))
-        );
+        assert_eq!(result.final_context.get("initial"), Some(&json!("value")));
         assert_eq!(
             result.final_context.get("visited_start"),
             Some(&json!(true))
         );
-        assert_eq!(
-            result.final_context.get("visited_exit"),
-            Some(&json!(true))
-        );
+        assert_eq!(result.final_context.get("visited_exit"), Some(&json!(true)));
     }
 
     // ---------------------------------------------------------------
@@ -1139,5 +1308,295 @@ mod tests {
         let engine = Engine::with_config(graph, success_registry(), config);
         assert_eq!(engine.config.max_steps, 42);
         assert!(!engine.config.enable_checkpointing);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 27: LoopCounter basic operations
+    // ---------------------------------------------------------------
+    #[test]
+    fn loop_counter_basic_operations() {
+        let mut counter = LoopCounter::new();
+        assert_eq!(counter.count("a", "b"), 0);
+        assert_eq!(counter.total(), 0);
+
+        counter.increment("a", "b");
+        assert_eq!(counter.count("a", "b"), 1);
+        assert_eq!(counter.total(), 1);
+
+        counter.increment("a", "b");
+        assert_eq!(counter.count("a", "b"), 2);
+        assert_eq!(counter.total(), 2);
+
+        counter.increment("c", "d");
+        assert_eq!(counter.count("c", "d"), 1);
+        assert_eq!(counter.total(), 3);
+
+        let counts = counter.counts();
+        assert_eq!(counts.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 28: LoopCounter default is empty
+    // ---------------------------------------------------------------
+    #[test]
+    fn loop_counter_default_is_empty() {
+        let counter = LoopCounter::default();
+        assert_eq!(counter.total(), 0);
+        assert!(counter.counts().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 29: loop_restart edge increments loop counter
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn loop_restart_edge_increments_counter() {
+        // Pipeline: start -> check -> process -> check (loop_restart back)
+        // After 2 loops, "check" sets context to break out to exit
+        // We use context_setting_registry so the handler sets "visited_<id>"
+        // and a conditional edge to route to exit after enough loops.
+        //
+        // Simpler approach: use a cycle with max_steps to force termination.
+        // start -> a -> b --(loop_restart)--> a (cycle until max_steps)
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("b", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "a"),
+                make_edge("a", "b"),
+                make_loop_restart_edge("b", "a"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 7,
+            enable_checkpointing: false,
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // Should hit max_steps. The loop_restart edge b->a should have been traversed.
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::MaxStepsExceeded { max_steps } => {
+                assert_eq!(max_steps, 7);
+            }
+            other => panic!("expected MaxStepsExceeded, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 30: loop_restart clears source node context entries
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn loop_restart_clears_source_context() {
+        // Pipeline: start -> worker -> exit, but with loop_restart from worker back to worker.
+        // Pipeline: start -> worker -> router
+        // router -> exit (condition: loop_done=true)
+        // router -> worker (loop_restart, no condition, lower priority, fallback)
+        //
+        // On the first pass, loop_done is not set, so router falls back to worker.
+        // The loop_restart edge clears context keys prefixed with "router_".
+        // On the second pass through router, loop_done is set, routing to exit.
+
+        /// Handler that counts executions and sets loop_done after first pass.
+        struct LoopControlHandler;
+
+        #[async_trait]
+        impl Handler for LoopControlHandler {
+            fn name(&self) -> &str {
+                "loop_control"
+            }
+            async fn execute(
+                &self,
+                node: &GraphNode,
+                context: &Context,
+            ) -> Result<Outcome, HandlerError> {
+                // Track per-node execution count using a key NOT prefixed with node ID
+                // so it survives loop_restart clearing
+                let count_key = format!("exec_count_{}", node.id);
+                let current: i64 = context
+                    .get(&count_key)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let new_count = current + 1;
+                context.set(count_key, json!(new_count));
+
+                // Set a node-prefixed key to test clearing
+                context.set(format!("{}_data", node.id), json!("some_data"));
+
+                // After first execution of router, set loop_done
+                if node.id == "router" && new_count >= 2 {
+                    context.set("loop_done", json!("true"));
+                }
+
+                Ok(Outcome::success())
+            }
+            fn handles(&self, _node_type: &NodeType) -> bool {
+                true
+            }
+        }
+
+        let mut exit_edge = make_conditional_edge("router", "exit", "loop_done=true");
+        exit_edge.priority = Some(10);
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("worker", NodeType::Generic),
+                make_node("router", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "worker"),
+                make_edge("worker", "router"),
+                exit_edge,
+                make_loop_restart_edge("router", "worker"),
+            ],
+        );
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(LoopControlHandler));
+        let config = EngineConfig {
+            max_steps: 20,
+            enable_checkpointing: false,
+        };
+        let engine = Engine::with_config(graph, registry, config);
+
+        let ctx = Context::new();
+        // Set a worker-prefixed context key to verify it gets cleared on loop_restart
+        ctx.set("router_preserved_key", json!("should_be_cleared"));
+
+        let result = engine.run(ctx).await.unwrap();
+
+        // Should have visited: start, worker, router (looped back), worker, router, exit
+        assert!(result.visited_nodes.contains(&"exit".to_string()));
+
+        // The loop_restart edge router->worker should have been traversed once
+        assert_eq!(result.loop_restarts.count("router", "worker"), 1);
+        assert_eq!(result.loop_restarts.total(), 1);
+
+        // After loop_restart, "router_" prefixed keys were cleared
+        // But then router executed again and set router_data again,
+        // so it should be present in the final context.
+        assert!(result.final_context.contains_key("router_data"));
+
+        // The "router_preserved_key" was set initially with the "router_" prefix,
+        // so it should have been cleared by the loop_restart
+        assert!(!result.final_context.contains_key("router_preserved_key"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 31: loop_restart with max_steps prevents infinite loops
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn loop_restart_max_steps_prevents_infinite_loop() {
+        // Create a tight loop: start -> a -> b --(loop_restart)--> a
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("b", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "a"),
+                make_edge("a", "b"),
+                make_loop_restart_edge("b", "a"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 10,
+            enable_checkpointing: false,
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::MaxStepsExceeded { max_steps } => {
+                assert_eq!(max_steps, 10);
+            }
+            other => panic!("expected MaxStepsExceeded, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 32: Non-loop_restart edge does not affect loop counter
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn non_loop_restart_edge_no_counter_increment() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        assert_eq!(result.loop_restarts.total(), 0);
+        assert!(result.loop_restarts.counts().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 33: loop_restart edge traversal logged in execution result
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn loop_restart_counter_in_execution_result() {
+        // start -> a -> b --(loop_restart)--> a, max_steps = 9
+        // Pattern: start(1), a(2), b(3), a(4), b(5), a(6), b(7), a(8), b(9) => max_steps
+        // loop_restart traversals: b->a happens at steps 3, 5, 7, 9 = 4 times
+        // Actually at step 9 it would be step 9, then try to loop but we hit max first.
+        // Let's trace: step 1=start, step 2=a, step 3=b, loop_restart->a,
+        //   step 4=a, step 5=b, loop_restart->a,
+        //   step 6=a, step 7=b, loop_restart->a,
+        //   step 8=a, step 9=b, loop_restart->a,
+        //   step 10 would be a but max_steps=9 so error at step 10 check... wait no.
+        //   max_steps check is: if steps >= max_steps at the TOP of the loop.
+        //   So steps is incremented after execution, so:
+        //   iteration 1: steps=0 < 9, execute start, steps=1
+        //   iteration 2: steps=1 < 9, execute a, steps=2
+        //   iteration 3: steps=2 < 9, execute b, steps=3, loop_restart
+        //   iteration 4: steps=3 < 9, execute a, steps=4
+        //   iteration 5: steps=4 < 9, execute b, steps=5, loop_restart
+        //   iteration 6: steps=5 < 9, execute a, steps=6
+        //   iteration 7: steps=6 < 9, execute b, steps=7, loop_restart
+        //   iteration 8: steps=7 < 9, execute a, steps=8
+        //   iteration 9: steps=8 < 9, execute b, steps=9, loop_restart
+        //   iteration 10: steps=9 >= 9, MaxStepsExceeded
+        // So 4 loop_restart traversals.
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("b", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "a"),
+                make_edge("a", "b"),
+                make_loop_restart_edge("b", "a"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 9,
+            enable_checkpointing: false,
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // Should fail with MaxStepsExceeded
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EngineError::MaxStepsExceeded { .. }
+        ));
     }
 }

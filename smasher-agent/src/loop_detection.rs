@@ -80,11 +80,7 @@ impl LoopDetector {
             if reps >= self.min_repetitions {
                 let pattern = self.history[self.history.len() - pattern_len..].to_vec();
                 return Some(LoopPattern {
-                    description: format!(
-                        "{} repeated {} times",
-                        format_pattern(&pattern),
-                        reps,
-                    ),
+                    description: format!("{} repeated {} times", format_pattern(&pattern), reps,),
                     pattern,
                     repetitions: reps,
                 });
@@ -299,14 +295,20 @@ mod tests {
     #[test]
     fn format_pattern_produces_readable_string() {
         let sigs = vec![
-            ToolSignature { name: "read_file".into(), arguments_hash: 0 },
-            ToolSignature { name: "edit_file".into(), arguments_hash: 0 },
-            ToolSignature { name: "read_file".into(), arguments_hash: 0 },
+            ToolSignature {
+                name: "read_file".into(),
+                arguments_hash: 0,
+            },
+            ToolSignature {
+                name: "edit_file".into(),
+                arguments_hash: 0,
+            },
+            ToolSignature {
+                name: "read_file".into(),
+                arguments_hash: 0,
+            },
         ];
-        assert_eq!(
-            format_pattern(&sigs),
-            "read_file -> edit_file -> read_file",
-        );
+        assert_eq!(format_pattern(&sigs), "read_file -> edit_file -> read_file",);
     }
 
     // ── detect_loop returns None when no pattern ──────────────────────

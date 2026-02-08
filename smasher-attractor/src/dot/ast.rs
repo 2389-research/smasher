@@ -77,8 +77,8 @@ mod tests {
 
     #[test]
     fn display_number_value() {
-        let val = DotValue::Number(3.14);
-        assert_eq!(val.to_string(), "3.14");
+        let val = DotValue::Number(3.15);
+        assert_eq!(val.to_string(), "3.15");
 
         let val_int = DotValue::Number(42.0);
         assert_eq!(val_int.to_string(), "42");

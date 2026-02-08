@@ -78,9 +78,8 @@ impl ProviderAdapter for AnthropicAdapter {
             types::inject_cache_control(&mut anthropic_req);
         }
 
-        let body = serde_json::to_string(&anthropic_req).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body = serde_json::to_string(&anthropic_req)
+            .map_err(|e| Error::Serialization { source: e })?;
 
         let response = self
             .client
@@ -112,8 +111,8 @@ impl ProviderAdapter for AnthropicAdapter {
             ));
         }
 
-        let anthropic_response: types::AnthropicResponse =
-            serde_json::from_str(&body_text).map_err(|e| Error::ResponseParse {
+        let anthropic_response: types::AnthropicResponse = serde_json::from_str(&body_text)
+            .map_err(|e| Error::ResponseParse {
                 provider: "anthropic".into(),
                 message: format!("failed to parse response: {e}"),
             })?;
@@ -129,9 +128,8 @@ impl ProviderAdapter for AnthropicAdapter {
             types::inject_cache_control(&mut anthropic_req);
         }
 
-        let body = serde_json::to_string(&anthropic_req).map_err(|e| Error::Serialization {
-            source: e,
-        })?;
+        let body = serde_json::to_string(&anthropic_req)
+            .map_err(|e| Error::Serialization { source: e })?;
 
         let response = self
             .client
@@ -196,10 +194,8 @@ mod tests {
 
     #[test]
     fn messages_url_uses_base_url() {
-        let adapter = AnthropicAdapter::with_base_url(
-            "key".into(),
-            "https://custom.api.example.com".into(),
-        );
+        let adapter =
+            AnthropicAdapter::with_base_url("key".into(), "https://custom.api.example.com".into());
         assert_eq!(
             adapter.messages_url(),
             "https://custom.api.example.com/v1/messages"
@@ -226,10 +222,7 @@ mod tests {
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let response = adapter.complete(&request).await.unwrap();
         assert_eq!(response.id, "msg_test");
@@ -288,17 +281,12 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_string("invalid api key"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
             .mount(&server)
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         match err {
@@ -325,10 +313,7 @@ mod tests {
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         match err {
@@ -349,17 +334,12 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_string("internal server error"),
-            )
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
             .mount(&server)
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let err = adapter.complete(&request).await.unwrap_err();
         match err {
@@ -449,10 +429,7 @@ mod tests {
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let mut event_stream = adapter.stream(&request).await.unwrap();
         let mut events: Vec<StreamEvent> = Vec::new();
@@ -481,17 +458,12 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_string("unauthorized"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
             .mount(&server)
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hi")],
-        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
 
         let result = adapter.stream(&request).await;
         match result {
@@ -560,11 +532,8 @@ mod tests {
             .await;
 
         let adapter = test_adapter(&server);
-        let request = Request::new(
-            "claude-sonnet-4-20250514",
-            vec![Message::user("Hello")],
-        )
-        .system_prompt("You are a pirate.");
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hello")])
+            .system_prompt("You are a pirate.");
 
         let response = adapter.complete(&request).await.unwrap();
         assert_eq!(response.text().as_deref(), Some("I am a pirate!"));

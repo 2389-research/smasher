@@ -290,12 +290,12 @@ mod tests {
 
     #[test]
     fn tokenize_numbers_int_and_float() {
-        let tokens = tokenize("42 3.14 0 100").unwrap();
+        let tokens = tokenize("42 3.15 0 100").unwrap();
         assert_eq!(
             tokens,
             vec![
                 Token::Number(42.0),
-                Token::Number(3.14),
+                Token::Number(3.15),
                 Token::Number(0.0),
                 Token::Number(100.0),
                 Token::Eof,

@@ -8,5 +8,5 @@ pub mod stream_object;
 
 pub use generate::generate;
 pub use generate_object::generate_object;
-pub use stream::{stream, StreamAccumulator, StreamResult};
-pub use stream_object::{stream_object, PartialObjectEvent, StreamObjectResult};
+pub use stream::{StreamAccumulator, StreamResult, stream};
+pub use stream_object::{PartialObjectEvent, StreamObjectResult, stream_object};

@@ -1,6 +1,64 @@
 // ABOUTME: Handler trait and registry for pipeline node execution strategies.
 // ABOUTME: Includes Start, Exit, Conditional, and Codergen handler implementations.
 
+//! Handler trait and registry for pipeline node execution.
+//!
+//! Every node in a pipeline graph is processed by a [`Handler`] -- an async
+//! trait that receives the node definition and the shared [`Context`], then
+//! returns an [`Outcome`] (success, failure, or skip).
+//!
+//! The [`HandlerRegistry`] maps node types to concrete handler implementations.
+//! When the engine visits a node, the registry finds the first handler whose
+//! [`Handler::handles`] method returns `true` for that node's type and
+//! delegates execution to it.
+//!
+//! Built-in handlers are provided for the fundamental node types:
+//!
+//! - [`StartHandler`] -- marks the pipeline as started.
+//! - [`ExitHandler`] -- marks the pipeline as completed.
+//! - [`ConditionalHandler`] -- evaluates a boolean condition from node attributes.
+//! - [`CodergenHandler`] -- delegates to a pluggable [`CodergenBackend`] for
+//!   LLM-powered code generation.
+//!
+//! Use [`default_registry`] to obtain a registry pre-loaded with Start, Exit,
+//! and Conditional handlers.
+//!
+//! # Implementing a custom handler
+//!
+//! ```
+//! use std::sync::Arc;
+//! use async_trait::async_trait;
+//! use smasher_attractor::graph::{GraphNode, NodeType};
+//! use smasher_attractor::handler::{Handler, HandlerError, HandlerRegistry};
+//! use smasher_attractor::state::{Context, Outcome};
+//! use serde_json::json;
+//!
+//! struct MyHandler;
+//!
+//! #[async_trait]
+//! impl Handler for MyHandler {
+//!     fn name(&self) -> &str { "my_handler" }
+//!
+//!     async fn execute(
+//!         &self,
+//!         node: &GraphNode,
+//!         context: &Context,
+//!     ) -> Result<Outcome, HandlerError> {
+//!         // Read from context, do work, write results back.
+//!         context.set(format!("{}_done", node.id), json!(true));
+//!         Ok(Outcome::success())
+//!     }
+//!
+//!     fn handles(&self, node_type: &NodeType) -> bool {
+//!         matches!(node_type, NodeType::Generic)
+//!     }
+//! }
+//!
+//! let mut registry = HandlerRegistry::new();
+//! registry.register(Arc::new(MyHandler));
+//! assert!(registry.get_handler(&NodeType::Generic).is_some());
+//! ```
+
 use std::sync::Arc;
 
 use serde_json::json;
@@ -34,11 +92,7 @@ pub trait Handler: Send + Sync {
     fn name(&self) -> &str;
 
     /// Execute this handler for the given node with the given context.
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError>;
+    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError>;
 
     /// Whether this handler can handle the given node type.
     fn handles(&self, node_type: &NodeType) -> bool;
@@ -69,11 +123,7 @@ impl Handler for StartHandler {
         "start"
     }
 
-    async fn execute(
-        &self,
-        _node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, _node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         context.set("_started", json!("true"));
         Ok(Outcome::success())
     }
@@ -92,11 +142,7 @@ impl Handler for ExitHandler {
         "exit"
     }
 
-    async fn execute(
-        &self,
-        _node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, _node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         context.set("_completed", json!("true"));
         Ok(Outcome::success())
     }
@@ -116,11 +162,7 @@ impl Handler for ConditionalHandler {
         "conditional"
     }
 
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         let condition_str = match node.attrs.get("condition") {
             Some(NodeAttrValue::String(s)) => s.clone(),
             _ => {
@@ -165,11 +207,7 @@ impl Handler for CodergenHandler {
         "codergen"
     }
 
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         // Determine prompt: explicit attribute first, then label fallback.
         let prompt = match node.attrs.get("prompt") {
             Some(NodeAttrValue::String(s)) => s.clone(),
@@ -747,10 +785,7 @@ mod tests {
             node_id: "n1".to_string(),
             message: "boom".to_string(),
         };
-        assert_eq!(
-            err.to_string(),
-            "handler 'start' failed on node 'n1': boom"
-        );
+        assert_eq!(err.to_string(), "handler 'start' failed on node 'n1': boom");
     }
 
     #[test]

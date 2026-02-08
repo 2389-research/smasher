@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 
-use crate::types::{Request, Response, Error};
+use crate::types::{Error, Request, Response};
 
 /// Middleware that can inspect and transform requests and responses.
 ///
@@ -137,8 +137,8 @@ where
 mod tests {
     use super::*;
     use crate::types::{ContentPart, FinishReason, Usage};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct CountingMiddleware {
         request_count: Arc<AtomicU32>,
@@ -236,18 +236,12 @@ mod tests {
             }
 
             async fn on_request(&self, request: Request) -> Result<Request, Error> {
-                self.order
-                    .lock()
-                    .unwrap()
-                    .push(format!("req_{}", self.id));
+                self.order.lock().unwrap().push(format!("req_{}", self.id));
                 Ok(request)
             }
 
             async fn on_response(&self, response: Response) -> Result<Response, Error> {
-                self.order
-                    .lock()
-                    .unwrap()
-                    .push(format!("resp_{}", self.id));
+                self.order.lock().unwrap().push(format!("resp_{}", self.id));
                 Ok(response)
             }
         }
@@ -616,8 +610,7 @@ mod tests {
             message: "stream setup failed".into(),
             retryable: false,
         };
-        let result =
-            execute_stream_error_middleware_chain(&middlewares, error).await;
+        let result = execute_stream_error_middleware_chain(&middlewares, error).await;
 
         assert!(result.is_err());
         assert_eq!(error_count.load(Ordering::SeqCst), 1);
@@ -644,8 +637,7 @@ mod tests {
             message: "should be suppressed".into(),
             retryable: false,
         };
-        let result =
-            execute_stream_error_middleware_chain(&middlewares, error).await;
+        let result = execute_stream_error_middleware_chain(&middlewares, error).await;
 
         assert!(result.is_ok(), "error should be suppressed by middleware");
     }
@@ -679,8 +671,7 @@ mod tests {
             message: "original error".into(),
             retryable: false,
         };
-        let result =
-            execute_stream_error_middleware_chain(&middlewares, error).await;
+        let result = execute_stream_error_middleware_chain(&middlewares, error).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

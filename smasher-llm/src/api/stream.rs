@@ -78,10 +78,7 @@ impl StreamAccumulator {
             StreamEventType::ToolCallDelta => {
                 if let Some(ref tool_call_id) = event.tool_call_id {
                     // Find an existing accumulator for this tool call, or create one.
-                    let acc = self
-                        .tool_calls
-                        .iter_mut()
-                        .find(|tc| tc.id == *tool_call_id);
+                    let acc = self.tool_calls.iter_mut().find(|tc| tc.id == *tool_call_id);
 
                     match acc {
                         Some(existing) => {
@@ -251,11 +248,7 @@ mod tests {
             Some("search".into()),
             r#"{"q":"#,
         ));
-        acc.process_event(&StreamEvent::tool_call_delta(
-            "call_1",
-            None,
-            r#""rust"}"#,
-        ));
+        acc.process_event(&StreamEvent::tool_call_delta("call_1", None, r#""rust"}"#));
 
         assert!(acc.has_tool_calls());
         assert_eq!(acc.tool_calls.len(), 1);
@@ -272,11 +265,7 @@ mod tests {
             Some("read_file".into()),
             r#"{"path":""#,
         ));
-        acc.process_event(&StreamEvent::tool_call_delta(
-            "call_abc",
-            None,
-            r#"/tmp"}"#,
-        ));
+        acc.process_event(&StreamEvent::tool_call_delta("call_abc", None, r#"/tmp"}"#));
 
         assert_eq!(acc.tool_calls[0].name, "read_file");
         assert_eq!(acc.tool_calls[0].arguments, r#"{"path":"/tmp"}"#);
@@ -427,11 +416,7 @@ mod tests {
             Some("calculator".into()),
             r#"{"expr":"#,
         ));
-        acc.process_event(&StreamEvent::tool_call_delta(
-            "call_x",
-            None,
-            r#""2+2"}"#,
-        ));
+        acc.process_event(&StreamEvent::tool_call_delta("call_x", None, r#""2+2"}"#));
 
         // Usage
         let usage = Usage {
@@ -548,7 +533,10 @@ mod tests {
             cache_read_tokens: Some(3),
             ..Default::default()
         };
-        acc.process_event(&StreamEvent::end(Some(FinishReason::Stop), Some(final_usage)));
+        acc.process_event(&StreamEvent::end(
+            Some(FinishReason::Stop),
+            Some(final_usage),
+        ));
 
         assert_eq!(acc.usage().input_tokens, 10);
         assert_eq!(acc.usage().output_tokens, 25);

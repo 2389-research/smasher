@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::graph::{GraphNode, NodeAttrValue, NodeType};
 use crate::handler::{Handler, HandlerError};
@@ -46,11 +46,7 @@ impl Handler for ManagerHandler {
         "manager"
     }
 
-    async fn execute(
-        &self,
-        node: &GraphNode,
-        context: &Context,
-    ) -> Result<Outcome, HandlerError> {
+    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         // Determine task: explicit attribute first, then label fallback.
         let task = match node.attrs.get("task") {
             Some(NodeAttrValue::String(s)) => s.clone(),
@@ -280,9 +276,7 @@ mod tests {
         );
         node.attrs.insert(
             "config".to_string(),
-            NodeAttrValue::String(
-                r#"{"parallelism": 4, "timeout": 300}"#.to_string(),
-            ),
+            NodeAttrValue::String(r#"{"parallelism": 4, "timeout": 300}"#.to_string()),
         );
 
         let ctx = Context::new();
@@ -362,6 +356,7 @@ mod tests {
         assert!(!handler.handles(&NodeType::Interviewer));
         assert!(!handler.handles(&NodeType::Parallel));
         assert!(!handler.handles(&NodeType::Tool));
+        assert!(!handler.handles(&NodeType::SubPipeline));
         assert!(!handler.handles(&NodeType::Generic));
     }
 
@@ -544,7 +539,8 @@ mod tests {
     #[tokio::test]
     async fn manager_handler_invokes_backend_once() {
         let backend = Arc::new(CountingManagerBackend::new());
-        let backend_trait: Arc<dyn ManagerBackend> = Arc::clone(&backend) as Arc<dyn ManagerBackend>;
+        let backend_trait: Arc<dyn ManagerBackend> =
+            Arc::clone(&backend) as Arc<dyn ManagerBackend>;
         let handler = ManagerHandler::new(backend_trait);
 
         let mut node = make_node("m11", NodeType::Manager);

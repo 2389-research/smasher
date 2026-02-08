@@ -235,11 +235,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         // Should have Start, ToolCallDelta, UsageDelta, End.
         let tool_delta = events
@@ -266,10 +263,7 @@ mod tests {
         });
 
         let events = collect_stream_events(
-            vec![
-                sse_event(&chunk.to_string()),
-                sse_event("[DONE]"),
-            ],
+            vec![sse_event(&chunk.to_string()), sse_event("[DONE]")],
             "gemini-2.0-flash",
         )
         .await;
@@ -292,10 +286,7 @@ mod tests {
         });
 
         let events = collect_stream_events(
-            vec![
-                sse_event(""),
-                sse_event(&chunk.to_string()),
-            ],
+            vec![sse_event(""), sse_event(&chunk.to_string())],
             "gemini-2.0-flash",
         )
         .await;
@@ -361,11 +352,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         let usage_event = events
             .iter()
@@ -391,11 +379,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         let content_deltas: Vec<_> = events
             .iter()
@@ -419,11 +404,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         // Should only have Start (no content delta for empty text).
         let content_deltas: Vec<_> = events
@@ -454,11 +436,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         // UsageDelta should carry the usage data.
         let usage_event = events
@@ -476,7 +455,10 @@ mod tests {
             .find(|e| e.event_type == crate::types::StreamEventType::End)
             .unwrap();
         assert_eq!(end_event.finish_reason, Some(FinishReason::Stop));
-        assert!(end_event.usage.is_none(), "End event should not duplicate usage from UsageDelta");
+        assert!(
+            end_event.usage.is_none(),
+            "End event should not duplicate usage from UsageDelta"
+        );
     }
 
     #[tokio::test]
@@ -490,11 +472,8 @@ mod tests {
             "modelVersion": "gemini-2.0-flash"
         });
 
-        let events = collect_stream_events(
-            vec![sse_event(&chunk.to_string())],
-            "gemini-2.0-flash",
-        )
-        .await;
+        let events =
+            collect_stream_events(vec![sse_event(&chunk.to_string())], "gemini-2.0-flash").await;
 
         // Should have Start + UsageDelta (no content delta, no end).
         assert!(events.len() >= 2);

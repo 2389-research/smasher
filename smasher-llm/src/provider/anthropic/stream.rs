@@ -167,8 +167,8 @@ mod tests {
     use super::*;
     use crate::types::StreamEventType;
     use crate::util::sse::SseEvent;
-    use futures::stream;
     use futures::StreamExt;
+    use futures::stream;
     use serde_json::json;
 
     /// Helper to create an SSE event with given JSON data.
@@ -181,9 +181,7 @@ mod tests {
     }
 
     /// Collect all stream events from the translated stream.
-    async fn collect_events(
-        events: Vec<Result<SseEvent, Error>>,
-    ) -> Vec<StreamEvent> {
+    async fn collect_events(events: Vec<Result<SseEvent, Error>>) -> Vec<StreamEvent> {
         let sse_stream: Pin<Box<dyn Stream<Item = Result<SseEvent, Error>> + Send>> =
             Box::pin(stream::iter(events));
         let translated = translate_stream(sse_stream);
@@ -197,19 +195,17 @@ mod tests {
 
     #[tokio::test]
     async fn translate_message_start() {
-        let events = vec![sse(
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": "msg_01",
-                    "model": "claude-sonnet-4-20250514",
-                    "content": [],
-                    "stop_reason": null,
-                    "usage": {"input_tokens": 10, "output_tokens": 0}
-                }
-            })
-            .to_string(),
-        )];
+        let events = vec![sse(&json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_01",
+                "model": "claude-sonnet-4-20250514",
+                "content": [],
+                "stop_reason": null,
+                "usage": {"input_tokens": 10, "output_tokens": 0}
+            }
+        })
+        .to_string())];
         let result = collect_events(events).await;
 
         assert_eq!(result.len(), 2); // start + usage_delta
@@ -222,30 +218,24 @@ mod tests {
     #[tokio::test]
     async fn translate_text_content_delta() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "Hello "}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "world!"}
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hello "}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "world!"}
+            })
+            .to_string()),
         ];
         let result = collect_events(events).await;
 
@@ -258,42 +248,34 @@ mod tests {
     #[tokio::test]
     async fn translate_tool_use_stream() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": "toolu_123",
-                        "name": "get_weather",
-                        "input": {}
-                    }
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "input_json_delta", "partial_json": "{\"loc"}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "input_json_delta", "partial_json": "ation\":\"NYC\"}"}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_stop",
-                    "index": 0
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "get_weather",
+                    "input": {}
+                }
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"loc"}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "ation\":\"NYC\"}"}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_stop",
+                "index": 0
+            })
+            .to_string()),
         ];
         let result = collect_events(events).await;
 
@@ -308,28 +290,27 @@ mod tests {
         assert!(result[1].tool_name.is_none());
         assert_eq!(result[1].arguments_delta.as_deref(), Some("{\"loc"));
 
-        assert_eq!(result[2].arguments_delta.as_deref(), Some("ation\":\"NYC\"}"));
+        assert_eq!(
+            result[2].arguments_delta.as_deref(),
+            Some("ation\":\"NYC\"}")
+        );
     }
 
     #[tokio::test]
     async fn translate_thinking_delta() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "thinking_delta", "thinking": "Let me think..."}
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Let me think..."}
+            })
+            .to_string()),
         ];
         let result = collect_events(events).await;
 
@@ -341,14 +322,12 @@ mod tests {
     #[tokio::test]
     async fn translate_message_delta_and_stop() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn"},
-                    "usage": {"input_tokens": 0, "output_tokens": 42}
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 0, "output_tokens": 42}
+            })
+            .to_string()),
             sse(&json!({"type": "message_stop"}).to_string()),
         ];
         let result = collect_events(events).await;
@@ -364,25 +343,25 @@ mod tests {
 
     #[tokio::test]
     async fn translate_error_event() {
-        let events = vec![sse(
-            &json!({
-                "type": "error",
-                "error": {
-                    "type": "overloaded_error",
-                    "message": "Server is overloaded"
-                }
-            })
-            .to_string(),
-        )];
+        let events = vec![sse(&json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": "Server is overloaded"
+            }
+        })
+        .to_string())];
         let result = collect_events(events).await;
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].event_type, StreamEventType::Error);
-        assert!(result[0]
-            .error_message
-            .as_ref()
-            .unwrap()
-            .contains("overloaded"));
+        assert!(
+            result[0]
+                .error_message
+                .as_ref()
+                .unwrap()
+                .contains("overloaded")
+        );
     }
 
     #[tokio::test]
@@ -406,51 +385,41 @@ mod tests {
     #[tokio::test]
     async fn translate_full_conversation_flow() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": "msg_full",
-                        "model": "claude-sonnet-4-20250514",
-                        "content": [],
-                        "stop_reason": null,
-                        "usage": {"input_tokens": 25, "output_tokens": 0}
-                    }
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_full",
+                    "model": "claude-sonnet-4-20250514",
+                    "content": [],
+                    "stop_reason": null,
+                    "usage": {"input_tokens": 25, "output_tokens": 0}
+                }
+            })
+            .to_string()),
             sse(&json!({"type": "ping"}).to_string()),
-            sse(
-                &json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": "Hi there!"}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_stop",
-                    "index": 0
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn"},
-                    "usage": {"input_tokens": 0, "output_tokens": 10}
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hi there!"}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_stop",
+                "index": 0
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 0, "output_tokens": 10}
+            })
+            .to_string()),
             sse(&json!({"type": "message_stop"}).to_string()),
         ];
         let result = collect_events(events).await;
@@ -492,22 +461,18 @@ mod tests {
     #[tokio::test]
     async fn translate_signature_delta_is_silent() {
         let events = vec![
-            sse(
-                &json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                })
-                .to_string(),
-            ),
-            sse(
-                &json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "signature_delta", "signature": "sig_partial"}
-                })
-                .to_string(),
-            ),
+            sse(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+            })
+            .to_string()),
+            sse(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_partial"}
+            })
+            .to_string()),
         ];
         let result = collect_events(events).await;
         // Signature deltas produce no output events.

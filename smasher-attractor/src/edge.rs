@@ -75,13 +75,12 @@ pub fn select_edge<'a>(
     for edge in &candidates {
         if has_explicit_condition(edge) {
             let cond_str = edge.condition.as_ref().unwrap();
-            let parsed = parse_condition(cond_str).map_err(|e| {
-                EdgeSelectionError::ConditionParseError {
+            let parsed =
+                parse_condition(cond_str).map_err(|e| EdgeSelectionError::ConditionParseError {
                     from: edge.from.clone(),
                     to: edge.to.clone(),
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             if evaluate_condition(&parsed, &ctx_map) {
                 passing.push(edge);
             }
@@ -163,6 +162,7 @@ mod tests {
             label: None,
             condition: None,
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -175,6 +175,7 @@ mod tests {
             label: None,
             condition: Some(condition.to_string()),
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -189,6 +190,7 @@ mod tests {
             label: Some(label.to_string()),
             condition: Some(label.to_string()),
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -201,6 +203,7 @@ mod tests {
             label: Some(label.to_string()),
             condition: Some(label.to_string()),
             priority: Some(priority),
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -213,6 +216,7 @@ mod tests {
             label: None,
             condition: None,
             priority: Some(priority),
+            loop_restart: false,
             attrs: HashMap::new(),
         }
     }
@@ -353,6 +357,7 @@ mod tests {
             label: Some("display".to_string()),
             condition: Some("@#$%^&*".to_string()),
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         };
         let graph = make_graph(vec![edge]);
@@ -518,6 +523,7 @@ mod tests {
             label: Some("success".to_string()),
             condition: Some("status=ok".to_string()),
             priority: None,
+            loop_restart: false,
             attrs: HashMap::new(),
         };
         let graph = make_graph(vec![edge]);

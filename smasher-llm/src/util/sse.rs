@@ -30,8 +30,10 @@ pub fn parse_sse_stream(
     Box::pin(try_stream! {
         let mut byte_stream = std::pin::pin!(byte_stream);
 
-        // Buffer for incomplete lines carried across chunk boundaries.
-        let mut line_buf = String::new();
+        // Raw byte buffer for incomplete lines carried across chunk boundaries.
+        // We buffer bytes (not decoded text) to avoid corrupting multi-byte UTF-8
+        // characters that may be split across chunk boundaries.
+        let mut byte_buf: Vec<u8> = Vec::new();
 
         // Accumulator for the current in-progress event.
         let mut event_type = String::from("message");
@@ -44,20 +46,26 @@ pub fn parse_sse_stream(
                 message: e.to_string(),
             })?;
 
-            // Append raw bytes to the line buffer and normalize \r\n to \n.
-            let text = String::from_utf8_lossy(&chunk);
-            line_buf.push_str(&text);
+            // Append raw bytes to the byte buffer.
+            byte_buf.extend_from_slice(&chunk);
 
-            // Process all complete lines (terminated by \n).
+            // Process all complete lines (terminated by b'\n').
+            // Since the SSE protocol is line-oriented and newline (0x0A) cannot appear
+            // inside a multi-byte UTF-8 sequence, splitting on b'\n' is safe.
             loop {
-                let Some(newline_pos) = line_buf.find('\n') else {
+                let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') else {
                     break;
                 };
 
-                // Extract the line, stripping any trailing \r.
-                let mut line = line_buf[..newline_pos].to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
+                // Extract the line bytes and advance the buffer past the newline.
+                let line_bytes = byte_buf[..newline_pos].to_vec();
+                byte_buf = byte_buf[newline_pos + 1..].to_vec();
 
+                // Decode the complete line. Line boundaries guarantee we won't
+                // split multi-byte characters since 0x0A only appears as '\n'.
+                let mut line = String::from_utf8_lossy(&line_bytes).into_owned();
+
+                // Strip any trailing \r for \r\n normalization.
                 if line.ends_with('\r') {
                     line.pop();
                 }
@@ -94,6 +102,26 @@ pub fn parse_sse_stream(
             }
         }
 
+        // If the stream ends with remaining bytes in the buffer, decode and process them.
+        if !byte_buf.is_empty() {
+            let mut line = String::from_utf8_lossy(&byte_buf).into_owned();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if !line.is_empty() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    let value = rest.strip_prefix(' ').unwrap_or(rest);
+                    data_lines.push(value.to_string());
+                } else if let Some(rest) = line.strip_prefix("event:") {
+                    let value = rest.strip_prefix(' ').unwrap_or(rest);
+                    event_type = value.to_string();
+                } else if let Some(rest) = line.strip_prefix("id:") {
+                    let value = rest.strip_prefix(' ').unwrap_or(rest);
+                    event_id = Some(value.to_string());
+                }
+            }
+        }
+
         // If the stream ends with accumulated data but no trailing empty line, yield it.
         if !data_lines.is_empty() {
             yield SseEvent {
@@ -109,8 +137,8 @@ pub fn parse_sse_stream(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures::stream;
     use futures::StreamExt;
+    use futures::stream;
 
     /// Helper: wrap string slices into a stream of Ok(Bytes) chunks.
     fn mock_stream(
@@ -119,6 +147,17 @@ mod tests {
         let owned: Vec<Result<Bytes, reqwest::Error>> = chunks
             .into_iter()
             .map(|s| Ok(Bytes::from(s.to_string())))
+            .collect();
+        stream::iter(owned)
+    }
+
+    /// Helper: wrap raw byte slices into a stream of Ok(Bytes) chunks.
+    fn mock_byte_stream(
+        chunks: Vec<&[u8]>,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+        let owned: Vec<Result<Bytes, reqwest::Error>> = chunks
+            .into_iter()
+            .map(|b| Ok(Bytes::copy_from_slice(b)))
             .collect();
         stream::iter(owned)
     }
@@ -289,9 +328,7 @@ mod tests {
     #[tokio::test]
     async fn event_type_resets_between_events() {
         // After an event with a custom type, the next event should default back to "message".
-        let s = mock_stream(vec![
-            "event: custom\ndata: first\n\ndata: second\n\n",
-        ]);
+        let s = mock_stream(vec!["event: custom\ndata: first\n\ndata: second\n\n"]);
         let events = collect_events(parse_sse_stream(s)).await;
 
         assert_eq!(events.len(), 2);
@@ -307,5 +344,21 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "no trailing newline");
+    }
+
+    #[tokio::test]
+    async fn multibyte_utf8_split_across_chunks() {
+        // '€' is encoded as 0xE2 0x82 0xAC in UTF-8.
+        // Split the euro sign across two chunks to verify the byte buffer
+        // correctly reassembles multi-byte characters at chunk boundaries.
+        let chunk1: &[u8] = &[b'd', b'a', b't', b'a', b':', b' ', 0xE2];
+        let chunk2: &[u8] = &[0x82, 0xAC, b'\n', b'\n'];
+
+        let s = mock_byte_stream(vec![chunk1, chunk2]);
+        let events = collect_events(parse_sse_stream(s)).await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "message");
+        assert_eq!(events[0].data, "\u{20AC}"); // U+20AC = €
     }
 }

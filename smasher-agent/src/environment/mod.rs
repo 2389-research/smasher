@@ -31,6 +31,9 @@ pub enum EnvironmentError {
 
     #[error("invalid pattern: {message}")]
     InvalidPattern { message: String },
+
+    #[error("path traversal denied: {path} escapes the working directory")]
+    PathTraversal { path: String },
 }
 
 /// Options controlling grep behavior.
@@ -107,6 +110,9 @@ pub trait ExecutionEnvironment: Send + Sync {
     /// Get the working directory.
     fn working_directory(&self) -> &str;
 
+    /// Delete a file from the filesystem.
+    async fn delete_file(&self, path: &str) -> Result<(), EnvironmentError>;
+
     /// Check if a path exists.
     async fn path_exists(&self, path: &str) -> bool;
 
@@ -152,6 +158,60 @@ impl LocalExecutionEnvironment {
         }
     }
 
+    /// Resolve and validate that a path stays within the working directory.
+    ///
+    /// For existing paths, canonicalizes the full path. For paths that don't
+    /// exist yet (e.g. write targets), canonicalizes the nearest existing
+    /// ancestor and appends the remaining components.
+    fn validate_path(&self, path: &str) -> Result<PathBuf, EnvironmentError> {
+        let resolved = self.resolve_path(path);
+
+        let canonical_root = Path::new(&self.working_directory)
+            .canonicalize()
+            .map_err(|e| EnvironmentError::Io {
+                message: format!("cannot canonicalize working directory: {e}"),
+            })?;
+
+        // Try to canonicalize the full resolved path first (works for existing paths).
+        let canonical = if resolved.exists() {
+            resolved.canonicalize().map_err(|e| EnvironmentError::Io {
+                message: format!("{}: {e}", resolved.display()),
+            })?
+        } else {
+            // For paths that don't exist yet, walk up to the nearest existing
+            // ancestor, canonicalize that, then re-append the remaining tail.
+            let mut ancestor = resolved.as_path();
+            let mut tail_components = Vec::new();
+            loop {
+                if ancestor.exists() {
+                    break;
+                }
+                if let Some(file_name) = ancestor.file_name() {
+                    tail_components.push(file_name.to_os_string());
+                    ancestor = ancestor.parent().unwrap_or(Path::new("/"));
+                } else {
+                    // No more components to strip — fall back to resolved.
+                    break;
+                }
+            }
+            let mut base = ancestor.canonicalize().map_err(|e| EnvironmentError::Io {
+                message: format!("{}: {e}", ancestor.display()),
+            })?;
+            for component in tail_components.into_iter().rev() {
+                base.push(component);
+            }
+            base
+        };
+
+        if !canonical.starts_with(&canonical_root) {
+            return Err(EnvironmentError::PathTraversal {
+                path: path.to_string(),
+            });
+        }
+
+        Ok(canonical)
+    }
+
     /// Determine whether an env var key should be filtered out.
     fn should_filter_env(&self, key: &str) -> bool {
         let key_upper = key.to_uppercase();
@@ -176,9 +236,10 @@ impl LocalExecutionEnvironment {
             } else {
                 format!("{}/{}", search_path.display(), file_pattern)
             };
-            let entries = glob_match(&full_pattern).map_err(|e| EnvironmentError::InvalidPattern {
-                message: e.to_string(),
-            })?;
+            let entries =
+                glob_match(&full_pattern).map_err(|e| EnvironmentError::InvalidPattern {
+                    message: e.to_string(),
+                })?;
             let mut files = Vec::new();
             for entry in entries {
                 match entry {
@@ -266,7 +327,7 @@ fn map_io_error(e: std::io::Error, path: &str) -> EnvironmentError {
 #[async_trait]
 impl ExecutionEnvironment for LocalExecutionEnvironment {
     async fn read_file(&self, path: &str) -> Result<String, EnvironmentError> {
-        let resolved = self.resolve_path(path);
+        let resolved = self.validate_path(path)?;
         let resolved_str = resolved.display().to_string();
         fs::read_to_string(&resolved)
             .await
@@ -274,7 +335,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
     }
 
     async fn write_file(&self, path: &str, content: &str) -> Result<(), EnvironmentError> {
-        let resolved = self.resolve_path(path);
+        let resolved = self.validate_path(path)?;
         let resolved_str = resolved.display().to_string();
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
@@ -287,7 +348,27 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
     }
 
     async fn glob_files(&self, pattern: &str) -> Result<Vec<String>, EnvironmentError> {
+        // Reject patterns that contain path traversal components.
+        if pattern.contains("..") {
+            return Err(EnvironmentError::PathTraversal {
+                path: pattern.to_string(),
+            });
+        }
+
+        // Reject absolute patterns that don't fall under the working directory.
         let resolved_pattern = if Path::new(pattern).is_absolute() {
+            let canonical_root =
+                Path::new(&self.working_directory)
+                    .canonicalize()
+                    .map_err(|e| EnvironmentError::Io {
+                        message: format!("cannot canonicalize working directory: {e}"),
+                    })?;
+            let canonical_root_str = canonical_root.display().to_string();
+            if !pattern.starts_with(&canonical_root_str) {
+                return Err(EnvironmentError::PathTraversal {
+                    path: pattern.to_string(),
+                });
+            }
             pattern.to_string()
         } else {
             format!("{}/{}", self.working_directory, pattern)
@@ -327,7 +408,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             message: e.to_string(),
         })?;
 
-        let search_path = self.resolve_path(path);
+        let search_path = self.validate_path(path)?;
         let files = self.collect_files_for_grep(&search_path, &options)?;
 
         let mut matches = Vec::new();
@@ -363,6 +444,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         command: &str,
         options: ExecOptions,
     ) -> Result<ExecResult, EnvironmentError> {
+        // Validate custom cwd stays within the working directory.
+        if let Some(ref custom_cwd) = options.cwd {
+            self.validate_path(custom_cwd)?;
+        }
         let cwd = options.cwd.as_deref().unwrap_or(&self.working_directory);
 
         let mut cmd = Command::new("sh");
@@ -426,13 +511,12 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
                 }
             }
         } else {
-            let output =
-                child
-                    .wait_with_output()
-                    .await
-                    .map_err(|e| EnvironmentError::Io {
-                        message: format!("failed to wait for command: {e}"),
-                    })?;
+            let output = child
+                .wait_with_output()
+                .await
+                .map_err(|e| EnvironmentError::Io {
+                    message: format!("failed to wait for command: {e}"),
+                })?;
             let duration_ms = start.elapsed().as_millis() as u64;
             Ok(ExecResult {
                 exit_code: output.status.code().unwrap_or(-1),
@@ -445,6 +529,14 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
 
     fn working_directory(&self) -> &str {
         &self.working_directory
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), EnvironmentError> {
+        let resolved = self.validate_path(path)?;
+        let resolved_str = resolved.display().to_string();
+        fs::remove_file(&resolved)
+            .await
+            .map_err(|e| map_io_error(e, &resolved_str))
     }
 
     async fn path_exists(&self, path: &str) -> bool {
@@ -592,11 +684,7 @@ mod tests {
     #[tokio::test]
     async fn grep_respects_max_matches() {
         let dir = make_temp_dir();
-        std::fs::write(
-            dir.join("many.txt"),
-            "match\nmatch\nmatch\nmatch\nmatch\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("many.txt"), "match\nmatch\nmatch\nmatch\nmatch\n").unwrap();
 
         let env = LocalExecutionEnvironment::new(dir.display().to_string());
         let matches = env
@@ -777,6 +865,218 @@ mod tests {
         assert!(
             matches!(err, EnvironmentError::CommandTimeout { timeout_ms: 100 }),
             "expected CommandTimeout, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    // --- delete_file tests ---
+
+    #[tokio::test]
+    async fn delete_file_removes_existing_file() {
+        let dir = make_temp_dir();
+        let file = dir.join("doomed.txt");
+        std::fs::write(&file, "goodbye").unwrap();
+        assert!(file.exists());
+
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+        env.delete_file("doomed.txt").await.unwrap();
+
+        assert!(!file.exists(), "file should be removed from the filesystem");
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_file_returns_error_for_missing() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.delete_file("nonexistent.txt").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::FileNotFound { .. }),
+            "expected FileNotFound, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    // --- Path traversal prevention tests ---
+
+    #[tokio::test]
+    async fn read_file_rejects_relative_traversal() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.read_file("../../etc/passwd").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_absolute_path_outside() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.read_file("/etc/passwd").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_traversal() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.write_file("../escape.txt", "bad").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_command_rejects_cwd_outside_working_dir() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env
+            .exec_command(
+                "ls",
+                ExecOptions {
+                    cwd: Some("/tmp".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn relative_path_within_working_dir_succeeds() {
+        let dir = make_temp_dir();
+        let subdir = dir.join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("data.txt"), "safe content").unwrap();
+
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+        let content = env.read_file("inner/data.txt").await.unwrap();
+        assert_eq!(content, "safe content");
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_file_to_subdir_succeeds() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        env.write_file("newdir/output.txt", "hello").await.unwrap();
+        let content = std::fs::read_to_string(dir.join("newdir/output.txt")).unwrap();
+        assert_eq!(content, "hello");
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_files_rejects_dotdot_pattern() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.glob_files("../../*").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_files_rejects_absolute_pattern_outside() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env.glob_files("/tmp/*").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_path_traversal() {
+        let dir = make_temp_dir();
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+
+        let result = env
+            .grep("pattern", "../../etc", GrepOptions::default())
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EnvironmentError::PathTraversal { .. }),
+            "expected PathTraversal, got: {err:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_command_allows_cwd_within_working_dir() {
+        let dir = make_temp_dir();
+        let subdir = dir.join("allowed");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let env = LocalExecutionEnvironment::new(dir.display().to_string());
+        let result = env
+            .exec_command(
+                "pwd",
+                ExecOptions {
+                    cwd: Some(subdir.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let stdout = result.stdout.trim();
+        assert!(
+            stdout.ends_with("allowed"),
+            "expected cwd ending in 'allowed', got: {stdout}"
         );
 
         cleanup(&dir);

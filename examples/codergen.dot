@@ -1,0 +1,60 @@
+// ABOUTME: Pipeline demonstrating code generation with LLM-powered nodes.
+// ABOUTME: Shows how Codergen nodes (shape=box) invoke LLM agents with configurable models.
+
+// Codergen nodes (shape=box) represent LLM agent sessions. When the engine
+// reaches a Codergen node, it spawns an agent that:
+//   1. Receives the node's `prompt` attribute as its system instruction
+//   2. Uses the `model` attribute to select the LLM provider/model
+//   3. Has access to any tools registered for the pipeline
+//   4. Writes its output into the pipeline context
+//
+// The `model` attribute can be overridden at the CLI level via --model,
+// or set per-node for heterogeneous pipelines (e.g., fast model for
+// planning, powerful model for generation).
+//
+// Run this pipeline:
+//   smasher run examples/codergen.dot --var task="implement a fibonacci function"
+
+digraph Codergen {
+    // Entry point
+    start [shape=circle, label="Start"];
+
+    // Planning step — uses a fast model to outline the approach.
+    // The prompt attribute guides the agent's behavior.
+    plan [
+        shape=box,
+        label="Plan",
+        model="claude-sonnet-4-20250514",
+        prompt="Analyze the task and produce a step-by-step implementation plan."
+    ];
+
+    // Code generation step — uses the model to write actual code.
+    // This is the core codergen node that produces the deliverable.
+    generate [
+        shape=box,
+        label="Generate Code",
+        model="claude-sonnet-4-20250514",
+        prompt="Write clean, tested code following the plan from the previous step."
+    ];
+
+    // Review step — conditional check on the generated output.
+    // In practice this could be a linter, test runner, or LLM reviewer.
+    review [
+        shape=diamond,
+        label="Review",
+        condition="review_passed=true"
+    ];
+
+    // Terminal nodes
+    exit_success [shape=doublecircle, label="Code Accepted"];
+    exit_failure [shape=doublecircle, label="Review Failed"];
+
+    // Linear flow through plan -> generate -> review
+    start    -> plan;
+    plan     -> generate;
+    generate -> review;
+
+    // Review routes based on outcome
+    review -> exit_success [label="success"];
+    review -> exit_failure [label="failure"];
+}

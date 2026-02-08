@@ -235,8 +235,8 @@ mod tests {
 
     #[test]
     fn builder_system_prompt() {
-        let req = Request::new("gpt-4", sample_messages())
-            .system_prompt("You are a helpful assistant.");
+        let req =
+            Request::new("gpt-4", sample_messages()).system_prompt("You are a helpful assistant.");
 
         assert_eq!(
             req.system_prompt.as_deref(),
@@ -295,8 +295,8 @@ mod tests {
 
     #[test]
     fn builder_response_format() {
-        let req = Request::new("gpt-4", sample_messages())
-            .response_format(ResponseFormat::JsonObject);
+        let req =
+            Request::new("gpt-4", sample_messages()).response_format(ResponseFormat::JsonObject);
 
         assert!(matches!(
             req.response_format,
@@ -359,14 +359,8 @@ mod tests {
     #[test]
     fn builder_provider_options() {
         let mut opts = HashMap::new();
-        opts.insert(
-            "anthropic".into(),
-            json!({"prompt_caching": true}),
-        );
-        opts.insert(
-            "openai".into(),
-            json!({"store": true}),
-        );
+        opts.insert("anthropic".into(), json!({"prompt_caching": true}));
+        opts.insert("openai".into(), json!({"store": true}));
         let req = Request::new("gpt-4", sample_messages()).provider_options(opts);
         let po = req.provider_options.unwrap();
         assert_eq!(po["anthropic"]["prompt_caching"], true);
@@ -419,10 +413,7 @@ mod tests {
             .provider_options(opts);
 
         assert_eq!(req.model, "claude-sonnet-4-20250514");
-        assert_eq!(
-            req.system_prompt.as_deref(),
-            Some("You are a calculator.")
-        );
+        assert_eq!(req.system_prompt.as_deref(), Some("You are a calculator."));
         assert_eq!(req.max_tokens, Some(2048));
         assert_eq!(req.temperature, Some(0.3));
         assert_eq!(req.top_p, Some(0.8));
