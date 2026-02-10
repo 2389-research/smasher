@@ -145,4 +145,60 @@ mod tests {
         assert_eq!(json["error"], "node X failed");
         assert!(json["completed_at"].is_string());
     }
+
+    /// Helper to create a minimal RunRecord for testing to_summary().
+    fn make_test_record(status: RunStatus, working_dir: Option<String>) -> RunRecord {
+        use smasher_attractor::dot::parser;
+        use smasher_attractor::graph;
+        let dot_graph = parser::parse("digraph { a -> b }").unwrap();
+        let resolved = graph::resolve(&dot_graph).unwrap();
+        RunRecord {
+            id: "test-run-id".into(),
+            dot_source: "digraph { a -> b }".into(),
+            graph: resolved,
+            status,
+            started_at: Utc::now(),
+            completed_at: None,
+            emitter: Arc::new(PipelineEventEmitter::default()),
+            event_log: Arc::new(PipelineEventLog::new()),
+            cancellation: CancellationToken::new(),
+            interviewer: HttpInterviewer::new(),
+            variables: HashMap::new(),
+            error: None,
+            input_tokens: Arc::new(AtomicU64::new(0)),
+            output_tokens: Arc::new(AtomicU64::new(0)),
+            run_working_dir: working_dir,
+        }
+    }
+
+    #[test]
+    fn to_summary_exposes_relative_working_dir() {
+        let record = make_test_record(
+            RunStatus::Running,
+            Some("/home/user/project/artifacts/abc-123".into()),
+        );
+        let summary = record.to_summary();
+        assert_eq!(summary.run_working_dir, Some("artifacts/abc-123".into()));
+    }
+
+    #[test]
+    fn to_summary_handles_none_working_dir() {
+        let record = make_test_record(RunStatus::Running, None);
+        let summary = record.to_summary();
+        assert!(summary.run_working_dir.is_none());
+    }
+
+    #[test]
+    fn to_summary_aborted_status() {
+        let record = make_test_record(RunStatus::Aborted, None);
+        let summary = record.to_summary();
+        assert_eq!(summary.status, "Aborted");
+    }
+
+    #[test]
+    fn to_summary_completed_status() {
+        let record = make_test_record(RunStatus::Completed, None);
+        let summary = record.to_summary();
+        assert_eq!(summary.status, "Completed");
+    }
 }

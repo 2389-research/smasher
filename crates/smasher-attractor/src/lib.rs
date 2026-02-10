@@ -18,6 +18,7 @@ pub mod lint;
 pub mod log_sink;
 pub mod manager_handler;
 pub mod parallel;
+pub mod preflight;
 pub mod rendering;
 pub mod retry;
 pub mod run_dir;

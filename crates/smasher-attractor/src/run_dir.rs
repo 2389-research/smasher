@@ -54,7 +54,8 @@ pub fn sanitize_graph_name(raw: &str) -> String {
         return "unnamed".to_string();
     }
     if trimmed.len() > MAX_GRAPH_NAME_LEN {
-        trimmed[..MAX_GRAPH_NAME_LEN].to_string()
+        // Truncate by chars, not bytes, to avoid splitting multi-byte UTF-8.
+        trimmed.chars().take(MAX_GRAPH_NAME_LEN).collect()
     } else {
         trimmed.to_string()
     }
@@ -482,7 +483,27 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_slashes_only_defaults_to_unnamed() {
+    fn sanitize_slashes_only_produces_underscores() {
         assert_eq!(sanitize_graph_name("///"), "___");
+    }
+
+    #[test]
+    fn sanitize_truncates_unicode_by_chars_not_bytes() {
+        // 200 CJK characters — each is 3 bytes in UTF-8 (600 bytes total).
+        // Truncation at MAX_GRAPH_NAME_LEN=128 chars should produce valid UTF-8.
+        let cjk = "\u{4e00}".repeat(200);
+        let result = sanitize_graph_name(&cjk);
+        assert_eq!(result.chars().count(), MAX_GRAPH_NAME_LEN);
+        // Must be valid UTF-8 (no partial chars).
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn sanitize_emoji_at_truncation_boundary() {
+        // Emoji are 4 bytes each. Fill past the limit to test boundary.
+        let emoji = "\u{1F600}".repeat(200);
+        let result = sanitize_graph_name(&emoji);
+        assert_eq!(result.chars().count(), MAX_GRAPH_NAME_LEN);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 }

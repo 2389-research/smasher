@@ -498,7 +498,7 @@ async fn smoke_checkpoint_and_resume() {
     let config = EngineConfig {
         max_steps: 100,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine1 = Engine::with_config(phase1_graph, smoke_test_registry(), config);
     let ctx = Context::new();
@@ -563,7 +563,7 @@ async fn smoke_checkpoint_and_resume() {
     let config2 = EngineConfig {
         max_steps: 100,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine2 = Engine::with_config(phase2_graph, smoke_test_registry(), config2);
     let resume_ctx = Context::new();

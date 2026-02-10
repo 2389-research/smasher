@@ -23,9 +23,15 @@
 //!   pipeline can be resumed later with [`Engine::run_from_checkpoint`].
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::edge::{EdgeSelectionError, select_edge};
@@ -52,7 +58,7 @@ use crate::state::{Checkpoint, Context, Outcome};
 /// let config = EngineConfig {
 ///     max_steps: 50,
 ///     enable_checkpointing: false,
-///     cancellation_token: None,
+///     ..EngineConfig::default()
 /// };
 /// assert_eq!(config.max_steps, 50);
 /// ```
@@ -64,6 +70,20 @@ pub struct EngineConfig {
     pub enable_checkpointing: bool,
     /// Optional cancellation token checked before each node execution.
     pub cancellation_token: Option<CancellationToken>,
+    /// Directory to write checkpoint files into after each node. Requires
+    /// `enable_checkpointing` to be `true` for auto-save to take effect.
+    pub checkpoint_dir: Option<PathBuf>,
+    /// Maximum time to wait without forward progress before aborting. When set,
+    /// a background watchdog task monitors the engine and cancels execution if
+    /// no node starts or completes within this duration.
+    pub stall_timeout: Option<Duration>,
+    /// How often the stall watchdog checks for progress. Defaults to 5 seconds
+    /// when `stall_timeout` is set and this field is `None`.
+    pub stall_check_interval: Option<Duration>,
+    /// Maximum number of identical (same node + same error) failures before
+    /// the engine aborts with `EngineError::DeterministicFailureCycle`.
+    /// `None` disables the check. Default: `Some(3)`.
+    pub max_identical_failures: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +92,10 @@ impl Default for EngineConfig {
             max_steps: 1000,
             enable_checkpointing: true,
             cancellation_token: None,
+            checkpoint_dir: None,
+            stall_timeout: None,
+            stall_check_interval: None,
+            max_identical_failures: Some(3),
         }
     }
 }
@@ -97,6 +121,14 @@ pub enum EngineError {
     RetryExhausted { node_id: String, message: String },
     #[error("pipeline cancelled")]
     Cancelled,
+    #[error("pipeline stalled: no progress for {timeout_secs}s")]
+    Stalled { timeout_secs: u64 },
+    #[error("deterministic failure cycle: node '{node_id}' failed {count} times with: {error}")]
+    DeterministicFailureCycle {
+        node_id: String,
+        error: String,
+        count: u32,
+    },
 }
 
 /// Tracks how many times each loop_restart edge has been traversed.
@@ -308,6 +340,7 @@ impl Engine {
         let mut steps: usize = 0;
         let mut loop_restarts = LoopCounter::new();
         let pipeline_start = std::time::Instant::now();
+        let mut failure_signatures: HashMap<u64, (String, String, u32)> = HashMap::new();
 
         // Emit PipelineStarted event.
         let graph_name = self
@@ -320,11 +353,58 @@ impl Engine {
             timestamp: Utc::now(),
         });
 
+        // Set up stall watchdog if configured.
+        let last_progress = Arc::new(Mutex::new(std::time::Instant::now()));
+        let stall_detected = Arc::new(AtomicBool::new(false));
+        let watchdog_handle = if let Some(stall_timeout) = self.config.stall_timeout {
+            let check_interval = self
+                .config
+                .stall_check_interval
+                .unwrap_or(Duration::from_secs(5));
+
+            // Create an internal cancellation token if none was provided.
+            let cancel_token = self.config.cancellation_token.clone().unwrap_or_default();
+
+            let progress = Arc::clone(&last_progress);
+            let stall_flag = Arc::clone(&stall_detected);
+            let timeout_secs = stall_timeout.as_secs();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(check_interval).await;
+                    let last = *progress.lock().await;
+                    if last.elapsed() > stall_timeout {
+                        stall_flag.store(true, Ordering::Release);
+                        cancel_token.cancel();
+                        break;
+                    }
+                }
+                timeout_secs
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
+        let loop_result: Result<_, EngineError> = async {
         loop {
             // Check cancellation token before each node.
             if let Some(ref token) = self.config.cancellation_token
                 && token.is_cancelled()
             {
+                // Distinguish stall-triggered cancellation from user cancellation
+                // using the atomic flag set by the watchdog task.
+                if stall_detected.load(Ordering::Acquire) {
+                    let timeout_secs = self
+                        .config
+                        .stall_timeout
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    self.emit(PipelineEvent::PipelineAborted {
+                        reason: format!("stalled: no progress for {timeout_secs}s"),
+                        timestamp: Utc::now(),
+                    });
+                    return Err(EngineError::Stalled { timeout_secs });
+                }
                 self.emit(PipelineEvent::PipelineAborted {
                     reason: "cancelled".to_string(),
                     timestamp: Utc::now(),
@@ -350,6 +430,9 @@ impl Engine {
                     .ok_or_else(|| EngineError::NodeNotFound {
                         node_id: current_node_id.clone(),
                     })?;
+
+            // Update stall watchdog progress on node start.
+            *last_progress.lock().await = std::time::Instant::now();
 
             // Emit NodeStarted event.
             let node_start = std::time::Instant::now();
@@ -380,6 +463,9 @@ impl Engine {
                 // and continue to edge selection (the outcome might route to an error edge)
             }
 
+            // Update stall watchdog progress on node complete.
+            *last_progress.lock().await = std::time::Instant::now();
+
             let node_duration_ms = node_start.elapsed().as_millis() as u64;
 
             // Emit NodeCompleted or NodeFailed event.
@@ -405,6 +491,81 @@ impl Engine {
             node_outcomes.insert(current_node_id.clone(), outcome.clone());
             if !visited_nodes.contains(&current_node_id) {
                 visited_nodes.push(current_node_id.clone());
+            }
+
+            // Deterministic failure cycle detection: track repeated identical failures
+            // and abort if the same (node, error) pair recurs too many times.
+            if let Some(max_failures) = self.config.max_identical_failures {
+                match &outcome {
+                    Outcome::Failure { error, .. } => {
+                        let mut hasher = DefaultHasher::new();
+                        current_node_id.hash(&mut hasher);
+                        error.hash(&mut hasher);
+                        let sig = hasher.finish();
+
+                        let entry = failure_signatures
+                            .entry(sig)
+                            .or_insert_with(|| (current_node_id.clone(), error.clone(), 0));
+                        entry.2 += 1;
+
+                        if entry.2 >= max_failures {
+                            self.emit(PipelineEvent::PipelineAborted {
+                                reason: format!(
+                                    "deterministic failure cycle: node '{}' failed {} times with: {}",
+                                    entry.0, entry.2, entry.1
+                                ),
+                                timestamp: Utc::now(),
+                            });
+                            return Err(EngineError::DeterministicFailureCycle {
+                                node_id: entry.0.clone(),
+                                error: entry.1.clone(),
+                                count: entry.2,
+                            });
+                        }
+                    }
+                    Outcome::Success { .. } => {
+                        // On success, remove any failure signatures for this node.
+                        failure_signatures.retain(|_, (nid, _, _)| nid != &current_node_id);
+                    }
+                    Outcome::Skip { .. } => {}
+                }
+            }
+
+            // Auto-save checkpoint after each node (when configured).
+            if self.config.enable_checkpointing
+                && let Some(ref checkpoint_dir) = self.config.checkpoint_dir
+            {
+                let mut cp =
+                    Checkpoint::new(graph_name.clone(), current_node_id.clone(), &context);
+                for id in &visited_nodes {
+                    cp.mark_visited(id);
+                }
+                for (id, out) in &node_outcomes {
+                    cp.add_outcome(id, out.clone());
+                }
+                match cp.to_json() {
+                    Ok(json_str) => {
+                        let cp_path = checkpoint_dir.join("checkpoint.json");
+                        if let Err(e) = std::fs::write(&cp_path, &json_str) {
+                            tracing::warn!(
+                                path = %cp_path.display(),
+                                error = %e,
+                                "failed to write auto-save checkpoint"
+                            );
+                        } else {
+                            self.emit(PipelineEvent::CheckpointCreated {
+                                node_id: current_node_id.clone(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to serialize auto-save checkpoint"
+                        );
+                    }
+                }
             }
 
             // If exit node, break the loop
@@ -473,6 +634,17 @@ impl Engine {
                 }
             }
         }
+
+        Ok(())
+        }.await;
+
+        // Abort the watchdog task if it's running.
+        if let Some(handle) = watchdog_handle {
+            handle.abort();
+        }
+
+        // Propagate any error from the loop.
+        loop_result?;
 
         // Enforce goal gates
         self.goal_gate.enforce(&visited_nodes)?;
@@ -847,7 +1019,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 5,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1115,7 +1287,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: true,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1145,7 +1317,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1336,7 +1508,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: true,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1392,7 +1564,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: true,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
 
@@ -1420,7 +1592,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 42,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         assert_eq!(engine.config.max_steps, 42);
@@ -1489,7 +1661,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 7,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1580,7 +1752,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 20,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, registry, config);
 
@@ -1628,7 +1800,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 10,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1707,7 +1879,7 @@ mod tests {
         let config = EngineConfig {
             max_steps: 9,
             enable_checkpointing: false,
-            cancellation_token: None,
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1821,6 +1993,7 @@ mod tests {
             max_steps: 1000,
             enable_checkpointing: false,
             cancellation_token: Some(token),
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config);
         let ctx = Context::new();
@@ -1853,6 +2026,7 @@ mod tests {
             max_steps: 1000,
             enable_checkpointing: false,
             cancellation_token: Some(token),
+            ..EngineConfig::default()
         };
         let engine = Engine::with_config(graph, success_registry(), config).with_emitter(emitter);
         let ctx = Context::new();
@@ -1929,5 +2103,455 @@ mod tests {
             .collect();
         // start node should produce a NodeFailed since AlwaysFailHandler returns Outcome::failure
         assert!(!failed_events.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 41: Config default includes new fields
+    // ---------------------------------------------------------------
+    #[test]
+    fn config_default_new_fields() {
+        let config = EngineConfig::default();
+        assert!(config.checkpoint_dir.is_none());
+        assert!(config.stall_timeout.is_none());
+        assert!(config.stall_check_interval.is_none());
+        assert_eq!(config.max_identical_failures, Some(3));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 42: Auto-save checkpoint writes file after each node
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn autosave_checkpoint_writes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_dir = tmp.path().to_path_buf();
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: true,
+            checkpoint_dir: Some(cp_dir.clone()),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        assert_eq!(result.steps_taken, 3);
+
+        // Verify checkpoint.json was written
+        let cp_path = cp_dir.join("checkpoint.json");
+        assert!(cp_path.exists(), "checkpoint.json should exist after run");
+
+        // Verify checkpoint content: it should reflect the final node (exit)
+        let cp_content = std::fs::read_to_string(&cp_path).unwrap();
+        let cp = Checkpoint::from_json(&cp_content).unwrap();
+        assert_eq!(cp.pipeline_name, "test_pipeline");
+        assert!(cp.was_visited("start"));
+        assert!(cp.was_visited("a"));
+        assert!(cp.was_visited("exit"));
+        assert_eq!(cp.current_node, "exit");
+    }
+
+    // ---------------------------------------------------------------
+    // Test 43: Auto-save checkpoint emits CheckpointCreated events
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn autosave_checkpoint_emits_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_dir = tmp.path().to_path_buf();
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "exit")],
+        );
+        let emitter = Arc::new(PipelineEventEmitter::new(64));
+        let mut rx = emitter.subscribe();
+
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: true,
+            checkpoint_dir: Some(cp_dir),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, success_registry(), config).with_emitter(emitter);
+        let ctx = Context::new();
+        engine.run(ctx).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let cp_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, PipelineEvent::CheckpointCreated { .. }))
+            .collect();
+        // One checkpoint per node: start and exit = 2 events
+        assert_eq!(cp_events.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 44: No auto-save without checkpoint_dir
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn no_autosave_without_checkpoint_dir() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "exit")],
+        );
+        let emitter = Arc::new(PipelineEventEmitter::new(64));
+        let mut rx = emitter.subscribe();
+
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: true,
+            // checkpoint_dir is None (default) -- no auto-save
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, success_registry(), config).with_emitter(emitter);
+        let ctx = Context::new();
+        engine.run(ctx).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let cp_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, PipelineEvent::CheckpointCreated { .. }))
+            .collect();
+        assert_eq!(
+            cp_events.len(),
+            0,
+            "no CheckpointCreated without checkpoint_dir"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 45: Stall watchdog detects stalled pipeline
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn stall_watchdog_detects_stall() {
+        /// Handler that sleeps for a long time to trigger stall detection.
+        struct SlowHandler;
+
+        #[async_trait]
+        impl Handler for SlowHandler {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            async fn execute(
+                &self,
+                node: &GraphNode,
+                _context: &Context,
+            ) -> Result<Outcome, HandlerError> {
+                if node.id == "slow_node" {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Ok(Outcome::success())
+            }
+            fn handles(&self, _node_type: &NodeType) -> bool {
+                true
+            }
+        }
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("slow_node", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "slow_node"),
+                make_edge("slow_node", "exit"),
+            ],
+        );
+        let token = CancellationToken::new();
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: false,
+            cancellation_token: Some(token),
+            stall_timeout: Some(std::time::Duration::from_millis(100)),
+            stall_check_interval: Some(std::time::Duration::from_millis(30)),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(SlowHandler));
+
+        let engine = Engine::with_config(graph, registry, config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::Stalled { timeout_secs } => {
+                // Duration was 100ms, so as_secs() = 0
+                assert_eq!(timeout_secs, 0);
+            }
+            other => panic!("expected Stalled, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 46: No stall with fast execution
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn no_stall_with_fast_execution() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let token = CancellationToken::new();
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: false,
+            cancellation_token: Some(token),
+            stall_timeout: Some(std::time::Duration::from_secs(10)),
+            stall_check_interval: Some(std::time::Duration::from_secs(5)),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().steps_taken, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 47: Deterministic failure cycle detection triggers
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn deterministic_failure_cycle_detection() {
+        // Graph with a loop: start -> fail_node -> fail_node (via loop_restart)
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("fail_node", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                make_loop_restart_edge("fail_node", "fail_node"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 100,
+            enable_checkpointing: false,
+            max_identical_failures: Some(3),
+            ..EngineConfig::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlwaysFailHandler));
+
+        let engine = Engine::with_config(graph, registry, config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::DeterministicFailureCycle {
+                node_id,
+                error,
+                count,
+            } => {
+                assert_eq!(node_id, "fail_node");
+                assert!(error.contains("handler always fails"));
+                assert_eq!(count, 3);
+            }
+            other => panic!("expected DeterministicFailureCycle, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 48: Failure cycle detection disabled when None
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn failure_cycle_detection_disabled_when_none() {
+        // Same looping-fail graph, but max_identical_failures = None
+        // Should hit max_steps instead
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("fail_node", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                make_loop_restart_edge("fail_node", "fail_node"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 10,
+            enable_checkpointing: false,
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlwaysFailHandler));
+
+        let engine = Engine::with_config(graph, registry, config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EngineError::MaxStepsExceeded { .. }
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 49: Success resets failure cycle counter
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn success_resets_failure_cycle_counter() {
+        /// Handler that alternates between fail and success based on context.
+        /// Uses a context key ("cycle_runs") that is NOT prefixed with the
+        /// node ID to avoid being cleared by loop_restart edge semantics.
+        struct AlternatingHandler;
+
+        #[async_trait]
+        impl Handler for AlternatingHandler {
+            fn name(&self) -> &str {
+                "alternating"
+            }
+            async fn execute(
+                &self,
+                node: &GraphNode,
+                context: &Context,
+            ) -> Result<Outcome, HandlerError> {
+                if node.id == "cycler" {
+                    let count: i64 = context
+                        .get("cycle_runs")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    context.set("cycle_runs", serde_json::json!(count + 1));
+                    // Fail twice, succeed on third, repeat
+                    if count % 3 < 2 {
+                        Ok(Outcome::failure("intermittent failure"))
+                    } else {
+                        Ok(Outcome::success())
+                    }
+                } else {
+                    Ok(Outcome::success())
+                }
+            }
+            fn handles(&self, _node_type: &NodeType) -> bool {
+                true
+            }
+        }
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("cycler", NodeType::Generic),
+            ],
+            vec![
+                make_edge("start", "cycler"),
+                make_loop_restart_edge("cycler", "cycler"),
+            ],
+        );
+        let config = EngineConfig {
+            max_steps: 20,
+            enable_checkpointing: false,
+            max_identical_failures: Some(3),
+            ..EngineConfig::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlternatingHandler));
+
+        let engine = Engine::with_config(graph, registry, config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // With max_identical_failures=3, it would trigger if we had 3 consecutive
+        // identical failures. But every 3rd iteration succeeds, resetting the counter.
+        // So it should hit max_steps instead.
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), EngineError::MaxStepsExceeded { .. }),
+            "should hit max_steps, not DeterministicFailureCycle"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 50: Stalled and DeterministicFailureCycle error display
+    // ---------------------------------------------------------------
+    #[test]
+    fn new_error_display_messages() {
+        let err1 = EngineError::Stalled { timeout_secs: 30 };
+        assert!(err1.to_string().contains("30"));
+        assert!(err1.to_string().contains("stalled"));
+
+        let err2 = EngineError::DeterministicFailureCycle {
+            node_id: "node_x".to_string(),
+            error: "boom".to_string(),
+            count: 5,
+        };
+        assert!(err2.to_string().contains("node_x"));
+        assert!(err2.to_string().contains("boom"));
+        assert!(err2.to_string().contains("5"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 51: Auto-save checkpoint includes correct node outcomes
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn autosave_checkpoint_includes_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_dir = tmp.path().to_path_buf();
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("worker", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "worker"), make_edge("worker", "exit")],
+        );
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: true,
+            checkpoint_dir: Some(cp_dir.clone()),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, success_registry(), config);
+        let ctx = Context::new();
+        engine.run(ctx).await.unwrap();
+
+        let cp_content = std::fs::read_to_string(cp_dir.join("checkpoint.json")).unwrap();
+        let cp = Checkpoint::from_json(&cp_content).unwrap();
+
+        // All 3 nodes should have outcomes
+        assert!(cp.node_outcomes.get("start").unwrap().is_success());
+        assert!(cp.node_outcomes.get("worker").unwrap().is_success());
+        assert!(cp.node_outcomes.get("exit").unwrap().is_success());
     }
 }

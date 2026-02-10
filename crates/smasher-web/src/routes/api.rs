@@ -21,7 +21,7 @@ use smasher_attractor::http_interviewer::HttpInterviewer;
 use smasher_attractor::rendering::{
     CachedRenderer, GraphRenderer, NodeExecutionStatus, RenderFormat, StatusGraphvizRenderer,
 };
-use smasher_attractor::state::{Context, RunStatus};
+use smasher_attractor::state::{Checkpoint, Context, RunStatus};
 use smasher_attractor::transforms;
 
 use crate::backend::AgentCodergenBackend;
@@ -58,16 +58,23 @@ pub struct ListRunsResponse {
     pub runs: Vec<RunSummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CancelResponse {
     pub success: bool,
     pub status: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TokenResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeResponse {
+    pub run_id: String,
+    pub status: String,
+    pub resumed_from_node: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +88,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/events", get(events_stream))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/tokens", get(get_tokens))
         .route("/api/runs/{id}/graph", get(render_graph))
 }
@@ -109,7 +117,7 @@ async fn submit_pipeline(
 
     transforms::apply_transforms(&mut resolved, &variables, None);
 
-    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = ulid::Ulid::new().to_string().to_lowercase();
 
     // Create per-run artifact directory for isolation.
     let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
@@ -195,6 +203,7 @@ async fn submit_pipeline(
             max_steps: 1000,
             enable_checkpointing: false,
             cancellation_token: Some(cancellation),
+            ..EngineConfig::default()
         };
 
         let engine = Engine::with_config(resolved, registry, config).with_emitter(emitter);
@@ -293,6 +302,188 @@ async fn cancel_run(
     Ok(Json(CancelResponse {
         success: true,
         status: "Aborted".into(),
+    }))
+}
+
+async fn resume_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ResumeResponse>, WebError> {
+    // Look up the existing run record to get its checkpoint and graph.
+    let (dot_source, graph, variables, checkpoint_json) = {
+        let runs = state.runs.read().await;
+        let record = runs
+            .get(&id)
+            .ok_or_else(|| WebError::NotFound(format!("run {id}")))?;
+
+        // Only completed or failed runs can be resumed.
+        match record.status {
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Aborted => {}
+            _ => {
+                return Err(WebError::BadRequest(format!(
+                    "run {id} is still {:?} and cannot be resumed",
+                    record.status
+                )));
+            }
+        }
+
+        // Read the checkpoint from disk using the run's working directory.
+        let run_dir = record
+            .run_working_dir
+            .as_ref()
+            .ok_or_else(|| WebError::Internal("run has no working directory".into()))?;
+
+        let cp_path = std::path::Path::new(run_dir)
+            .join("checkpoints")
+            .join("checkpoint.json");
+
+        let cp_json = std::fs::read_to_string(&cp_path).map_err(|e| {
+            WebError::Internal(format!(
+                "cannot read checkpoint at {}: {e}",
+                cp_path.display()
+            ))
+        })?;
+
+        (
+            record.dot_source.clone(),
+            record.graph.clone(),
+            record.variables.clone(),
+            cp_json,
+        )
+    };
+
+    let checkpoint = Checkpoint::from_json(&checkpoint_json)
+        .map_err(|e| WebError::Internal(format!("invalid checkpoint: {e}")))?;
+
+    let resumed_from_node = checkpoint.current_node.clone();
+
+    // Create a new run for the resumed execution.
+    let run_id = ulid::Ulid::new().to_string().to_lowercase();
+
+    // Create per-run artifact directory for the resumed run.
+    let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
+    let graph_name =
+        smasher_attractor::run_dir::sanitize_graph_name(&graph.name.clone().unwrap_or_default());
+    let run_directory = smasher_attractor::run_dir::RunDirectory::create(
+        &artifacts_base,
+        &run_id,
+        &graph_name,
+        &dot_source,
+    )
+    .map_err(|e| WebError::Internal(format!("failed to create run directory: {e}")))?;
+    let run_working_dir = run_directory
+        .manifest()
+        .directories
+        .root
+        .display()
+        .to_string();
+
+    let emitter = Arc::new(PipelineEventEmitter::default());
+    let event_log = Arc::new(PipelineEventLog::new());
+    let cancellation = CancellationToken::new();
+    let interviewer = HttpInterviewer::new();
+    let input_tokens = Arc::new(AtomicU64::new(0));
+    let output_tokens = Arc::new(AtomicU64::new(0));
+
+    let model = variables
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| state.default_model.clone());
+
+    let record = RunRecord {
+        id: run_id.clone(),
+        dot_source,
+        graph: graph.clone(),
+        status: RunStatus::Running,
+        started_at: Utc::now(),
+        completed_at: None,
+        emitter: Arc::clone(&emitter),
+        event_log: Arc::clone(&event_log),
+        cancellation: cancellation.clone(),
+        interviewer: interviewer.clone(),
+        variables: variables.clone(),
+        error: None,
+        input_tokens: Arc::clone(&input_tokens),
+        output_tokens: Arc::clone(&output_tokens),
+        run_working_dir: Some(run_working_dir.clone()),
+    };
+
+    {
+        let mut runs = state.runs.write().await;
+        runs.insert(run_id.clone(), record);
+    }
+
+    // Subscribe to events and drain into the log.
+    let mut log_rx = emitter.subscribe();
+    let log_clone = Arc::clone(&event_log);
+    tokio::spawn(async move {
+        loop {
+            match log_rx.recv().await {
+                Ok(event) => log_clone.push(event),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "event log subscriber lagged");
+                }
+            }
+        }
+    });
+
+    // Spawn resumed pipeline execution.
+    let run_id_clone = run_id.clone();
+    let runs = Arc::clone(&state.runs);
+    let client = Arc::clone(&state.client);
+    let spawn_working_dir = run_working_dir;
+    tokio::spawn(async move {
+        let backend = Arc::new(AgentCodergenBackend::new(
+            Arc::clone(&client),
+            model.clone(),
+            spawn_working_dir,
+            input_tokens,
+            output_tokens,
+            Arc::clone(&emitter),
+        ));
+        let mut registry = default_registry();
+        registry.register(Arc::new(CodergenHandler::new(backend)));
+
+        let config = EngineConfig {
+            max_steps: 1000,
+            enable_checkpointing: false,
+            cancellation_token: Some(cancellation),
+            ..EngineConfig::default()
+        };
+
+        let engine = Engine::with_config(graph, registry, config).with_emitter(emitter);
+        let context = Context::default();
+
+        for (key, value) in &variables {
+            context.set(key, serde_json::Value::String(value.clone()));
+        }
+
+        let result = engine.run_from_checkpoint(checkpoint, context).await;
+
+        let mut runs = runs.write().await;
+        if let Some(record) = runs.get_mut(&run_id_clone) {
+            record.completed_at = Some(Utc::now());
+            match result {
+                Ok(_) => {
+                    record.status = RunStatus::Completed;
+                }
+                Err(e) => {
+                    if matches!(e, smasher_attractor::engine::EngineError::Cancelled) {
+                        record.status = RunStatus::Aborted;
+                    } else {
+                        record.status = RunStatus::Failed;
+                        record.error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Json(ResumeResponse {
+        run_id,
+        status: "Running".into(),
+        resumed_from_node,
     }))
 }
 
@@ -494,5 +685,117 @@ mod tests {
         // Verify the run exists in state.
         let runs = state.runs.read().await;
         assert!(runs.contains_key(&parsed.run_id));
+    }
+
+    /// Insert a RunRecord directly into state for handler testing.
+    async fn insert_test_record(
+        state: &AppState,
+        id: &str,
+        status: RunStatus,
+    ) -> CancellationToken {
+        let dot_graph = parser::parse("digraph { a -> b }").unwrap();
+        let resolved = graph::resolve(&dot_graph).unwrap();
+        let token = CancellationToken::new();
+        let record = crate::state::RunRecord {
+            id: id.into(),
+            dot_source: "digraph { a -> b }".into(),
+            graph: resolved,
+            status,
+            started_at: Utc::now(),
+            completed_at: None,
+            emitter: Arc::new(PipelineEventEmitter::default()),
+            event_log: Arc::new(PipelineEventLog::new()),
+            cancellation: token.clone(),
+            interviewer: HttpInterviewer::new(),
+            variables: HashMap::new(),
+            error: None,
+            input_tokens: Arc::new(AtomicU64::new(0)),
+            output_tokens: Arc::new(AtomicU64::new(0)),
+            run_working_dir: Some("/srv/project/artifacts/test-run-1".into()),
+        };
+        state.runs.write().await.insert(id.into(), record);
+        token
+    }
+
+    #[tokio::test]
+    async fn cancel_running_run_returns_success() {
+        let state = test_state();
+        let _token = insert_test_record(&state, "run-cancel-1", RunStatus::Running).await;
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/runs/run-cancel-1/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: CancelResponse = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.status, "Aborted");
+    }
+
+    #[tokio::test]
+    async fn cancel_completed_run_returns_failure() {
+        let state = test_state();
+        let _token = insert_test_record(&state, "run-done-1", RunStatus::Completed).await;
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/runs/run-done-1/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: CancelResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!parsed.success);
+        assert_eq!(parsed.status, "Completed");
+    }
+
+    #[tokio::test]
+    async fn get_run_returns_relative_working_dir() {
+        let state = test_state();
+        let _token = insert_test_record(&state, "run-dir-1", RunStatus::Running).await;
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/api/runs/run-dir-1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: RunSummary = serde_json::from_slice(&body).unwrap();
+        // run_working_dir should be relative, not the absolute path we stored.
+        assert_eq!(parsed.run_working_dir, Some("artifacts/test-run-1".into()));
+    }
+
+    #[tokio::test]
+    async fn get_tokens_for_existing_run() {
+        let state = test_state();
+        let _token = insert_test_record(&state, "run-tok-1", RunStatus::Running).await;
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/api/runs/run-tok-1/tokens")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: TokenResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.input_tokens, 0);
+        assert_eq!(parsed.output_tokens, 0);
     }
 }

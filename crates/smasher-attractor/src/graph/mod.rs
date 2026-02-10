@@ -133,6 +133,24 @@ impl Graph {
             .map(|e| e.from.as_str())
             .collect()
     }
+
+    /// Extract all unique model IDs referenced by nodes in this graph.
+    ///
+    /// Scans each node's `attrs` map for a "model" key with a string value.
+    /// Returns a deduplicated, sorted list of model ID strings.
+    pub fn referenced_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match n.attrs.get("model") {
+                Some(NodeAttrValue::String(s)) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        models.sort();
+        models.dedup();
+        models
+    }
 }
 
 /// Convert a DotValue into a NodeAttrValue.
@@ -892,5 +910,89 @@ mod tests {
         for node in &g.nodes {
             assert_eq!(node.node_type, NodeType::Interviewer);
         }
+    }
+
+    // ---- referenced_models extracts model attrs from nodes ----
+    #[test]
+    fn referenced_models_extracts_model_attrs() {
+        let dot = make_graph(vec![
+            DotStatement::Node(DotNode {
+                id: "a".to_string(),
+                attrs: vec![
+                    DotAttr {
+                        key: "shape".to_string(),
+                        value: DotValue::String("box".to_string()),
+                    },
+                    DotAttr {
+                        key: "model".to_string(),
+                        value: DotValue::String("claude-sonnet-4-20250514".to_string()),
+                    },
+                ],
+            }),
+            DotStatement::Node(DotNode {
+                id: "b".to_string(),
+                attrs: vec![
+                    DotAttr {
+                        key: "shape".to_string(),
+                        value: DotValue::String("box".to_string()),
+                    },
+                    DotAttr {
+                        key: "model".to_string(),
+                        value: DotValue::String("gpt-4o".to_string()),
+                    },
+                ],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        let models = g.referenced_models();
+        assert_eq!(models, vec!["claude-sonnet-4-20250514", "gpt-4o"]);
+    }
+
+    // ---- referenced_models deduplicates models ----
+    #[test]
+    fn referenced_models_deduplicates() {
+        let dot = make_graph(vec![
+            DotStatement::Node(DotNode {
+                id: "a".to_string(),
+                attrs: vec![DotAttr {
+                    key: "model".to_string(),
+                    value: DotValue::String("claude-sonnet-4-20250514".to_string()),
+                }],
+            }),
+            DotStatement::Node(DotNode {
+                id: "b".to_string(),
+                attrs: vec![DotAttr {
+                    key: "model".to_string(),
+                    value: DotValue::String("claude-sonnet-4-20250514".to_string()),
+                }],
+            }),
+        ]);
+        let g = resolve(&dot).unwrap();
+        let models = g.referenced_models();
+        assert_eq!(models, vec!["claude-sonnet-4-20250514"]);
+    }
+
+    // ---- referenced_models returns empty for graph with no model attrs ----
+    #[test]
+    fn referenced_models_empty_for_no_model_attrs() {
+        let dot = make_graph(vec![plain_node("a"), plain_node("b"), plain_edge("a", "b")]);
+        let g = resolve(&dot).unwrap();
+        let models = g.referenced_models();
+        assert!(models.is_empty());
+    }
+
+    // ---- referenced_models skips empty model strings ----
+    #[test]
+    fn referenced_models_skips_empty_strings() {
+        let dot = make_graph(vec![DotStatement::Node(DotNode {
+            id: "a".to_string(),
+            attrs: vec![DotAttr {
+                key: "model".to_string(),
+                value: DotValue::String("".to_string()),
+            }],
+        })]);
+        let g = resolve(&dot).unwrap();
+        let models = g.referenced_models();
+        assert!(models.is_empty());
     }
 }

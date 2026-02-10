@@ -25,6 +25,7 @@ use smasher_attractor::stylesheet::Stylesheet;
 use smasher_attractor::transforms;
 
 use crate::error::CliError;
+use crate::gitutil;
 
 /// CodergenBackend that runs a full agent session with file/shell tools.
 ///
@@ -167,6 +168,19 @@ pub struct RunArgs {
     /// from the file extension (.dot, .svg, .png), or defaults to SVG.
     #[arg(long, value_name = "FILE")]
     pub render: Option<String>,
+
+    /// Run in an isolated git worktree branch. Creates a fresh branch and
+    /// working directory for the pipeline, commits results when done.
+    #[arg(long)]
+    pub worktree: bool,
+
+    /// Allow running with a dirty working tree (only meaningful with --worktree).
+    #[arg(long)]
+    pub allow_dirty: bool,
+
+    /// Skip preflight health-checks of LLM providers before execution.
+    #[arg(long)]
+    pub skip_preflight: bool,
 }
 
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
@@ -214,7 +228,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let config = EngineConfig {
         max_steps: args.max_steps,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
 
     let client = smasher_llm::client::Client::from_env();
@@ -225,12 +239,50 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     }
     let client = Arc::new(client);
 
+    // Run preflight health-checks unless explicitly skipped.
+    if !args.skip_preflight {
+        match smasher_attractor::preflight::preflight_check(&resolved, &client).await {
+            Ok(report) => {
+                for probe in &report.probes {
+                    eprintln!(
+                        "  preflight {}/{}: ok ({}ms)",
+                        probe.provider, probe.model, probe.latency_ms
+                    );
+                }
+            }
+            Err(smasher_attractor::preflight::PreflightError::ProviderUnreachable {
+                report,
+                ..
+            }) => {
+                for probe in &report.probes {
+                    if probe.passed {
+                        eprintln!(
+                            "  preflight {}/{}: ok ({}ms)",
+                            probe.provider, probe.model, probe.latency_ms
+                        );
+                    } else {
+                        eprintln!(
+                            "  preflight {}/{}: FAILED - {}",
+                            probe.provider,
+                            probe.model,
+                            probe.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
+                return Err(CliError::Other(format!(
+                    "preflight check failed: {} provider(s) unreachable. Use --skip-preflight to bypass.",
+                    report.failure_count()
+                )));
+            }
+        }
+    }
+
     let working_dir = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
     // Create per-run artifact directory for isolation.
-    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = generate_run_id();
     let artifacts_base = std::path::Path::new(&working_dir).join("artifacts");
     let graph_name =
         smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
@@ -248,10 +300,40 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         .to_string();
     eprintln!("Run directory: {run_working_dir}");
 
+    // Optionally set up git worktree isolation for the pipeline run.
+    let effective_working_dir = if args.worktree {
+        let repo_path = std::env::current_dir()?;
+
+        if !gitutil::is_git_repo(&repo_path)? {
+            return Err(CliError::Other(
+                "--worktree requires a git repository".into(),
+            ));
+        }
+
+        if !args.allow_dirty && !gitutil::is_clean(&repo_path)? {
+            return Err(gitutil::GitError::DirtyWorkingTree.into());
+        }
+
+        let base_sha = gitutil::current_sha(&repo_path)?;
+        let branch_name = format!("attractor/run/{run_id}");
+        let worktree_dir = run_directory.manifest().directories.root.join("worktree");
+
+        gitutil::create_worktree(&repo_path, &worktree_dir, &branch_name, &base_sha)?;
+
+        eprintln!(
+            "Worktree created: {} (branch: {branch_name})",
+            worktree_dir.display()
+        );
+
+        worktree_dir.display().to_string()
+    } else {
+        run_working_dir
+    };
+
     let backend = Arc::new(AgentCodergenBackend::new(
         Arc::clone(&client),
         args.model.clone(),
-        run_working_dir,
+        effective_working_dir,
     ));
     let mut registry = default_registry();
     registry.register(Arc::new(CodergenHandler::new(backend)));
@@ -266,6 +348,20 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
     let result = engine.run(context).await?;
 
+    // Commit and clean up the worktree if one was created.
+    if args.worktree {
+        let worktree_dir = run_directory.manifest().directories.root.join("worktree");
+
+        if let Some(sha) =
+            gitutil::commit_all_changes(&worktree_dir, &format!("attractor({run_id}): final"))?
+        {
+            eprintln!("Final commit: {sha}");
+        }
+
+        gitutil::remove_worktree(&worktree_dir)?;
+        eprintln!("Worktree cleaned up");
+    }
+
     let json = serde_json::to_string_pretty(&result.final_context)
         .map_err(|e| CliError::Other(format!("failed to serialize context: {e}")))?;
     println!("{json}");
@@ -276,7 +372,23 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         "pipeline completed"
     );
 
+    // Create a compressed archive of the run artifacts.
+    let archive_path = run_directory.manifest().directories.root.join("run.tgz");
+    match crate::archive::create_archive(&run_directory.manifest().directories.root, &archive_path)
+    {
+        Ok(path) => eprintln!("Archive: {}", path.display()),
+        Err(e) => tracing::warn!("failed to create run archive: {e}"),
+    }
+
     Ok(())
+}
+
+/// Generate a new run ID using ULID (Universally Unique Lexicographically Sortable Identifier).
+///
+/// ULIDs are time-ordered, so sequential IDs sort chronologically.
+/// Output is lowercase Crockford base32, 26 characters.
+fn generate_run_id() -> String {
+    ulid::Ulid::new().to_string().to_lowercase()
 }
 
 /// Infer the render format from a file path extension.
@@ -292,6 +404,42 @@ fn infer_render_format(path: &str) -> RenderFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// Wrapper struct for testing RunArgs parsing via clap.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        run: RunArgs,
+    }
+
+    #[test]
+    fn worktree_flag_defaults_to_false() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert!(!cli.run.worktree);
+        assert!(!cli.run.allow_dirty);
+    }
+
+    #[test]
+    fn worktree_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--worktree", "pipeline.dot"]);
+        assert!(cli.run.worktree);
+        assert!(!cli.run.allow_dirty);
+    }
+
+    #[test]
+    fn allow_dirty_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--worktree", "--allow-dirty", "pipeline.dot"]);
+        assert!(cli.run.worktree);
+        assert!(cli.run.allow_dirty);
+    }
+
+    #[test]
+    fn allow_dirty_without_worktree_parses_successfully() {
+        let cli = TestCli::parse_from(["test", "--allow-dirty", "pipeline.dot"]);
+        assert!(!cli.run.worktree);
+        assert!(cli.run.allow_dirty);
+    }
 
     #[test]
     fn infer_svg_from_extension() {
@@ -324,5 +472,62 @@ mod tests {
             infer_render_format("/tmp/output/graph.png"),
             RenderFormat::Png
         );
+    }
+
+    // ---- ULID run ID tests ----
+
+    #[test]
+    fn generate_run_id_is_valid_crockford_base32() {
+        let id = generate_run_id();
+        // ULIDs are 26 characters of Crockford base32
+        assert_eq!(
+            id.len(),
+            26,
+            "ULID should be 26 characters, got {}",
+            id.len()
+        );
+        // Crockford base32 lowercase: 0-9 and a-z excluding i, l, o, u
+        let valid_chars = "0123456789abcdefghjkmnpqrstvwxyz";
+        for c in id.chars() {
+            assert!(
+                valid_chars.contains(c),
+                "character '{}' is not valid Crockford base32 in '{}'",
+                c,
+                id,
+            );
+        }
+    }
+
+    #[test]
+    fn generate_run_id_sequential_ids_sort_chronologically() {
+        let id1 = generate_run_id();
+        // Small delay to ensure different timestamp component
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = generate_run_id();
+        assert!(
+            id2 > id1,
+            "sequential ULIDs should sort in order: {} vs {}",
+            id1,
+            id2,
+        );
+    }
+
+    #[test]
+    fn generate_run_id_is_url_safe() {
+        let id = generate_run_id();
+        for c in id.chars() {
+            assert!(
+                c.is_ascii_alphanumeric(),
+                "character '{}' is not URL-safe in '{}'",
+                c,
+                id,
+            );
+        }
+    }
+
+    #[test]
+    fn generate_run_id_is_lowercase() {
+        let id = generate_run_id();
+        assert_eq!(id, id.to_lowercase(), "ULID should be lowercase");
     }
 }

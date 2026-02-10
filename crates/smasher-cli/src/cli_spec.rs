@@ -6,7 +6,7 @@
 /// ## Binary
 ///
 /// The `smasher` binary is the main entry point for the smasher CLI. It provides
-/// five subcommands for AI workflow orchestration from the command line.
+/// six subcommands for AI workflow orchestration from the command line.
 ///
 /// ## Global Flags
 ///
@@ -78,6 +78,17 @@
 /// | `-p`, `--port <PORT>`      | Port to listen on (default: 21541).              |
 /// | `-m`, `--model <MODEL>`    | Default LLM model for pipeline execution.        |
 /// | `-w`, `--working-dir <PATH>` | Working directory for agent file operations.    |
+///
+/// ### `smasher ingest`
+///
+/// Convert English requirements into a DOT pipeline file using an LLM.
+///
+/// | Argument / Flag            | Description                                      |
+/// |----------------------------|--------------------------------------------------|
+/// | `<REQUIREMENTS>`           | English-language requirements text (positional).  |
+/// | `-o`, `--output <FILE>`    | Output file path. Writes to stdout if omitted.   |
+/// | `--model <MODEL>`          | Model identifier (default: `claude-sonnet-4-20250514`). |
+/// | `--skill <PATH>`           | Path to a custom skill file for LLM prompting.   |
 ///
 /// ## Exit Codes
 ///
@@ -167,6 +178,10 @@ mod tests {
         assert!(
             stdout.contains("serve") || stdout.contains("Serve"),
             "help should mention the serve subcommand: {stdout}"
+        );
+        assert!(
+            stdout.contains("ingest") || stdout.contains("Ingest"),
+            "help should mention the ingest subcommand: {stdout}"
         );
         assert!(
             stdout.contains("--verbose") || stdout.contains("-v"),
@@ -381,6 +396,41 @@ mod tests {
             assert!(
                 stdout.contains(flag),
                 "serve --help should mention {flag}: {stdout}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `smasher ingest --help`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ingest_help_exits_zero() {
+        let output = smasher_cmd()
+            .args(["ingest", "--help"])
+            .output()
+            .expect("failed to run smasher ingest --help");
+
+        assert!(
+            output.status.success(),
+            "smasher ingest --help should exit 0"
+        );
+    }
+
+    #[test]
+    fn ingest_help_contains_expected_flags() {
+        let output = smasher_cmd()
+            .args(["ingest", "--help"])
+            .output()
+            .expect("failed to run smasher ingest --help");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let expected_flags = ["--model", "--output", "--skill"];
+        for flag in &expected_flags {
+            assert!(
+                stdout.contains(flag),
+                "ingest --help should mention {flag}: {stdout}"
             );
         }
     }

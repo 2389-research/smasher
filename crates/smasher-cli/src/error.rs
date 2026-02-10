@@ -35,6 +35,9 @@ pub enum CliError {
     #[error("state error: {0}")]
     State(#[from] StateError),
 
+    #[error("git error: {0}")]
+    Git(#[from] crate::gitutil::GitError),
+
     #[error("web server error: {0}")]
     Web(String),
 
@@ -53,6 +56,7 @@ impl CliError {
             CliError::Io(_) => 6,
             CliError::Web(_) => 7,
             CliError::State(_) => 8,
+            CliError::Git(_) => 9,
             CliError::Other(_) => 1,
         }
     }

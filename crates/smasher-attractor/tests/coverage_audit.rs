@@ -376,7 +376,7 @@ async fn test_engine_error_paths_covered() {
     let config = EngineConfig {
         max_steps: 5,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let err = Engine::with_config(cycle, passthrough_registry(), config)
         .run(Context::new())
@@ -459,7 +459,7 @@ async fn test_engine_checkpoint_path_covered() {
     let config = EngineConfig {
         max_steps: 1000,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, stamping_registry(counter), config);
     let ctx = Context::new();
@@ -1076,7 +1076,7 @@ async fn test_loop_with_checkpoint_and_resume() {
     let config = EngineConfig {
         max_steps: 20,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph.clone(), registry, config);
 
@@ -1109,7 +1109,7 @@ async fn test_loop_with_checkpoint_and_resume() {
     let config2 = EngineConfig {
         max_steps: 20,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
 
     // Create a checkpoint mid-pipeline to test resume

@@ -26,3 +26,9 @@ chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+ulid.workspace = true
+tar.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

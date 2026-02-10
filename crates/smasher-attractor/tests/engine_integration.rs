@@ -660,7 +660,7 @@ async fn error_max_steps_exceeded_on_loop() {
     let config = EngineConfig {
         max_steps: 7,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, passthrough_registry(), config);
     let err = engine.run(Context::new()).await.unwrap_err();
@@ -731,7 +731,7 @@ async fn checkpoint_created_with_correct_state() {
     let config = EngineConfig {
         max_steps: 1000,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, stamping_registry(counter), config);
     let ctx = Context::new();
@@ -774,7 +774,7 @@ async fn checkpoint_disabled_produces_none() {
     let config = EngineConfig {
         max_steps: 1000,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, passthrough_registry(), config);
     let result = engine.run(Context::new()).await.unwrap();
@@ -796,7 +796,7 @@ async fn checkpoint_serialization_roundtrip() {
     let config = EngineConfig {
         max_steps: 1000,
         enable_checkpointing: true,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, stamping_registry(counter), config);
     let ctx = Context::new();
@@ -992,7 +992,7 @@ async fn loop_restart_tracks_counter() {
     let config = EngineConfig {
         max_steps: 20,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, registry, config);
 
@@ -1031,7 +1031,7 @@ async fn loop_restart_clears_prefixed_context_entries() {
     let config = EngineConfig {
         max_steps: 20,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, registry, config);
 
@@ -1070,7 +1070,7 @@ async fn loop_restart_max_steps_prevents_infinite_loop() {
     let config = EngineConfig {
         max_steps: 10,
         enable_checkpointing: false,
-        cancellation_token: None,
+        ..EngineConfig::default()
     };
     let engine = Engine::with_config(graph, passthrough_registry(), config);
     let err = engine.run(Context::new()).await.unwrap_err();

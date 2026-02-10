@@ -284,6 +284,7 @@ async fn submit_run(
             max_steps: 1000,
             enable_checkpointing: false,
             cancellation_token: Some(cancellation),
+            ..EngineConfig::default()
         };
 
         let engine = Engine::with_config(resolved, registry, config).with_emitter(emitter);

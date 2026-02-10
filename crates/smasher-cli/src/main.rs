@@ -1,14 +1,18 @@
-// ABOUTME: Entry point for the smasher CLI binary with five subcommands.
-// ABOUTME: Routes to complete, chat, run, render, and serve (web dashboard).
+// ABOUTME: Entry point for the smasher CLI binary with eight subcommands.
+// ABOUTME: Routes to complete, chat, run, resume, render, serve, ingest, and archive.
 
+mod archive;
 mod chat;
 #[cfg(test)]
 mod cli_spec;
 mod complete;
 mod error;
+mod gitutil;
+mod ingest;
 #[cfg(test)]
 mod layout_check;
 mod render;
+mod resume;
 mod run;
 mod serve;
 pub mod tui;
@@ -46,11 +50,20 @@ enum Command {
     /// Execute a DOT-based pipeline.
     Run(run::RunArgs),
 
+    /// Resume a checkpointed pipeline run.
+    Resume(resume::ResumeArgs),
+
     /// Render a DOT pipeline file to SVG or PNG.
     Render(render::RenderArgs),
 
     /// Start the web dashboard server.
     Serve(serve::ServeArgs),
+
+    /// Convert English requirements into a DOT pipeline file using an LLM.
+    Ingest(ingest::IngestArgs),
+
+    /// Create a compressed archive of a run directory.
+    Archive(archive::ArchiveArgs),
 }
 
 fn main() {
@@ -103,8 +116,11 @@ fn main() {
             Command::Complete(args) => complete::run(args).await,
             Command::Chat(args) => chat::run(args).await,
             Command::Run(args) => run::run(args).await,
+            Command::Resume(args) => resume::run(args).await,
             Command::Render(args) => render::run(args).await,
             Command::Serve(args) => serve::run(args).await,
+            Command::Ingest(args) => ingest::run(args).await,
+            Command::Archive(args) => async { archive::run(args) }.await,
         }
     });
 
