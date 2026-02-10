@@ -268,6 +268,7 @@ async fn submit_run(
     let run_id_clone = run_id.clone();
     let runs = Arc::clone(&state.runs);
     let client = Arc::clone(&state.client);
+    let checkpoint_dir = run_directory.manifest().directories.checkpoints.clone();
     tokio::spawn(async move {
         let backend = Arc::new(AgentCodergenBackend::new(
             Arc::clone(&client),
@@ -282,7 +283,8 @@ async fn submit_run(
 
         let config = EngineConfig {
             max_steps: 1000,
-            enable_checkpointing: false,
+            enable_checkpointing: true,
+            checkpoint_dir: Some(checkpoint_dir),
             cancellation_token: Some(cancellation),
             ..EngineConfig::default()
         };

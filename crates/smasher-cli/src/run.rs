@@ -225,12 +225,6 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         tracing::info!(format = %format, path = %render_path, "graph rendered to file");
     }
 
-    let config = EngineConfig {
-        max_steps: args.max_steps,
-        enable_checkpointing: false,
-        ..EngineConfig::default()
-    };
-
     let client = smasher_llm::client::Client::from_env();
     if client.registered_providers().is_empty() {
         return Err(CliError::Other(
@@ -330,6 +324,13 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         run_working_dir
     };
 
+    let config = EngineConfig {
+        max_steps: args.max_steps,
+        enable_checkpointing: true,
+        checkpoint_dir: Some(run_directory.manifest().directories.checkpoints.clone()),
+        ..EngineConfig::default()
+    };
+
     let backend = Arc::new(AgentCodergenBackend::new(
         Arc::clone(&client),
         args.model.clone(),
@@ -346,21 +347,31 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         context.set(key, serde_json::Value::String(value.clone()));
     }
 
-    let result = engine.run(context).await?;
+    let result = engine.run(context).await;
 
-    // Commit and clean up the worktree if one was created.
+    // Always clean up the worktree, even if the engine failed. Capture the
+    // engine result and propagate any error *after* cleanup so that the
+    // worktree branch and directory are not leaked on failure.
     if args.worktree {
         let worktree_dir = run_directory.manifest().directories.root.join("worktree");
 
-        if let Some(sha) =
-            gitutil::commit_all_changes(&worktree_dir, &format!("attractor({run_id}): final"))?
-        {
+        let msg = if result.is_ok() {
+            format!("attractor({run_id}): final")
+        } else {
+            format!("attractor({run_id}): failed (partial)")
+        };
+        if let Ok(Some(sha)) = gitutil::commit_all_changes(&worktree_dir, &msg) {
             eprintln!("Final commit: {sha}");
         }
 
-        gitutil::remove_worktree(&worktree_dir)?;
-        eprintln!("Worktree cleaned up");
+        if let Err(e) = gitutil::remove_worktree(&worktree_dir) {
+            tracing::warn!("failed to clean up worktree: {e}");
+        } else {
+            eprintln!("Worktree cleaned up");
+        }
     }
+
+    let result = result?;
 
     let json = serde_json::to_string_pretty(&result.final_context)
         .map_err(|e| CliError::Other(format!("failed to serialize context: {e}")))?;

@@ -463,4 +463,29 @@ mod tests {
             "should return NotGitRepo error"
         );
     }
+
+    // ---------------------------------------------------------------
+    // Worktree cleanup with dirty state (simulates engine failure mid-run)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn remove_worktree_succeeds_with_dirty_state() {
+        let (_tmp, repo) = setup_test_repo();
+        let sha = current_sha(&repo).unwrap();
+
+        let worktree_dir = repo.join("wt-dirty");
+        create_worktree(&repo, &worktree_dir, "dirty/test", &sha).unwrap();
+
+        // Simulate a failed engine run leaving uncommitted changes.
+        std::fs::write(worktree_dir.join("partial_output.txt"), "incomplete work").unwrap();
+        std::fs::write(worktree_dir.join("README.md"), "modified content").unwrap();
+
+        // Cleanup must succeed even with dirty working tree.
+        remove_worktree(&worktree_dir).unwrap();
+
+        assert!(
+            !worktree_dir.exists(),
+            "dirty worktree directory should still be removed"
+        );
+    }
 }

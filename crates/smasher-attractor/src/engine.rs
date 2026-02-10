@@ -354,6 +354,11 @@ impl Engine {
         });
 
         // Set up stall watchdog if configured.
+        // Use a unified cancellation token: either the user-provided one or a
+        // fresh internal one. Both the watchdog and the main loop check this
+        // same token so that stall detection works regardless of whether the
+        // caller supplied an external token.
+        let effective_cancel_token = self.config.cancellation_token.clone().unwrap_or_default();
         let last_progress = Arc::new(Mutex::new(std::time::Instant::now()));
         let stall_detected = Arc::new(AtomicBool::new(false));
         let watchdog_handle = if let Some(stall_timeout) = self.config.stall_timeout {
@@ -362,8 +367,7 @@ impl Engine {
                 .stall_check_interval
                 .unwrap_or(Duration::from_secs(5));
 
-            // Create an internal cancellation token if none was provided.
-            let cancel_token = self.config.cancellation_token.clone().unwrap_or_default();
+            let cancel_token = effective_cancel_token.clone();
 
             let progress = Arc::clone(&last_progress);
             let stall_flag = Arc::clone(&stall_detected);
@@ -387,9 +391,8 @@ impl Engine {
 
         let loop_result: Result<_, EngineError> = async {
         loop {
-            // Check cancellation token before each node.
-            if let Some(ref token) = self.config.cancellation_token
-                && token.is_cancelled()
+            // Check the unified cancellation token before each node.
+            if effective_cancel_token.is_cancelled()
             {
                 // Distinguish stall-triggered cancellation from user cancellation
                 // using the atomic flag set by the watchdog task.
@@ -2307,6 +2310,70 @@ mod tests {
                 // Duration was 100ms, so as_secs() = 0
                 assert_eq!(timeout_secs, 0);
             }
+            other => panic!("expected Stalled, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 45b: Stall watchdog works without external cancellation token
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn stall_watchdog_works_without_external_token() {
+        /// Handler that sleeps to trigger stall detection.
+        struct SlowHandler;
+
+        #[async_trait]
+        impl Handler for SlowHandler {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            async fn execute(
+                &self,
+                node: &GraphNode,
+                _context: &Context,
+            ) -> Result<Outcome, HandlerError> {
+                if node.id == "slow_node" {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Ok(Outcome::success())
+            }
+            fn handles(&self, _node_type: &NodeType) -> bool {
+                true
+            }
+        }
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("slow_node", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "slow_node"),
+                make_edge("slow_node", "exit"),
+            ],
+        );
+        // No external cancellation token — the engine must create one internally.
+        let config = EngineConfig {
+            max_steps: 50,
+            enable_checkpointing: false,
+            cancellation_token: None,
+            stall_timeout: Some(std::time::Duration::from_millis(100)),
+            stall_check_interval: Some(std::time::Duration::from_millis(30)),
+            max_identical_failures: None,
+            ..EngineConfig::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(SlowHandler));
+
+        let engine = Engine::with_config(graph, registry, config);
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::Stalled { .. } => { /* expected */ }
             other => panic!("expected Stalled, got: {other:?}"),
         }
     }
