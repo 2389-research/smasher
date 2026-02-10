@@ -277,8 +277,26 @@
       font-weight: 300;
       line-height: 1.7;
       max-width: 480px;
-      margin-bottom: 2rem;
+      margin-bottom: 0.75rem;
       color: var(--ghost);
+    }
+
+    .hero-origin {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--ghost);
+      margin-bottom: 2rem;
+    }
+
+    .hero-origin a {
+      color: var(--trace-green);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(45, 140, 111, 0.4);
+      transition: border-color 0.2s;
+    }
+
+    .hero-origin a:hover {
+      border-color: var(--trace-green);
     }
 
     .hero-actions {
@@ -882,6 +900,9 @@
           Write a directed graph. Smasher runs it: agents, tools, conditionals,
           human approval gates. Rust all the way down, five crates deep.
         </p>
+        <p class="hero-origin">
+          Built on the ideas from <a href="https://github.com/strongdm/attractor">attractor</a> by <a href="https://www.strongdm.com/">strongDM</a>. Reimplemented from scratch in Rust.
+        </p>
         <div class="hero-actions">
           <a href="#quickstart" class="btn-primary">Get Started</a>
           <a href="#examples" class="btn-secondary">See Examples</a>
@@ -1163,6 +1184,7 @@ Steps: 6 | Nodes visited: 5</pre>
         <li><a href="api-reference.md">API</a></li>
         <li><a href="dot-reference.md">DOT Reference</a></li>
         <li><a href="https://github.com/2389-ai/smasher">GitHub</a></li>
+        <li><a href="https://github.com/strongdm/attractor">attractor</a></li>
       </ul>
     </div>
   </footer>

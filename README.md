@@ -5,7 +5,9 @@
 
 AI workflow orchestration in Rust. Write your pipeline as a DOT directed graph, point it at an LLM, and run it.
 
-Smasher is a Rust reimplementation of [strongdm/attractor](https://github.com/strongdm/attractor). It breaks the problem into five crates that stack on top of each other, bottom to top:
+Based on [attractor](https://github.com/strongdm/attractor) by [strongDM](https://www.strongdm.com/), reimplemented from scratch in Rust. The original attractor defined the idea of DOT-graph-driven AI pipelines; smasher takes that concept and rebuilds it with a layered crate architecture, multi-provider LLM support, and a web dashboard.
+
+Five crates, bottom to top:
 
 | Crate | What it does |
 |-------|-------------|
