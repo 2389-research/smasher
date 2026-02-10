@@ -232,7 +232,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     // Create per-run artifact directory for isolation.
     let run_id = uuid::Uuid::new_v4().to_string();
     let artifacts_base = std::path::Path::new(&working_dir).join("artifacts");
-    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let graph_name =
+        smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
         &artifacts_base,
         &run_id,

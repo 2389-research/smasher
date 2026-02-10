@@ -39,6 +39,27 @@ pub struct RunDirectory {
     manifest: RunManifest,
 }
 
+/// Maximum length for a sanitized graph name.
+const MAX_GRAPH_NAME_LEN: usize = 128;
+
+/// Sanitize a graph name from user input for safe storage.
+///
+/// Strips path separators (`/`, `\`) and parent-directory traversals (`..`),
+/// replacing them with underscores. Truncates to 128 characters and defaults
+/// to `"unnamed"` if the result is empty.
+pub fn sanitize_graph_name(raw: &str) -> String {
+    let sanitized = raw.replace(['/', '\\'], "_").replace("..", "_");
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return "unnamed".to_string();
+    }
+    if trimmed.len() > MAX_GRAPH_NAME_LEN {
+        trimmed[..MAX_GRAPH_NAME_LEN].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Compute a hex-encoded SHA256 hash of the given input.
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -409,5 +430,59 @@ mod tests {
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // sanitize_graph_name tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sanitize_replaces_forward_slashes() {
+        assert_eq!(sanitize_graph_name("foo/bar/baz"), "foo_bar_baz");
+    }
+
+    #[test]
+    fn sanitize_replaces_backslashes() {
+        assert_eq!(sanitize_graph_name("foo\\bar\\baz"), "foo_bar_baz");
+    }
+
+    #[test]
+    fn sanitize_replaces_dot_dot_traversal() {
+        assert_eq!(
+            sanitize_graph_name("../../../etc/passwd"),
+            "______etc_passwd"
+        );
+    }
+
+    #[test]
+    fn sanitize_empty_string_defaults_to_unnamed() {
+        assert_eq!(sanitize_graph_name(""), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_whitespace_only_defaults_to_unnamed() {
+        assert_eq!(sanitize_graph_name("   "), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_names() {
+        let long_name = "a".repeat(200);
+        let result = sanitize_graph_name(&long_name);
+        assert_eq!(result.len(), MAX_GRAPH_NAME_LEN);
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_names() {
+        assert_eq!(sanitize_graph_name("my_pipeline"), "my_pipeline");
+    }
+
+    #[test]
+    fn sanitize_handles_mixed_dangerous_input() {
+        assert_eq!(sanitize_graph_name("../../foo/bar\\baz"), "____foo_bar_baz");
+    }
+
+    #[test]
+    fn sanitize_slashes_only_defaults_to_unnamed() {
+        assert_eq!(sanitize_graph_name("///"), "___");
     }
 }

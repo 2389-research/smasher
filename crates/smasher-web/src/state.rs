@@ -83,7 +83,15 @@ impl RunRecord {
             error: self.error.clone(),
             input_tokens: self.input_tokens.load(Ordering::Relaxed),
             output_tokens: self.output_tokens.load(Ordering::Relaxed),
-            run_working_dir: self.run_working_dir.clone(),
+            run_working_dir: self.run_working_dir.as_ref().map(|dir| {
+                // Expose only the relative path (artifacts/{run_id}/...) to avoid
+                // leaking absolute server filesystem paths in API responses and UI.
+                let path = std::path::Path::new(dir);
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| format!("artifacts/{name}"))
+                    .unwrap_or_else(|| dir.clone())
+            }),
         }
     }
 }

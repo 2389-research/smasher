@@ -58,6 +58,7 @@ jobs:
           cache-on-failure: true
       - name: Run tests and capture output
         run: |
+          set -o pipefail
           mkdir -p test-logs
           cargo test --workspace 2>&1 | tee test-logs/full-output.log
       - name: Upload test logs
@@ -84,6 +85,7 @@ jobs:
           cache-on-failure: true
       - name: Run clippy and capture output
         run: |
+          set -o pipefail
           mkdir -p clippy-logs
           cargo clippy --workspace --message-format=json 2>&1 | tee clippy-logs/clippy-json.log
           cargo clippy --workspace -- -D warnings 2>&1 | tee clippy-logs/clippy-human.log
@@ -123,7 +125,9 @@ jobs:
           shared-key: "ci-doc"
           cache-on-failure: true
       - name: Build documentation
-        run: cargo doc --workspace --no-deps 2>&1 | tee doc-build.log
+        run: |
+          set -o pipefail
+          cargo doc --workspace --no-deps 2>&1 | tee doc-build.log
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Upload doc build log

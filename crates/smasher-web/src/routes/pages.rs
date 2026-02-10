@@ -203,7 +203,8 @@ async fn submit_run(
 
     // Create per-run artifact directory for isolation.
     let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
-    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let graph_name =
+        smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
         &artifacts_base,
         &run_id,
@@ -300,8 +301,12 @@ async fn submit_run(
             match result {
                 Ok(_) => record.status = RunStatus::Completed,
                 Err(e) => {
-                    record.status = RunStatus::Failed;
-                    record.error = Some(e.to_string());
+                    if matches!(e, smasher_attractor::engine::EngineError::Cancelled) {
+                        record.status = RunStatus::Aborted;
+                    } else {
+                        record.status = RunStatus::Failed;
+                        record.error = Some(e.to_string());
+                    }
                 }
             }
         }

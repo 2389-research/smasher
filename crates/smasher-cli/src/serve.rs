@@ -42,6 +42,7 @@ pub async fn run(args: ServeArgs) -> Result<(), CliError> {
 
     let config = ServerConfig {
         port: args.port,
+        host: defaults.host,
         model,
         working_dir,
     };

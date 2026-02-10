@@ -113,7 +113,8 @@ async fn submit_pipeline(
 
     // Create per-run artifact directory for isolation.
     let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
-    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let graph_name =
+        smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
         &artifacts_base,
         &run_id,
@@ -213,17 +214,27 @@ async fn submit_pipeline(
                     record.status = RunStatus::Completed;
                 }
                 Err(e) => {
-                    record.status = RunStatus::Failed;
-                    record.error = Some(e.to_string());
+                    if matches!(e, smasher_attractor::engine::EngineError::Cancelled) {
+                        record.status = RunStatus::Aborted;
+                    } else {
+                        record.status = RunStatus::Failed;
+                        record.error = Some(e.to_string());
+                    }
                 }
             }
         }
     });
 
+    // Return the run working directory as a relative path from the project working dir.
+    let relative_working_dir = std::path::Path::new(&run_working_dir)
+        .strip_prefix(&state.working_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or(run_working_dir);
+
     Ok(Json(SubmitResponse {
         run_id,
         status: "Running".into(),
-        run_working_dir: Some(run_working_dir),
+        run_working_dir: Some(relative_working_dir),
     }))
 }
 

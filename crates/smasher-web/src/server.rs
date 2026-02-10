@@ -31,6 +31,7 @@ pub fn build_router(state: AppState) -> Router {
 /// Configuration for the web dashboard server.
 pub struct ServerConfig {
     pub port: u16,
+    pub host: [u8; 4],
     pub model: String,
     pub working_dir: String,
 }
@@ -41,6 +42,11 @@ impl Default for ServerConfig {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_PORT);
+
+        let host = match std::env::var("SMASHER_WEB_HOST").ok().as_deref() {
+            Some("0.0.0.0") => [0, 0, 0, 0],
+            _ => [127, 0, 0, 1],
+        };
 
         let model =
             std::env::var("SMASHER_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
@@ -57,6 +63,7 @@ impl Default for ServerConfig {
 
         Self {
             port,
+            host,
             model,
             working_dir,
         }
@@ -82,7 +89,7 @@ pub async fn run_with_config(config: ServerConfig) -> Result<(), Box<dyn std::er
     let state = AppState::new(client, config.model, config.working_dir);
     let app = build_router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = SocketAddr::from((config.host, config.port));
     tracing::info!(%addr, "smasher dashboard starting");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
