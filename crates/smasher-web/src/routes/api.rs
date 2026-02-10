@@ -12,19 +12,26 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use smasher_attractor::artifact::ArtifactStore;
 use smasher_attractor::dot::parser;
 use smasher_attractor::engine::{Engine, EngineConfig};
 use smasher_attractor::events::{PipelineEvent, PipelineEventEmitter, PipelineEventLog};
 use smasher_attractor::graph;
-use smasher_attractor::handler::{CodergenHandler, default_registry};
+use smasher_attractor::handler::{CodergenHandler, HandlerRegistry, default_registry};
 use smasher_attractor::http_interviewer::HttpInterviewer;
+use smasher_attractor::interviewer::{HumanGateHandler, InterviewerHandler};
+use smasher_attractor::lint::LintRunner;
+use smasher_attractor::log_sink::LogSink;
+use smasher_attractor::manager_handler::ManagerHandler;
+use smasher_attractor::parallel::ParallelHandler;
 use smasher_attractor::rendering::{
     CachedRenderer, GraphRenderer, NodeExecutionStatus, RenderFormat, StatusGraphvizRenderer,
 };
 use smasher_attractor::state::{Checkpoint, Context, RunStatus};
+use smasher_attractor::tool_handler::ToolHandler;
 use smasher_attractor::transforms;
 
-use crate::backend::AgentCodergenBackend;
+use crate::backend::{AgentCodergenBackend, LlmManagerBackend, LlmToolBackend};
 use crate::error::WebError;
 use crate::sse;
 use crate::state::{AppState, RunRecord, RunSummary};
@@ -117,10 +124,24 @@ async fn submit_pipeline(
 
     transforms::apply_transforms(&mut resolved, &variables, None);
 
+    // Lint the resolved graph and reject pipelines with errors.
+    let lint_report = LintRunner::with_builtins().run(&resolved);
+    if lint_report.has_errors() {
+        let msgs: Vec<String> = lint_report
+            .errors()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        return Err(WebError::BadRequest(format!(
+            "Pipeline lint errors: {}",
+            msgs.join("; ")
+        )));
+    }
+
     let run_id = ulid::Ulid::new().to_string().to_lowercase();
 
     // Create per-run artifact directory for isolation.
-    let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
+    let artifacts_base = std::path::Path::new(&state.data_dir).join("artifacts");
     let graph_name =
         smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
@@ -167,7 +188,7 @@ async fn submit_pipeline(
         runs.insert(run_id.clone(), record);
     }
 
-    // Subscribe to events and drain into the log.
+    // Subscribe to events and drain into the in-memory log.
     let mut log_rx = emitter.subscribe();
     let log_clone = Arc::clone(&event_log);
     tokio::spawn(async move {
@@ -177,6 +198,25 @@ async fn submit_pipeline(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(missed = n, "event log subscriber lagged");
+                }
+            }
+        }
+    });
+
+    // Subscribe to events and write JSONL log to disk.
+    let mut file_log_rx = emitter.subscribe();
+    let file_sink = smasher_attractor::log_sink::FileLogSink::new(run_directory.event_log_path());
+    tokio::spawn(async move {
+        loop {
+            match file_log_rx.recv().await {
+                Ok(event) => {
+                    if let Err(e) = file_sink.append(event).await {
+                        tracing::warn!(error = %e, "failed to write event to JSONL log");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "file log subscriber lagged");
                 }
             }
         }
@@ -192,23 +232,66 @@ async fn submit_pipeline(
         let backend = Arc::new(AgentCodergenBackend::new(
             Arc::clone(&client),
             model.clone(),
-            spawn_working_dir,
+            spawn_working_dir.clone(),
             input_tokens,
             output_tokens,
             Arc::clone(&emitter),
         ));
+        let interviewer_arc: Arc<dyn smasher_attractor::interviewer::Interviewer> =
+            Arc::new(interviewer);
+
+        let manager_backend = Arc::new(LlmManagerBackend::new(
+            Arc::clone(&client),
+            model.clone(),
+            spawn_working_dir.clone(),
+        ));
+        let tool_backend = Arc::new(LlmToolBackend::new(
+            Arc::clone(&client),
+            model.clone(),
+            spawn_working_dir.clone(),
+        ));
+
+        // Build a child registry for ParallelHandler to dispatch within parallel nodes.
+        // Clone the backends as trait object Arcs for the child registry.
+        let child_codergen: Arc<dyn smasher_attractor::handler::CodergenBackend> = backend.clone();
+        let child_manager: Arc<dyn smasher_attractor::manager_handler::ManagerBackend> =
+            manager_backend.clone();
+        let child_tool: Arc<dyn smasher_attractor::tool_handler::ToolBackend> =
+            tool_backend.clone();
+        let mut child_registry = HandlerRegistry::new();
+        child_registry.register(Arc::new(CodergenHandler::new(child_codergen)));
+        child_registry.register(Arc::new(InterviewerHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        child_registry.register(Arc::new(HumanGateHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        child_registry.register(Arc::new(ManagerHandler::new(child_manager)));
+        child_registry.register(Arc::new(ToolHandler::new(child_tool)));
+
         let mut registry = default_registry();
         registry.register(Arc::new(CodergenHandler::new(backend)));
+        registry.register(Arc::new(InterviewerHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        registry.register(Arc::new(HumanGateHandler::new(interviewer_arc)));
+        registry.register(Arc::new(ManagerHandler::new(manager_backend)));
+        registry.register(Arc::new(ToolHandler::new(tool_backend)));
+        registry.register(Arc::new(ParallelHandler::new(Arc::new(child_registry))));
 
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: true,
             checkpoint_dir: Some(checkpoint_dir),
             cancellation_token: Some(cancellation),
+            artifact_store: Some(ArtifactStore::new()),
             ..EngineConfig::default()
         };
 
-        let engine = Engine::with_config(resolved, registry, config).with_emitter(emitter);
+        let mut engine = Engine::with_config(resolved, registry, config).with_emitter(emitter);
+        if let Err(e) = engine.apply_sub_pipeline_transform(&spawn_working_dir) {
+            tracing::warn!(error = %e, "sub-pipeline transform failed, continuing without");
+        }
         let context = Context::default();
 
         for (key, value) in &variables {
@@ -238,7 +321,7 @@ async fn submit_pipeline(
 
     // Return the run working directory as a relative path from the project working dir.
     let relative_working_dir = std::path::Path::new(&run_working_dir)
-        .strip_prefix(&state.working_dir)
+        .strip_prefix(&state.data_dir)
         .map(|p| p.display().to_string())
         .unwrap_or(run_working_dir);
 
@@ -363,7 +446,7 @@ async fn resume_run(
     let run_id = ulid::Ulid::new().to_string().to_lowercase();
 
     // Create per-run artifact directory for the resumed run.
-    let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
+    let artifacts_base = std::path::Path::new(&state.data_dir).join("artifacts");
     let graph_name =
         smasher_attractor::run_dir::sanitize_graph_name(&graph.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
@@ -415,7 +498,7 @@ async fn resume_run(
         runs.insert(run_id.clone(), record);
     }
 
-    // Subscribe to events and drain into the log.
+    // Subscribe to events and drain into the in-memory log.
     let mut log_rx = emitter.subscribe();
     let log_clone = Arc::clone(&event_log);
     tokio::spawn(async move {
@@ -430,6 +513,25 @@ async fn resume_run(
         }
     });
 
+    // Subscribe to events and write JSONL log to disk.
+    let mut file_log_rx = emitter.subscribe();
+    let file_sink = smasher_attractor::log_sink::FileLogSink::new(run_directory.event_log_path());
+    tokio::spawn(async move {
+        loop {
+            match file_log_rx.recv().await {
+                Ok(event) => {
+                    if let Err(e) = file_sink.append(event).await {
+                        tracing::warn!(error = %e, "failed to write event to JSONL log");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "file log subscriber lagged");
+                }
+            }
+        }
+    });
+
     // Spawn resumed pipeline execution.
     let run_id_clone = run_id.clone();
     let runs = Arc::clone(&state.runs);
@@ -439,22 +541,65 @@ async fn resume_run(
         let backend = Arc::new(AgentCodergenBackend::new(
             Arc::clone(&client),
             model.clone(),
-            spawn_working_dir,
+            spawn_working_dir.clone(),
             input_tokens,
             output_tokens,
             Arc::clone(&emitter),
         ));
+        let interviewer_arc: Arc<dyn smasher_attractor::interviewer::Interviewer> =
+            Arc::new(interviewer);
+
+        let manager_backend = Arc::new(LlmManagerBackend::new(
+            Arc::clone(&client),
+            model.clone(),
+            spawn_working_dir.clone(),
+        ));
+        let tool_backend = Arc::new(LlmToolBackend::new(
+            Arc::clone(&client),
+            model.clone(),
+            spawn_working_dir.clone(),
+        ));
+
+        // Build a child registry for ParallelHandler to dispatch within parallel nodes.
+        // Clone the backends as trait object Arcs for the child registry.
+        let child_codergen: Arc<dyn smasher_attractor::handler::CodergenBackend> = backend.clone();
+        let child_manager: Arc<dyn smasher_attractor::manager_handler::ManagerBackend> =
+            manager_backend.clone();
+        let child_tool: Arc<dyn smasher_attractor::tool_handler::ToolBackend> =
+            tool_backend.clone();
+        let mut child_registry = HandlerRegistry::new();
+        child_registry.register(Arc::new(CodergenHandler::new(child_codergen)));
+        child_registry.register(Arc::new(InterviewerHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        child_registry.register(Arc::new(HumanGateHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        child_registry.register(Arc::new(ManagerHandler::new(child_manager)));
+        child_registry.register(Arc::new(ToolHandler::new(child_tool)));
+
         let mut registry = default_registry();
         registry.register(Arc::new(CodergenHandler::new(backend)));
+        registry.register(Arc::new(InterviewerHandler::new(Arc::clone(
+            &interviewer_arc,
+        ))));
+        registry.register(Arc::new(HumanGateHandler::new(interviewer_arc)));
+        registry.register(Arc::new(ManagerHandler::new(manager_backend)));
+        registry.register(Arc::new(ToolHandler::new(tool_backend)));
+        registry.register(Arc::new(ParallelHandler::new(Arc::new(child_registry))));
 
         let config = EngineConfig {
             max_steps: 1000,
             enable_checkpointing: false,
             cancellation_token: Some(cancellation),
+            artifact_store: Some(ArtifactStore::new()),
             ..EngineConfig::default()
         };
 
-        let engine = Engine::with_config(graph, registry, config).with_emitter(emitter);
+        let mut engine = Engine::with_config(graph, registry, config).with_emitter(emitter);
+        if let Err(e) = engine.apply_sub_pipeline_transform(&spawn_working_dir) {
+            tracing::warn!(error = %e, "sub-pipeline transform failed, continuing without");
+        }
         let context = Context::default();
 
         for (key, value) in &variables {
@@ -660,7 +805,7 @@ mod tests {
         );
         let app = router().with_state(state.clone());
         let body = serde_json::json!({
-            "dot_source": "digraph { a -> b }",
+            "dot_source": "digraph { start [shape=circle]; a [shape=box]; end [shape=doublecircle]; start -> a -> end }",
             "variables": {}
         });
         let req = Request::builder()
@@ -779,6 +924,24 @@ mod tests {
         let parsed: RunSummary = serde_json::from_slice(&body).unwrap();
         // run_working_dir should be relative, not the absolute path we stored.
         assert_eq!(parsed.run_working_dir, Some("artifacts/test-run-1".into()));
+    }
+
+    #[tokio::test]
+    async fn submit_lint_errors_return_bad_request() {
+        let app = router().with_state(test_state());
+        // A graph with no start node triggers a lint error.
+        let body = serde_json::json!({
+            "dot_source": "digraph { a [shape=box]; b [shape=doublecircle]; a -> b }",
+            "variables": {}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

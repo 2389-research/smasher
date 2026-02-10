@@ -34,8 +34,11 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::artifact::ArtifactStore;
+use crate::composition::SubPipelineTransform;
 use crate::edge::{EdgeSelectionError, select_edge};
 use crate::events::{PipelineEvent, PipelineEventEmitter};
+use crate::fidelity::{FidelityConfig, FidelityProcessor};
 use crate::goals::{GoalError, GoalGate};
 use crate::graph::{Graph, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
@@ -62,7 +65,7 @@ use crate::state::{Checkpoint, Context, Outcome};
 /// };
 /// assert_eq!(config.max_steps, 50);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Maximum nodes to visit before forced stop (prevents infinite loops).
     pub max_steps: usize,
@@ -84,6 +87,34 @@ pub struct EngineConfig {
     /// the engine aborts with `EngineError::DeterministicFailureCycle`.
     /// `None` disables the check. Default: `Some(3)`.
     pub max_identical_failures: Option<u32>,
+    /// Optional fidelity configuration controlling context carryover between nodes.
+    /// When set, the engine applies fidelity transformations after each edge traversal.
+    pub fidelity_config: Option<FidelityConfig>,
+    /// Optional artifact store for capturing node outputs during execution.
+    /// When set, node outcomes are stored as queryable artifacts.
+    pub artifact_store: Option<ArtifactStore>,
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("max_steps", &self.max_steps)
+            .field("enable_checkpointing", &self.enable_checkpointing)
+            .field("cancellation_token", &self.cancellation_token)
+            .field("checkpoint_dir", &self.checkpoint_dir)
+            .field("stall_timeout", &self.stall_timeout)
+            .field("stall_check_interval", &self.stall_check_interval)
+            .field("max_identical_failures", &self.max_identical_failures)
+            .field("fidelity_config", &self.fidelity_config)
+            .field(
+                "artifact_store",
+                &self
+                    .artifact_store
+                    .as_ref()
+                    .map(|s| format!("ArtifactStore({} items)", s.count())),
+            )
+            .finish()
+    }
 }
 
 impl Default for EngineConfig {
@@ -96,6 +127,8 @@ impl Default for EngineConfig {
             stall_timeout: None,
             stall_check_interval: None,
             max_identical_failures: Some(3),
+            fidelity_config: None,
+            artifact_store: None,
         }
     }
 }
@@ -129,6 +162,8 @@ pub enum EngineError {
         error: String,
         count: u32,
     },
+    #[error("composition error: {0}")]
+    Composition(#[from] crate::composition::CompositionError),
 }
 
 /// Tracks how many times each loop_restart edge has been traversed.
@@ -223,6 +258,29 @@ impl Engine {
     pub fn with_emitter(mut self, emitter: Arc<PipelineEventEmitter>) -> Self {
         self.emitter = Some(emitter);
         self
+    }
+
+    /// Apply sub-pipeline composition, inlining any SubPipeline nodes.
+    ///
+    /// Scans the graph for SubPipeline-type nodes and replaces them by
+    /// parsing and inlining the referenced DOT files. `base_dir` is used
+    /// to resolve relative `pipeline` attribute paths.
+    ///
+    /// This is a no-op if the graph contains no SubPipeline nodes.
+    pub fn apply_sub_pipeline_transform(&mut self, base_dir: &str) -> Result<(), EngineError> {
+        let has_sub_pipelines = self
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.node_type == NodeType::SubPipeline);
+        if !has_sub_pipelines {
+            return Ok(());
+        }
+        let transform = SubPipelineTransform::new(base_dir);
+        self.graph = transform.apply(&self.graph)?;
+        // Recompute goal gate after graph modification.
+        self.goal_gate = GoalGate::from_graph(&self.graph);
+        Ok(())
     }
 
     /// Helper to emit an event if an emitter is configured.
@@ -488,6 +546,18 @@ impl Engine {
                 });
             }
 
+            // Store artifact if artifact store is configured.
+            if let Some(ref store) = self.config.artifact_store
+                && let Ok(value) = serde_json::to_value(&outcome)
+            {
+                store.store(
+                    &current_node_id,
+                    "outcome",
+                    "application/json",
+                    value,
+                );
+            }
+
             steps += 1;
 
             // Record outcome and mark visited
@@ -627,6 +697,20 @@ impl Engine {
                             traversal_count = loop_restarts.count(&edge.from, &edge.to),
                             "loop_restart edge traversed, context entries for source node cleared"
                         );
+                    }
+
+                    // Apply fidelity processing if configured.
+                    if let Some(ref fidelity_config) = self.config.fidelity_config {
+                        let processor = FidelityProcessor::new(fidelity_config.clone());
+                        let processed = processor.process(&edge.from, &edge.to, &context);
+                        let new_snapshot = processed.snapshot();
+                        // Clear existing context and replace with processed version.
+                        for key in context.keys() {
+                            context.remove(&key);
+                        }
+                        for (k, v) in new_snapshot {
+                            context.set(k, v);
+                        }
                     }
 
                     current_node_id = edge.to.clone();
@@ -2620,5 +2704,133 @@ mod tests {
         assert!(cp.node_outcomes.get("start").unwrap().is_success());
         assert!(cp.node_outcomes.get("worker").unwrap().is_success());
         assert!(cp.node_outcomes.get("exit").unwrap().is_success());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 52: EngineConfig defaults None for fidelity and artifact fields
+    // ---------------------------------------------------------------
+    #[test]
+    fn engine_config_defaults_none_for_new_fields() {
+        let config = EngineConfig::default();
+        assert!(config.fidelity_config.is_none());
+        assert!(config.artifact_store.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 53: Fidelity config None preserves existing behavior
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn fidelity_config_none_works_identically() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlwaysSuccessHandler));
+
+        let config = EngineConfig {
+            fidelity_config: None,
+            enable_checkpointing: false,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, registry, config);
+        let context = Context::new();
+        context.set("preserved_key", json!("should_remain"));
+        let result = engine.run(context).await.unwrap();
+        assert_eq!(result.steps_taken, 3);
+        // Context should still have the key since fidelity is off (Full by default)
+        assert!(result.final_context.contains_key("preserved_key"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 54: Fidelity Reset clears context between nodes
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn fidelity_reset_clears_context_between_nodes() {
+        use crate::fidelity::{FidelityConfig, FidelityMode};
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(ContextSettingHandler));
+
+        let config = EngineConfig {
+            fidelity_config: Some(FidelityConfig::new(FidelityMode::Reset)),
+            enable_checkpointing: false,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, registry, config);
+        let context = Context::new();
+        context.set("initial_key", json!("initial_value"));
+        let result = engine.run(context).await.unwrap();
+        assert_eq!(result.steps_taken, 3);
+        // With Reset fidelity, context is cleared between each node transition.
+        // The "initial_key" should be wiped after the first edge traversal.
+        assert!(!result.final_context.contains_key("initial_key"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 55: ArtifactStore captures outcomes for all nodes
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn artifact_store_captures_outcomes() {
+        use crate::artifact::ArtifactStore;
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("a", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "a"), make_edge("a", "exit")],
+        );
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlwaysSuccessHandler));
+
+        let store = ArtifactStore::new();
+        let config = EngineConfig {
+            artifact_store: Some(store.clone()),
+            enable_checkpointing: false,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::with_config(graph, registry, config);
+        let result = engine.run(Context::new()).await.unwrap();
+        assert_eq!(result.steps_taken, 3);
+
+        // All 3 nodes should have artifacts stored
+        let all = store.list();
+        assert_eq!(all.len(), 3, "expected 3 artifacts, got {}", all.len());
+    }
+
+    // ---------------------------------------------------------------
+    // Test 56: Sub-pipeline transform is a no-op without SubPipeline nodes
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn sub_pipeline_transform_noop_without_sub_pipelines() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "exit")],
+        );
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(AlwaysSuccessHandler));
+
+        let mut engine = Engine::with_config(graph, registry, EngineConfig::default());
+        // Should be a no-op, no error
+        engine.apply_sub_pipeline_transform("/tmp").unwrap();
+        let result = engine.run(Context::new()).await.unwrap();
+        assert_eq!(result.steps_taken, 2);
     }
 }

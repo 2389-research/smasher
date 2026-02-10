@@ -12,16 +12,24 @@ use smasher_agent::tools::ToolRegistry;
 use smasher_agent::tools::shared::register_shared_tools;
 use smasher_agent::types::SessionConfig;
 
+use smasher_attractor::artifact::ArtifactStore;
 use smasher_attractor::dot::parser;
 use smasher_attractor::engine::{Engine, EngineConfig};
 use smasher_attractor::graph;
 use smasher_attractor::handler::{
     CodergenBackend, CodergenHandler, HandlerError, default_registry,
 };
+use smasher_attractor::interviewer::{
+    AutoApproveInterviewer, ConsoleInterviewer, HumanGateHandler, Interviewer, InterviewerHandler,
+    TimeoutInterviewer,
+};
+use smasher_attractor::manager_handler::ManagerHandler;
+use smasher_attractor::parallel::ParallelHandler;
 use smasher_attractor::rendering::{CachedRenderer, GraphRenderer, GraphvizRenderer, RenderFormat};
 use smasher_attractor::state::Context;
 use smasher_attractor::state::Outcome;
 use smasher_attractor::stylesheet::Stylesheet;
+use smasher_attractor::tool_handler::ToolHandler;
 use smasher_attractor::transforms;
 
 use crate::error::CliError;
@@ -181,6 +189,15 @@ pub struct RunArgs {
     /// Skip preflight health-checks of LLM providers before execution.
     #[arg(long)]
     pub skip_preflight: bool,
+
+    /// Skip lint pre-check before pipeline execution.
+    #[arg(long)]
+    pub skip_lint: bool,
+
+    /// Interviewer mode for human-in-the-loop nodes: auto, console, or timeout:N
+    /// (default: auto if no tty, console if tty).
+    #[arg(long, default_value = "auto")]
+    pub interviewer: String,
 }
 
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
@@ -212,6 +229,11 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     };
 
     transforms::apply_transforms(&mut resolved, &variables, stylesheet.as_ref());
+
+    // Lint pre-check: catch structural issues before execution.
+    if !args.skip_lint {
+        crate::lint::lint_graph(&resolved)?;
+    }
 
     // Optionally render the graph before execution.
     if let Some(ref render_path) = args.render {
@@ -324,22 +346,72 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         run_working_dir
     };
 
+    let artifact_store = ArtifactStore::new();
     let config = EngineConfig {
         max_steps: args.max_steps,
         enable_checkpointing: true,
         checkpoint_dir: Some(run_directory.manifest().directories.checkpoints.clone()),
+        artifact_store: Some(artifact_store),
         ..EngineConfig::default()
     };
 
     let backend = Arc::new(AgentCodergenBackend::new(
         Arc::clone(&client),
         args.model.clone(),
-        effective_working_dir,
+        effective_working_dir.clone(),
     ));
     let mut registry = default_registry();
     registry.register(Arc::new(CodergenHandler::new(backend)));
 
-    let engine = Engine::with_config(resolved, registry, config);
+    // Build interviewer based on --interviewer flag.
+    let interviewer: Arc<dyn Interviewer> = if args.interviewer.starts_with("timeout:") {
+        let secs: u64 = args.interviewer["timeout:".len()..]
+            .parse()
+            .map_err(|e| CliError::Other(format!("invalid timeout value: {e}")))?;
+        Arc::new(TimeoutInterviewer::new(
+            Arc::new(ConsoleInterviewer::from_stdio()),
+            std::time::Duration::from_secs(secs),
+        ))
+    } else if args.interviewer == "console" {
+        Arc::new(ConsoleInterviewer::from_stdio())
+    } else {
+        // "auto" mode: auto-approve (non-interactive)
+        Arc::new(AutoApproveInterviewer::new())
+    };
+
+    // Register interviewer-dependent handlers.
+    registry.register(Arc::new(InterviewerHandler::new(interviewer.clone())));
+    registry.register(Arc::new(HumanGateHandler::new(interviewer)));
+
+    // Register manager and tool handlers with LLM backends.
+    let manager_backend = Arc::new(crate::llm_backends::LlmManagerBackend::new(
+        Arc::clone(&client),
+        args.model.clone(),
+        effective_working_dir.clone(),
+    ));
+    registry.register(Arc::new(ManagerHandler::new(manager_backend)));
+
+    let tool_backend = Arc::new(crate::llm_backends::LlmToolBackend::new(
+        Arc::clone(&client),
+        args.model.clone(),
+        effective_working_dir.clone(),
+    ));
+    registry.register(Arc::new(ToolHandler::new(tool_backend)));
+
+    // Register parallel handler. The registry parameter is reserved for future
+    // engine-level parallel dispatch; the handler itself uses node attributes only.
+    registry.register(Arc::new(ParallelHandler::new(Arc::new(
+        smasher_attractor::handler::HandlerRegistry::new(),
+    ))));
+
+    let mut engine = Engine::with_config(resolved, registry, config);
+
+    // Apply sub-pipeline composition if any SubPipeline nodes exist.
+    let pipeline_dir = std::path::Path::new(&args.pipeline)
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    engine.apply_sub_pipeline_transform(&pipeline_dir)?;
     let context = Context::default();
 
     // Seed variables into the context.
@@ -540,5 +612,37 @@ mod tests {
     fn generate_run_id_is_lowercase() {
         let id = generate_run_id();
         assert_eq!(id, id.to_lowercase(), "ULID should be lowercase");
+    }
+
+    // ---- Interviewer flag tests ----
+
+    #[test]
+    fn interviewer_flag_defaults_to_auto() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert_eq!(cli.run.interviewer, "auto");
+    }
+
+    #[test]
+    fn interviewer_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--interviewer", "console", "pipeline.dot"]);
+        assert_eq!(cli.run.interviewer, "console");
+    }
+
+    #[test]
+    fn interviewer_timeout_flag_parsed() {
+        let cli = TestCli::parse_from(["test", "--interviewer", "timeout:30", "pipeline.dot"]);
+        assert_eq!(cli.run.interviewer, "timeout:30");
+    }
+
+    #[test]
+    fn skip_lint_flag_defaults_to_false() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert!(!cli.run.skip_lint);
+    }
+
+    #[test]
+    fn skip_lint_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--skip-lint", "pipeline.dot"]);
+        assert!(cli.run.skip_lint);
     }
 }

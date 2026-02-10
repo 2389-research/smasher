@@ -21,20 +21,20 @@ pub struct AppState {
     pub runs: Arc<RwLock<HashMap<String, RunRecord>>>,
     pub client: Arc<smasher_llm::client::Client>,
     pub default_model: String,
-    pub working_dir: String,
+    pub data_dir: String,
 }
 
 impl AppState {
     pub fn new(
         client: smasher_llm::client::Client,
         default_model: String,
-        working_dir: String,
+        data_dir: String,
     ) -> Self {
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
             client: Arc::new(client),
             default_model,
-            working_dir,
+            data_dir,
         }
     }
 }

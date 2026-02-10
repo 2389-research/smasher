@@ -77,7 +77,7 @@
 /// |----------------------------|--------------------------------------------------|
 /// | `-p`, `--port <PORT>`      | Port to listen on (default: 21541).              |
 /// | `-m`, `--model <MODEL>`    | Default LLM model for pipeline execution.        |
-/// | `-w`, `--working-dir <PATH>` | Working directory for agent file operations.    |
+/// | `--data-dir <PATH>`        | Data directory for run artifacts (default: ~/.smasher). |
 ///
 /// ### `smasher ingest`
 ///
@@ -89,6 +89,16 @@
 /// | `-o`, `--output <FILE>`    | Output file path. Writes to stdout if omitted.   |
 /// | `--model <MODEL>`          | Model identifier (default: `claude-sonnet-4-20250514`). |
 /// | `--skill <PATH>`           | Path to a custom skill file for LLM prompting.   |
+///
+/// ### `smasher lint`
+///
+/// Validate a DOT pipeline file with built-in lint rules.
+///
+/// | Argument / Flag            | Description                                      |
+/// |----------------------------|--------------------------------------------------|
+/// | `<PIPELINE>`               | Path to the DOT pipeline file (positional).      |
+/// | `--var <KEY=VALUE>`        | Variable assignment, repeatable.                 |
+/// | `--stylesheet <PATH>`      | Path to a stylesheet file for graph transforms.  |
 ///
 /// ## Exit Codes
 ///
@@ -182,6 +192,10 @@ mod tests {
         assert!(
             stdout.contains("ingest") || stdout.contains("Ingest"),
             "help should mention the ingest subcommand: {stdout}"
+        );
+        assert!(
+            stdout.contains("lint") || stdout.contains("Lint"),
+            "help should mention the lint subcommand: {stdout}"
         );
         assert!(
             stdout.contains("--verbose") || stdout.contains("-v"),
@@ -391,7 +405,7 @@ mod tests {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let expected_flags = ["--port", "--model", "--working-dir"];
+        let expected_flags = ["--port", "--model", "--data-dir"];
         for flag in &expected_flags {
             assert!(
                 stdout.contains(flag),
@@ -513,5 +527,61 @@ mod tests {
         use crate::error::CliError;
         let err = CliError::Web("bind failed".into());
         assert_eq!(err.exit_code(), 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // `smasher lint --help`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lint_help_exits_zero() {
+        let output = smasher_cmd()
+            .args(["lint", "--help"])
+            .output()
+            .expect("failed to run smasher lint --help");
+        assert!(output.status.success(), "smasher lint --help should exit 0");
+    }
+
+    #[test]
+    fn lint_help_contains_expected_flags() {
+        let output = smasher_cmd()
+            .args(["lint", "--help"])
+            .output()
+            .expect("failed to run smasher lint --help");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_flags = ["--var", "--stylesheet"];
+        for flag in &expected_flags {
+            assert!(
+                stdout.contains(flag),
+                "lint --help should mention {flag}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn lint_nonexistent_file_exits_six() {
+        let output = smasher_cmd()
+            .args(["lint", "/nonexistent_pipeline_file_that_does_not_exist.dot"])
+            .output()
+            .expect("failed to run smasher lint /nonexistent.dot");
+        assert!(
+            !output.status.success(),
+            "smasher lint with nonexistent file should exit non-zero"
+        );
+        let code = output.status.code().expect("process should have exit code");
+        assert_eq!(code, 6, "I/O error should map to exit code 6, got {code}");
+    }
+
+    #[test]
+    fn run_help_mentions_skip_lint() {
+        let output = smasher_cmd()
+            .args(["run", "--help"])
+            .output()
+            .expect("failed to run smasher run --help");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("--skip-lint"),
+            "run --help should mention --skip-lint: {stdout}"
+        );
     }
 }

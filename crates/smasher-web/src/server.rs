@@ -33,7 +33,19 @@ pub struct ServerConfig {
     pub port: u16,
     pub host: [u8; 4],
     pub model: String,
-    pub working_dir: String,
+    pub data_dir: String,
+}
+
+/// Return the default data directory for smasher (~/.smasher).
+///
+/// Override with SMASHER_DATA_DIR env var.
+pub fn default_data_dir() -> String {
+    if let Ok(dir) = std::env::var("SMASHER_DATA_DIR") {
+        return dir;
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".smasher").display().to_string())
+        .unwrap_or_else(|| ".smasher".into())
 }
 
 impl Default for ServerConfig {
@@ -51,21 +63,13 @@ impl Default for ServerConfig {
         let model =
             std::env::var("SMASHER_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
 
-        let working_dir = std::env::var("SMASHER_WORKING_DIR").unwrap_or_else(|_| {
-            std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".into())
-        });
-        let working_dir = std::path::Path::new(&working_dir)
-            .canonicalize()
-            .map(|p| p.display().to_string())
-            .unwrap_or(working_dir);
+        let data_dir = default_data_dir();
 
         Self {
             port,
             host,
             model,
-            working_dir,
+            data_dir,
         }
     }
 }
@@ -84,9 +88,9 @@ pub async fn run_with_config(config: ServerConfig) -> Result<(), Box<dyn std::er
         );
     }
 
-    tracing::info!(working_dir = %config.working_dir, model = %config.model, "agent configuration");
+    tracing::info!(data_dir = %config.data_dir, model = %config.model, "agent configuration");
 
-    let state = AppState::new(client, config.model, config.working_dir);
+    let state = AppState::new(client, config.model, config.data_dir);
     let app = build_router(state);
 
     let addr = SocketAddr::from((config.host, config.port));

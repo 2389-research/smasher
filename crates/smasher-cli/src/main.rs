@@ -1,5 +1,5 @@
-// ABOUTME: Entry point for the smasher CLI binary with eight subcommands.
-// ABOUTME: Routes to complete, chat, run, resume, render, serve, ingest, and archive.
+// ABOUTME: Entry point for the smasher CLI binary with nine subcommands.
+// ABOUTME: Routes to complete, chat, run, resume, render, serve, ingest, archive, and lint.
 
 mod archive;
 mod chat;
@@ -11,6 +11,8 @@ mod gitutil;
 mod ingest;
 #[cfg(test)]
 mod layout_check;
+mod lint;
+mod llm_backends;
 mod render;
 mod resume;
 mod run;
@@ -64,6 +66,9 @@ enum Command {
 
     /// Create a compressed archive of a run directory.
     Archive(archive::ArchiveArgs),
+
+    /// Validate a DOT pipeline file with lint rules.
+    Lint(lint::LintArgs),
 }
 
 fn main() {
@@ -121,6 +126,7 @@ fn main() {
             Command::Serve(args) => serve::run(args).await,
             Command::Ingest(args) => ingest::run(args).await,
             Command::Archive(args) => async { archive::run(args) }.await,
+            Command::Lint(args) => lint::run(args).await,
         }
     });
 

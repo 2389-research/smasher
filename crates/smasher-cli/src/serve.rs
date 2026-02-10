@@ -1,5 +1,5 @@
 // ABOUTME: CLI subcommand that starts the smasher-web dashboard server.
-// ABOUTME: Accepts --port, --model, and --working-dir to configure the web UI.
+// ABOUTME: Accepts --port, --model, and --data-dir to configure the web UI.
 
 use std::path::PathBuf;
 
@@ -19,9 +19,9 @@ pub struct ServeArgs {
     #[arg(long, short)]
     pub model: Option<String>,
 
-    /// Working directory for agent file operations.
-    #[arg(long, short)]
-    pub working_dir: Option<PathBuf>,
+    /// Data directory for run artifacts. Defaults to ~/.smasher.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 pub async fn run(args: ServeArgs) -> Result<(), CliError> {
@@ -29,7 +29,7 @@ pub async fn run(args: ServeArgs) -> Result<(), CliError> {
 
     let model = args.model.unwrap_or(defaults.model);
 
-    let working_dir = match args.working_dir {
+    let data_dir = match args.data_dir {
         Some(dir) => {
             let dir_str = dir.display().to_string();
             std::path::Path::new(&dir_str)
@@ -37,14 +37,14 @@ pub async fn run(args: ServeArgs) -> Result<(), CliError> {
                 .map(|p| p.display().to_string())
                 .unwrap_or(dir_str)
         }
-        None => defaults.working_dir,
+        None => defaults.data_dir,
     };
 
     let config = ServerConfig {
         port: args.port,
         host: defaults.host,
         model,
-        working_dir,
+        data_dir,
     };
 
     smasher_web::server::run_with_config(config)
