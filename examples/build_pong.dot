@@ -1,0 +1,110 @@
+// Build a Pong TUI game end-to-end using makeatron.
+// Exercises: stylesheet, goal gates, conditional branching, human review, retry.
+digraph build_pong {
+    graph [
+        goal="Build a two-player Pong TUI game in Go using ANSI escape codes and golang.org/x/term",
+        retry_target="implement",
+        default_max_retry=3,
+        model_stylesheet="
+            * { llm_model: claude-sonnet-4-5; llm_provider: anthropic; }
+            .code { llm_model: claude-opus-4-6; llm_provider: anthropic; }
+            .review { llm_model: claude-sonnet-4-5; llm_provider: anthropic; }
+            #plan { llm_model: claude-sonnet-4-5; llm_provider: anthropic; reasoning_effort: high; }
+        "
+    ]
+    rankdir=LR
+
+    // Terminal nodes
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    // Phase 1: Planning
+    plan [
+        label="Plan",
+        class="planning",
+        prompt="Plan a two-player Pong TUI game for: $goal.
+Design the architecture:
+- Single main.go file in Go
+- Use golang.org/x/term for raw terminal mode
+- ANSI escape codes for rendering (no ncurses/tcell)
+- Two paddles (W/S and Up/Down arrow keys)
+- Ball with float64 position for sub-character precision
+- Score tracking, first to 11 wins
+- 60fps game loop via time.Ticker
+Output a detailed plan with data structures, game loop design, and rendering approach."
+    ]
+
+    // Phase 2: Scaffold
+    scaffold [
+        label="Scaffold",
+        class="code",
+        prompt="Create the project structure for the Pong TUI game:
+1. Initialize a Go module at the working directory
+2. Run 'go mod init pong-tui'
+3. Run 'go get golang.org/x/term'
+4. Create an empty main.go with package main and a stub main() function
+Verify the module compiles with 'go build ./...'"
+    ]
+
+    // Phase 3: Implement (goal gate - must succeed for pipeline to complete)
+    implement [
+        label="Implement",
+        class="code",
+        prompt="Implement the full Pong TUI game in main.go based on the plan.
+Requirements:
+- Terminal raw mode via golang.org/x/term
+- Non-blocking input via goroutine reading stdin into a channel
+- Game state struct with paddles, ball, scores
+- Ball physics with float64 position and direction vectors
+- Paddle collision with spin based on contact point
+- Ball speed increases on paddle hits
+- ANSI rendering: blue P1 paddle, red P2 paddle, yellow ball
+- Center net made of pipe characters
+- Score display at top
+- Frame buffer via strings.Builder flushed in one write
+- Game over screen with restart option (R key)
+- Q or Escape to quit
+- First to 11 points wins
+Write the complete implementation.",
+        goal_gate=true,
+        max_retries=3
+    ]
+
+    // Phase 4: Compile check
+    compile [
+        label="Compile",
+        class="code",
+        prompt="Run 'go build -o pong .' in the working directory and report whether it succeeded. Then run 'go vet ./...' to check for issues. Report any compilation errors or vet warnings verbatim."
+    ]
+
+    // Phase 5: Compilation gate
+    compile_ok [shape=diamond, label="Compiles?"]
+
+    // Phase 6: LLM code review
+    review [
+        label="Review Code",
+        class="review",
+        prompt="Review all generated code in the working directory.\nCheck for: compilation/syntax, logic correctness, edge cases, readability, missing error handling.\nEnd your response with OUTCOME:PASS if acceptable, or OUTCOME:FAIL with details if issues need fixing."
+    ]
+
+    // Phase 7: Polish
+    polish [
+        label="Polish",
+        class="code",
+        prompt="Apply any feedback from the review. Clean up the code, ensure comments are clear, and verify the game handles edge cases like terminal resize gracefully."
+    ]
+
+    // Edges: main flow
+    start -> plan -> scaffold -> implement -> compile -> compile_ok
+
+    // Conditional: compile result
+    compile_ok -> review     [label="Pass", condition="outcome=success"]
+    compile_ok -> implement  [label="Fail", condition="outcome=fail"]
+
+    // Review outcome
+    review -> done   [label="Pass", condition="outcome=success"]
+    review -> polish [label="Fail", condition="outcome=fail"]
+
+    // Polish loops back to compile to re-verify
+    polish -> compile
+}

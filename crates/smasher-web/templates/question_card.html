@@ -1,0 +1,31 @@
+{% for q in questions %}
+<div class="question-card">
+    <div class="question-header">
+        <span class="question-kind">{{ q.kind_label }}</span>
+        <span class="question-id">{{ q.id }}</span>
+    </div>
+    <p class="question-text">{{ q.question }}</p>
+    {% if !q.choices.is_empty() %}
+    <div class="question-choices">
+        {% for choice in q.choices %}
+        <label class="choice-label">
+            <input type="radio" name="answer" value="{{ choice }}">
+            {{ choice }}
+        </label>
+        {% endfor %}
+    </div>
+    {% endif %}
+    <form hx-post="/api/runs/{{ run_id }}/questions/{{ q.id }}/answer"
+        hx-target="closest .question-card"
+        hx-swap="outerHTML"
+        class="answer-form">
+        {% if q.choices.is_empty() %}
+        <input type="text" name="answer" placeholder="Type your answer..." class="answer-input">
+        {% endif %}
+        <button type="submit" class="btn btn-primary btn-small">Submit</button>
+    </form>
+</div>
+{% endfor %}
+{% if questions.is_empty() %}
+<p class="empty-state">No pending questions.</p>
+{% endif %}

@@ -1,0 +1,38 @@
+[package]
+name = "smasher-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "smasher-web"
+path = "src/main.rs"
+
+[dependencies]
+smasher-llm.workspace = true
+smasher-agent.workspace = true
+smasher-attractor.workspace = true
+
+axum = { version = "0.8", features = ["macros"] }
+askama = "0.12"
+askama_axum = "0.4"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+async-stream = "0.3"
+futures.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tokio-test.workspace = true
+tower = "0.5"

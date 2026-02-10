@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block title %}SMASHER — Run{% endblock %}
+
+{% block content %}
+<div class="run-detail">
+    <div class="run-header">
+        <h2>Run {{ run.id }}</h2>
+        <div id="run-status" hx-get="/runs/{{ run.id }}/status" hx-trigger="every 5s">
+            {% include "run_status.html" %}
+        </div>
+        <div class="token-counter" id="token-counter"
+            hx-get="/runs/{{ run.id }}/tokens"
+            hx-trigger="every 3s"
+            hx-swap="innerHTML">
+            <div class="token-stat">
+                <span class="token-label">IN</span>
+                <span class="token-value">{{ initial_input_tokens }}</span>
+            </div>
+            <div class="token-stat">
+                <span class="token-label">OUT</span>
+                <span class="token-value">{{ initial_output_tokens }}</span>
+            </div>
+            <div class="token-stat token-total">
+                <span class="token-label">TOTAL</span>
+                <span class="token-value">{{ initial_input_tokens + initial_output_tokens }}</span>
+            </div>
+        </div>
+        {% if run.status == "Running" %}
+        <button class="btn btn-danger"
+            hx-post="/api/runs/{{ run.id }}/cancel"
+            hx-target="#run-status">
+            Abort
+        </button>
+        {% endif %}
+    </div>
+
+    <div class="run-stack">
+        <section class="events-section"
+            hx-ext="sse"
+            sse-connect="/api/runs/{{ run.id }}/events">
+            <h3>Event Stream</h3>
+            <div id="event-log" sse-swap="node_started,node_completed,node_failed,edge_traversed,pipeline_started,pipeline_completed,pipeline_aborted,loop_restarted,human_prompt_issued,human_response_received,context_updated,checkpoint_created,agent_tool_call_started,agent_tool_call_completed,agent_message,agent_turn_started"
+                hx-swap="afterbegin">
+                {{ historical_events|safe }}
+            </div>
+        </section>
+
+        <section class="graph-section">
+            <h3>Pipeline Graph</h3>
+            <div id="graph-container"
+                hx-get="/runs/{{ run.id }}/graph"
+                hx-trigger="load, every 3s"
+                hx-swap="innerHTML">
+            </div>
+        </section>
+
+        <section class="questions-section">
+            <h3>Human Input</h3>
+            <div id="question-list"
+                hx-get="/runs/{{ run.id }}/questions"
+                hx-trigger="every 2s">
+            </div>
+        </section>
+    </div>
+
+    <section class="run-meta">
+        <h3>Run Metadata</h3>
+        <dl>
+            <dt>Run ID</dt><dd>{{ run.id }}</dd>
+            <dt>Started</dt><dd>{{ run.started_at }}</dd>
+            {% match run.completed_at %}
+                {% when Some with (completed) %}
+                <dt>Completed</dt><dd>{{ completed }}</dd>
+                {% when None %}
+            {% endmatch %}
+            {% match run.error %}
+                {% when Some with (err) %}
+                <dt>Error</dt><dd class="error-text">{{ err }}</dd>
+                {% when None %}
+            {% endmatch %}
+        </dl>
+    </section>
+</div>
+{% endblock %}

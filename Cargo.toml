@@ -1,10 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "smasher-llm",
-    "smasher-agent",
-    "smasher-attractor",
-    "smasher-cli",
+    "crates/smasher-llm",
+    "crates/smasher-agent",
+    "crates/smasher-attractor",
+    "crates/smasher-cli",
+    "crates/smasher-web",
 ]
 
 [workspace.package]
@@ -62,6 +63,7 @@ tokio-test = "0.4"
 tempfile = "3"
 
 # Workspace crate cross-references
-smasher-llm = { path = "smasher-llm" }
-smasher-agent = { path = "smasher-agent" }
-smasher-attractor = { path = "smasher-attractor" }
+smasher-llm = { path = "crates/smasher-llm" }
+smasher-agent = { path = "crates/smasher-agent" }
+smasher-attractor = { path = "crates/smasher-attractor" }
+smasher-web = { path = "crates/smasher-web" }

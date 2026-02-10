@@ -11,10 +11,12 @@ A Rust implementation of [strongdm/attractor](https://github.com/strongdm/attrac
 1. **smasher-llm** — Unified LLM client (OpenAI Responses API, Anthropic Messages API, Gemini API)
 2. **smasher-agent** — Programmable coding agent loop with tools, steering, subagents
 3. **smasher-attractor** — DOT-based directed graph pipeline orchestrator
+4. **smasher-cli** — CLI binary (`smasher complete`, `smasher chat`, `smasher run`)
+5. **smasher-web** — HTMX dashboard for pipeline execution (axum + askama, port 21541)
 
 ## Architecture
 
-Cargo workspace, 3 crates. Each layer depends only on the one below it.
+Cargo workspace, 5 crates under `crates/`. Each layer depends only on the ones below it.
 
 ## Key Rust Patterns
 

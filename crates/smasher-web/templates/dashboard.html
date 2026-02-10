@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}SMASHER — Dashboard{% endblock %}
+
+{% block content %}
+<section class="submit-section">
+    <h2>Submit Pipeline</h2>
+    <form hx-post="/runs" hx-target="#main" class="submit-form">
+        <div class="form-group">
+            <label for="dot_source">DOT Source</label>
+            <div class="dot-source-header">
+                <label for="dot_file" class="btn btn-small dot-upload-btn">
+                    Upload .dot file
+                    <input type="file" id="dot_file" accept=".dot,.gv" hidden>
+                </label>
+                <span id="dot-file-name" class="dot-file-name"></span>
+            </div>
+            <textarea id="dot_source" name="dot_source" rows="10"
+                placeholder='digraph pipeline {
+    plan -> implement -> review
+    review -> implement [label="revise"]
+}'></textarea>
+        </div>
+        <script>
+            document.getElementById('dot_file').addEventListener('change', function(e) {
+                var file = e.target.files[0];
+                if (!file) return;
+                document.getElementById('dot-file-name').textContent = file.name;
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    document.getElementById('dot_source').value = ev.target.result;
+                };
+                reader.readAsText(file);
+            });
+        </script>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="model">Model (optional)</label>
+                <input type="text" id="model" name="model"
+                    placeholder="claude-sonnet-4-20250514">
+            </div>
+            <div class="form-group">
+                <label for="vars">Variables (key=value, one per line)</label>
+                <textarea id="vars" name="vars" rows="3" style="min-height: 80px"
+                    placeholder="project=myapp
+lang=rust"></textarea>
+            </div>
+        </div>
+        <button type="submit" class="btn btn-primary">Execute Pipeline</button>
+    </form>
+</section>
+
+<section class="runs-section">
+    <h2>Run History</h2>
+    <div id="run-list-container">
+        {% include "run_list.html" %}
+    </div>
+</section>
+{% endblock %}

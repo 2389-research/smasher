@@ -1,0 +1,27 @@
+<table class="run-table">
+    <thead>
+        <tr>
+            <th>Run ID</th>
+            <th>Graph</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for run in runs %}
+        <tr>
+            <td><a href="/runs/{{ run.id }}">{{ run.id }}</a></td>
+            <td>{% match run.graph_name %}{% when Some with (name) %}{{ name }}{% when None %}unnamed{% endmatch %}</td>
+            <td>{% include "run_status.html" %}</td>
+            <td>{{ run.started_at }}</td>
+            <td><a href="/runs/{{ run.id }}" class="btn btn-small">View</a></td>
+        </tr>
+        {% endfor %}
+        {% if runs.is_empty() %}
+        <tr>
+            <td colspan="5" class="empty-state">No runs yet. Submit a pipeline above.</td>
+        </tr>
+        {% endif %}
+    </tbody>
+</table>
