@@ -74,6 +74,11 @@
                 <dt>Completed</dt><dd>{{ completed }}</dd>
                 {% when None %}
             {% endmatch %}
+            {% match run.run_working_dir %}
+                {% when Some with (dir) %}
+                <dt>Working Directory</dt><dd>{{ dir }}</dd>
+                {% when None %}
+            {% endmatch %}
             {% match run.error %}
                 {% when Some with (err) %}
                 <dt>Error</dt><dd class="error-text">{{ err }}</dd>

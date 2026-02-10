@@ -55,6 +55,7 @@ pub struct RunRecord {
     pub error: Option<String>,
     pub input_tokens: Arc<AtomicU64>,
     pub output_tokens: Arc<AtomicU64>,
+    pub run_working_dir: Option<String>,
 }
 
 /// Serializable summary of a run for API responses.
@@ -68,6 +69,7 @@ pub struct RunSummary {
     pub error: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub run_working_dir: Option<String>,
 }
 
 impl RunRecord {
@@ -81,6 +83,7 @@ impl RunRecord {
             error: self.error.clone(),
             input_tokens: self.input_tokens.load(Ordering::Relaxed),
             output_tokens: self.output_tokens.load(Ordering::Relaxed),
+            run_working_dir: self.run_working_dir.clone(),
         }
     }
 }
@@ -109,6 +112,7 @@ mod tests {
             error: None,
             input_tokens: 0,
             output_tokens: 0,
+            run_working_dir: None,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["id"], "test-123");
@@ -127,6 +131,7 @@ mod tests {
             error: Some("node X failed".into()),
             input_tokens: 100,
             output_tokens: 50,
+            run_working_dir: None,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["error"], "node X failed");

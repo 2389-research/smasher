@@ -229,10 +229,28 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
+    // Create per-run artifact directory for isolation.
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let artifacts_base = std::path::Path::new(&working_dir).join("artifacts");
+    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let run_directory = smasher_attractor::run_dir::RunDirectory::create(
+        &artifacts_base,
+        &run_id,
+        &graph_name,
+        &dot_source,
+    )?;
+    let run_working_dir = run_directory
+        .manifest()
+        .directories
+        .root
+        .display()
+        .to_string();
+    eprintln!("Run directory: {run_working_dir}");
+
     let backend = Arc::new(AgentCodergenBackend::new(
         Arc::clone(&client),
         args.model.clone(),
-        working_dir,
+        run_working_dir,
     ));
     let mut registry = default_registry();
     registry.register(Arc::new(CodergenHandler::new(backend)));

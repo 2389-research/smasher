@@ -5,6 +5,7 @@ use smasher_agent::session::SessionError;
 use smasher_attractor::dot::parser::ParseError;
 use smasher_attractor::engine::EngineError;
 use smasher_attractor::graph::ResolutionError;
+use smasher_attractor::state::StateError;
 use smasher_attractor::stylesheet::StylesheetError;
 
 /// Unified error type for the smasher CLI.
@@ -31,6 +32,9 @@ pub enum CliError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    #[error("state error: {0}")]
+    State(#[from] StateError),
+
     #[error("web server error: {0}")]
     Web(String),
 
@@ -48,6 +52,7 @@ impl CliError {
             CliError::Resolution(_) | CliError::DotParse(_) | CliError::Stylesheet(_) => 5,
             CliError::Io(_) => 6,
             CliError::Web(_) => 7,
+            CliError::State(_) => 8,
             CliError::Other(_) => 1,
         }
     }

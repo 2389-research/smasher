@@ -200,6 +200,24 @@ async fn submit_run(
     transforms::apply_transforms(&mut resolved, &variables, None);
 
     let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Create per-run artifact directory for isolation.
+    let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
+    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let run_directory = smasher_attractor::run_dir::RunDirectory::create(
+        &artifacts_base,
+        &run_id,
+        &graph_name,
+        &form.dot_source,
+    )
+    .map_err(|e| WebError::Internal(format!("failed to create run directory: {e}")))?;
+    let run_working_dir = run_directory
+        .manifest()
+        .directories
+        .root
+        .display()
+        .to_string();
+
     let emitter = Arc::new(PipelineEventEmitter::default());
     let event_log = Arc::new(PipelineEventLog::new());
     let cancellation = CancellationToken::new();
@@ -222,6 +240,7 @@ async fn submit_run(
         error: None,
         input_tokens: Arc::clone(&input_tokens),
         output_tokens: Arc::clone(&output_tokens),
+        run_working_dir: Some(run_working_dir.clone()),
     };
 
     {
@@ -252,7 +271,7 @@ async fn submit_run(
         let backend = Arc::new(AgentCodergenBackend::new(
             Arc::clone(&client),
             model.clone(),
-            state.working_dir.clone(),
+            run_working_dir,
             input_tokens,
             output_tokens,
             Arc::clone(&emitter),

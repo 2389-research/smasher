@@ -34,5 +34,6 @@ async-trait.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
+tempfile.workspace = true
 tokio-test.workspace = true
 tower = "0.5"

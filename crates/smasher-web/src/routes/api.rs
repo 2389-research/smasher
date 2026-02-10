@@ -45,6 +45,7 @@ pub struct SubmitRequest {
 pub struct SubmitResponse {
     pub run_id: String,
     pub status: String,
+    pub run_working_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +110,24 @@ async fn submit_pipeline(
     transforms::apply_transforms(&mut resolved, &variables, None);
 
     let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Create per-run artifact directory for isolation.
+    let artifacts_base = std::path::Path::new(&state.working_dir).join("artifacts");
+    let graph_name = resolved.name.clone().unwrap_or_else(|| "unnamed".into());
+    let run_directory = smasher_attractor::run_dir::RunDirectory::create(
+        &artifacts_base,
+        &run_id,
+        &graph_name,
+        &req.dot_source,
+    )
+    .map_err(|e| WebError::Internal(format!("failed to create run directory: {e}")))?;
+    let run_working_dir = run_directory
+        .manifest()
+        .directories
+        .root
+        .display()
+        .to_string();
+
     let emitter = Arc::new(PipelineEventEmitter::default());
     let event_log = Arc::new(PipelineEventLog::new());
     let cancellation = CancellationToken::new();
@@ -131,6 +150,7 @@ async fn submit_pipeline(
         error: None,
         input_tokens: Arc::clone(&input_tokens),
         output_tokens: Arc::clone(&output_tokens),
+        run_working_dir: Some(run_working_dir.clone()),
     };
 
     {
@@ -157,11 +177,12 @@ async fn submit_pipeline(
     let run_id_clone = run_id.clone();
     let runs = Arc::clone(&state.runs);
     let client = Arc::clone(&state.client);
+    let spawn_working_dir = run_working_dir.clone();
     tokio::spawn(async move {
         let backend = Arc::new(AgentCodergenBackend::new(
             Arc::clone(&client),
             model.clone(),
-            state.working_dir.clone(),
+            spawn_working_dir,
             input_tokens,
             output_tokens,
             Arc::clone(&emitter),
@@ -202,6 +223,7 @@ async fn submit_pipeline(
     Ok(Json(SubmitResponse {
         run_id,
         status: "Running".into(),
+        run_working_dir: Some(run_working_dir),
     }))
 }
 
@@ -425,7 +447,13 @@ mod tests {
 
     #[tokio::test]
     async fn submit_valid_dot_creates_run() {
-        let state = test_state();
+        let tmp = tempfile::tempdir().unwrap();
+        let client = smasher_llm::client::Client::from_env();
+        let state = AppState::new(
+            client,
+            "test-model".into(),
+            tmp.path().display().to_string(),
+        );
         let app = router().with_state(state.clone());
         let body = serde_json::json!({
             "dot_source": "digraph { a -> b }",
@@ -446,6 +474,11 @@ mod tests {
         let parsed: SubmitResponse = serde_json::from_slice(&body).unwrap();
         assert!(!parsed.run_id.is_empty());
         assert_eq!(parsed.status, "Running");
+
+        // Verify per-run working directory is returned and contains the run ID.
+        assert!(parsed.run_working_dir.is_some());
+        let dir = parsed.run_working_dir.unwrap();
+        assert!(dir.contains(&parsed.run_id));
 
         // Verify the run exists in state.
         let runs = state.runs.read().await;
