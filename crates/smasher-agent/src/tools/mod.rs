@@ -57,23 +57,43 @@ pub trait AgentTool: Send + Sync {
     async fn execute(&self, arguments: &str) -> ToolOutput;
 }
 
+/// Default output character limit for tools not listed in the per-tool map.
+const DEFAULT_OUTPUT_LIMIT: usize = 100_000;
+
+/// Spec-defined per-tool output truncation limits.
+fn default_tool_output_limits() -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    m.insert("read_file".to_string(), 50_000);
+    m.insert("shell".to_string(), 30_000);
+    m.insert("grep".to_string(), 20_000);
+    m.insert("glob_files".to_string(), 20_000);
+    m.insert("edit_file".to_string(), 10_000);
+    m.insert("write_file".to_string(), 10_000);
+    m.insert("apply_patch".to_string(), 10_000);
+    m
+}
+
 /// Registry that holds available tools and dispatches execution requests.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn AgentTool>>,
     /// Maximum output length in bytes before truncation is applied.
     max_output_chars: usize,
+    /// Per-tool output character limits. Tools not in this map use `max_output_chars`.
+    tool_output_limits: HashMap<String, usize>,
 }
 
 impl ToolRegistry {
-    /// Create a new empty registry with default max output length of 100,000 characters.
+    /// Create a new empty registry with spec-defined per-tool output limits.
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
-            max_output_chars: 100_000,
+            max_output_chars: DEFAULT_OUTPUT_LIMIT,
+            tool_output_limits: default_tool_output_limits(),
         }
     }
 
-    /// Set the maximum output character limit (builder pattern).
+    /// Set the default maximum output character limit (builder pattern).
+    /// This only affects tools without a per-tool limit.
     pub fn with_max_output_chars(mut self, max: usize) -> Self {
         self.max_output_chars = max;
         self
@@ -109,7 +129,16 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Execute a tool by name, applying output truncation if needed.
+    /// Return the output character limit for a specific tool.
+    /// Falls back to the default limit if no per-tool limit is configured.
+    pub fn output_limit_for(&self, tool_name: &str) -> usize {
+        self.tool_output_limits
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.max_output_chars)
+    }
+
+    /// Execute a tool by name, applying per-tool output truncation if needed.
     ///
     /// Returns an error `ToolOutput` if the tool is not found.
     pub async fn execute(&self, name: &str, arguments: &str) -> ToolOutput {
@@ -122,8 +151,9 @@ impl ToolRegistry {
 
         let mut output = tool.execute(arguments).await;
 
-        if output.content.len() > self.max_output_chars {
-            output.content = truncate_output(&output.content, self.max_output_chars);
+        let limit = self.output_limit_for(name);
+        if output.content.len() > limit {
+            output.content = truncate_output(&output.content, limit);
         }
 
         output
@@ -191,6 +221,32 @@ mod tests {
 
         fn description(&self) -> &str {
             "Produces large output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _arguments: &str) -> ToolOutput {
+            let content = "x".repeat(self.output_size);
+            ToolOutput::success(content, 5)
+        }
+    }
+
+    /// Test tool that produces output of a configurable size and has a configurable name.
+    struct NamedBigOutputTool {
+        tool_name: &'static str,
+        output_size: usize,
+    }
+
+    #[async_trait]
+    impl AgentTool for NamedBigOutputTool {
+        fn name(&self) -> &str {
+            self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "Produces large output with a custom name"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -295,6 +351,78 @@ mod tests {
             "output len {} should be near max 200",
             output.content.len()
         );
+    }
+
+    #[test]
+    fn output_limit_for_returns_spec_defaults() {
+        let registry = ToolRegistry::new();
+
+        assert_eq!(registry.output_limit_for("read_file"), 50_000);
+        assert_eq!(registry.output_limit_for("shell"), 30_000);
+        assert_eq!(registry.output_limit_for("grep"), 20_000);
+        assert_eq!(registry.output_limit_for("glob_files"), 20_000);
+        assert_eq!(registry.output_limit_for("edit_file"), 10_000);
+        assert_eq!(registry.output_limit_for("write_file"), 10_000);
+        assert_eq!(registry.output_limit_for("apply_patch"), 10_000);
+    }
+
+    #[test]
+    fn output_limit_for_unknown_tool_returns_default() {
+        let registry = ToolRegistry::new();
+        assert_eq!(registry.output_limit_for("some_unknown_tool"), 100_000);
+    }
+
+    #[tokio::test]
+    async fn execute_applies_per_tool_limit_for_read_file() {
+        let mut registry = ToolRegistry::new();
+        // read_file limit is 50_000, so 60_000 chars should be truncated
+        registry.register(NamedBigOutputTool {
+            tool_name: "read_file",
+            output_size: 60_000,
+        });
+
+        let output = registry.execute("read_file", "{}").await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("[... truncated"));
+        assert!(
+            output.content.len() <= 55_000,
+            "read_file output len {} should be near max 50000",
+            output.content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_applies_per_tool_limit_for_shell() {
+        let mut registry = ToolRegistry::new();
+        // shell limit is 30_000, so 40_000 chars should be truncated
+        registry.register(NamedBigOutputTool {
+            tool_name: "shell",
+            output_size: 40_000,
+        });
+
+        let output = registry.execute("shell", "{}").await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("[... truncated"));
+        assert!(
+            output.content.len() <= 35_000,
+            "shell output len {} should be near max 30000",
+            output.content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_truncate_within_per_tool_limit() {
+        let mut registry = ToolRegistry::new();
+        // read_file limit is 50_000, output of 40_000 should NOT be truncated
+        registry.register(NamedBigOutputTool {
+            tool_name: "read_file",
+            output_size: 40_000,
+        });
+
+        let output = registry.execute("read_file", "{}").await;
+        assert!(!output.is_error);
+        assert!(!output.content.contains("[... truncated"));
+        assert_eq!(output.content.len(), 40_000);
     }
 
     #[test]
