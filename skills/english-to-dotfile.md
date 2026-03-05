@@ -49,7 +49,7 @@ Smasher maps DOT node shapes to handler types:
 - `shape` — Determines the handler type (see table above)
 - `prompt` — Instructions for LLM agent nodes (Codergen). This is the system-level instruction that tells the agent what to do.
 - `model` — Override the LLM model for this specific node (e.g., `"claude-sonnet-4-20250514"`, `"claude-opus-4-6"`)
-- `condition` — For Conditional nodes, the expression to evaluate (e.g., `"status=ready"`)
+- `condition` — **REQUIRED** for Conditional (diamond) nodes. The boolean expression to evaluate against the pipeline context. Examples: `"outcome=success"`, `"status=ready"`, `"count>3"`, `"valid=true&&complete=true"`. Supported operators: `=`, `!=`, `>`, `<`, `&&`, `||`, `!`, parentheses. Without this attribute, the pipeline will fail at the conditional node.
 - `question` — For Manager/Interviewer nodes, the question to present to the human
 - `goal_gate` — Boolean. When `true`, this node must succeed for the pipeline to be considered successful
 - `class` — CSS-like class for stylesheet targeting (e.g., `"code"`, `"review"`, `"planning"`)
@@ -84,13 +84,21 @@ start -> step1 -> step2 -> exit
 
 ### Conditional Branching
 ```
+check [shape=diamond, label="Check Result", condition="outcome=success"]
+
 start -> work -> check
 check -> success_exit [label="success"]
 check -> failure_exit [label="failure"]
 ```
 
+The `condition` attribute on the diamond node tells the engine what to evaluate.
+When the condition is true the node returns "success"; when false it returns "failure".
+The edge `label` values (`"success"` / `"failure"`) match against that outcome.
+
 ### Retry Loop
 ```
+check [shape=diamond, label="Tests Pass?", condition="outcome=success"]
+
 start -> attempt -> check
 check -> done [label="success"]
 check -> attempt [label="failure", loop_restart=true]
@@ -122,7 +130,7 @@ review_gate -> implement [label="Fail", loop_restart=true]
    - Expected format of output
    - Reference to previous pipeline steps where relevant (use `$variable` syntax)
 
-4. **Use conditions for branching.** When the pipeline needs to make decisions, use a `diamond` conditional node with appropriate `condition` attributes on outgoing edges.
+4. **Use conditions for branching.** Every `diamond` conditional node **MUST** have a `condition` attribute on the node itself (e.g., `condition="outcome=success"`). This tells the engine what to evaluate. The outgoing edges then use `label="success"` and `label="failure"` to match the evaluation outcome. Without a `condition` attribute the pipeline will fail.
 
 5. **Add human gates for safety.** If the requirements mention review, approval, or human oversight, use a Manager or Interviewer node.
 
@@ -164,7 +172,7 @@ digraph build_calculator {
         prompt="Write and run tests for the calculator. Test each operation, edge cases (division by zero, large numbers), and UI interactions. Report results clearly."
     ]
 
-    test_ok [shape=diamond, label="Tests Pass?"]
+    test_ok [shape=diamond, label="Tests Pass?", condition="outcome=success"]
 
     review [
         shape=box,
@@ -174,10 +182,10 @@ digraph build_calculator {
     ]
 
     start -> plan -> implement -> test -> test_ok
-    test_ok -> review    [label="Pass", condition="outcome=success"]
-    test_ok -> implement [label="Fail", condition="outcome=fail", loop_restart=true]
+    test_ok -> review    [label="success"]
+    test_ok -> implement [label="failure", loop_restart=true]
     review -> done   [label="Pass", condition="outcome=success"]
-    review -> implement [label="Fail", condition="outcome=fail", loop_restart=true]
+    review -> implement [label="Fail", condition="outcome=failure", loop_restart=true]
     implement -> failed [label="max_retries_exceeded"]
 }
 ```
@@ -191,7 +199,8 @@ Before outputting your digraph, verify:
 - [ ] At least one exit node (shape=doublecircle or shape=Msquare)
 - [ ] All nodes have a `label` attribute
 - [ ] All Codergen nodes (shape=box) have a `prompt` attribute
-- [ ] All Conditional nodes (shape=diamond) have edges for both outcomes
+- [ ] All Conditional nodes (shape=diamond) have a `condition` attribute on the node itself
+- [ ] All Conditional nodes have outgoing edges labeled `"success"` and `"failure"`
 - [ ] All node IDs are valid snake_case identifiers (letters, digits, underscores)
 - [ ] All string values are properly quoted with double quotes
 - [ ] The graph is connected (every node reachable from start)

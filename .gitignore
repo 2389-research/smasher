@@ -1,4 +1,6 @@
 /target
+/bin/
+/artifacts/
 .scratch/
 .env
 .workgraph/
