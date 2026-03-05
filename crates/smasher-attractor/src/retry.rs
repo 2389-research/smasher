@@ -27,7 +27,7 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            max_attempts: 1,
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
             jitter: true,
@@ -47,16 +47,20 @@ impl RetryPolicy {
     /// Extract retry configuration from a graph node's attributes.
     ///
     /// Recognized attributes:
-    /// - `retries` (Number): number of retries; max_attempts = retries + 1
+    /// - `max_retries` (Number): number of retries; max_attempts = max_retries + 1
+    /// - `retries` (Number): legacy alias for max_retries (backward compat)
     /// - `retry_delay` (Duration): base delay between retries
     /// - `max_retry_delay` (Duration): upper bound on delay
     /// - `retry_jitter` (Bool): whether to apply randomized jitter
     ///
+    /// When both `max_retries` and `retries` are present, `max_retries` wins.
     /// Any missing attribute falls back to the default value.
     pub fn from_node(node: &GraphNode) -> RetryPolicy {
         let mut policy = RetryPolicy::default();
 
-        if let Some(NodeAttrValue::Number(n)) = node.attrs.get("retries") {
+        if let Some(NodeAttrValue::Number(n)) = node.attrs.get("max_retries") {
+            policy.max_attempts = (*n as u32) + 1;
+        } else if let Some(NodeAttrValue::Number(n)) = node.attrs.get("retries") {
             policy.max_attempts = (*n as u32) + 1;
         }
 
@@ -165,7 +169,7 @@ mod tests {
     #[test]
     fn default_policy_has_expected_values() {
         let policy = RetryPolicy::default();
-        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_attempts, 1);
         assert_eq!(policy.base_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(30));
         assert!(policy.jitter);
@@ -234,7 +238,7 @@ mod tests {
         let node = make_node(attrs);
         let policy = RetryPolicy::from_node(&node);
 
-        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_attempts, 1);
         assert_eq!(policy.base_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(30));
         assert!(policy.jitter);
@@ -447,7 +451,7 @@ mod tests {
         let policy = RetryPolicy::from_node(&node);
 
         // All should remain at defaults since types didn't match
-        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_attempts, 1);
         assert_eq!(policy.base_delay, Duration::from_secs(1));
         assert_eq!(policy.max_delay, Duration::from_secs(30));
         assert!(policy.jitter);
@@ -493,5 +497,43 @@ mod tests {
         let state = RetryState::new();
         assert_eq!(state.attempts, 0);
         assert!(state.last_error.is_none());
+    }
+
+    // ---- Test 19: Default policy has zero retries (1 attempt) per spec ----
+    #[test]
+    fn default_retry_policy_has_zero_retries() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_attempts, 1); // 0 retries = 1 attempt
+    }
+
+    // ---- Test 20: from_node reads max_retries attribute per spec ----
+    #[test]
+    fn from_node_reads_max_retries_attribute() {
+        let mut attrs = HashMap::new();
+        attrs.insert("max_retries".to_string(), NodeAttrValue::Number(5.0));
+        let node = make_node(attrs);
+        let policy = RetryPolicy::from_node(&node);
+        assert_eq!(policy.max_attempts, 6); // 5 retries = 6 attempts
+    }
+
+    // ---- Test 21: max_retries takes precedence over retries ----
+    #[test]
+    fn from_node_max_retries_takes_precedence_over_retries() {
+        let mut attrs = HashMap::new();
+        attrs.insert("max_retries".to_string(), NodeAttrValue::Number(7.0));
+        attrs.insert("retries".to_string(), NodeAttrValue::Number(2.0));
+        let node = make_node(attrs);
+        let policy = RetryPolicy::from_node(&node);
+        assert_eq!(policy.max_attempts, 8); // max_retries wins: 7 + 1
+    }
+
+    // ---- Test 22: legacy retries attribute still works for backward compat ----
+    #[test]
+    fn from_node_legacy_retries_still_works() {
+        let mut attrs = HashMap::new();
+        attrs.insert("retries".to_string(), NodeAttrValue::Number(3.0));
+        let node = make_node(attrs);
+        let policy = RetryPolicy::from_node(&node);
+        assert_eq!(policy.max_attempts, 4); // 3 retries = 4 attempts
     }
 }
