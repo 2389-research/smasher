@@ -44,31 +44,46 @@ fn node_type_to_shape(node_type: &NodeType) -> &'static str {
 }
 
 /// Convert a `GraphNode` to a JSON object with `id`, `shape`, and all extra attrs.
+///
+/// Attrs are inserted first so that canonical fields (`id`, `shape`, `label`) always
+/// win if an untrusted attr tries to overwrite a structural key.
 fn node_to_json(node: &GraphNode) -> Value {
     let mut obj = serde_json::Map::new();
+
+    // Insert untrusted attrs first so canonical fields can overwrite them.
+    for (key, val) in &node.attrs {
+        obj.insert(key.clone(), node_attr_value_to_json(val));
+    }
+
+    // Canonical fields are inserted last and always win.
     obj.insert("id".to_string(), json!(node.id));
     obj.insert(
         "shape".to_string(),
         json!(node_type_to_shape(&node.node_type)),
     );
-
     if let Some(ref label) = node.label {
         obj.insert("label".to_string(), json!(label));
-    }
-
-    for (key, val) in &node.attrs {
-        obj.insert(key.clone(), node_attr_value_to_json(val));
     }
 
     Value::Object(obj)
 }
 
 /// Convert a `GraphEdge` to a JSON object with `from`, `to`, and all metadata.
+///
+/// Attrs are inserted first so that canonical fields (`from`, `to`, `label`,
+/// `condition`, `priority`) always win if an untrusted attr tries to overwrite
+/// a structural key.
 fn edge_to_json(edge: &GraphEdge) -> Value {
     let mut obj = serde_json::Map::new();
+
+    // Insert untrusted attrs first so canonical fields can overwrite them.
+    for (key, val) in &edge.attrs {
+        obj.insert(key.clone(), node_attr_value_to_json(val));
+    }
+
+    // Canonical fields are inserted last and always win.
     obj.insert("from".to_string(), json!(edge.from));
     obj.insert("to".to_string(), json!(edge.to));
-
     if let Some(ref label) = edge.label {
         obj.insert("label".to_string(), json!(label));
     }
@@ -77,10 +92,6 @@ fn edge_to_json(edge: &GraphEdge) -> Value {
     }
     if let Some(priority) = edge.priority {
         obj.insert("priority".to_string(), json!(priority));
-    }
-
-    for (key, val) in &edge.attrs {
-        obj.insert(key.clone(), node_attr_value_to_json(val));
     }
 
     Value::Object(obj)
@@ -383,6 +394,72 @@ mod tests {
                 expected_shape,
             );
         }
+    }
+
+    #[test]
+    fn node_canonical_fields_win_over_attrs() {
+        // An attr with a key matching a canonical field must not overwrite it.
+        let node = GraphNode {
+            id: "real_id".to_string(),
+            node_type: NodeType::Codergen,
+            label: Some("real_label".to_string()),
+            attrs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "id".to_string(),
+                    NodeAttrValue::String("evil_id".to_string()),
+                );
+                m.insert(
+                    "shape".to_string(),
+                    NodeAttrValue::String("evil_shape".to_string()),
+                );
+                m.insert(
+                    "label".to_string(),
+                    NodeAttrValue::String("evil_label".to_string()),
+                );
+                m
+            },
+        };
+        let json = node_to_json(&node);
+        assert_eq!(json["id"], "real_id");
+        assert_eq!(json["shape"], "box");
+        assert_eq!(json["label"], "real_label");
+    }
+
+    #[test]
+    fn edge_canonical_fields_win_over_attrs() {
+        // An attr with a key matching a canonical field must not overwrite it.
+        let edge = GraphEdge {
+            from: "real_from".to_string(),
+            to: "real_to".to_string(),
+            label: Some("real_label".to_string()),
+            condition: Some("real_condition".to_string()),
+            priority: Some(5),
+            loop_restart: false,
+            attrs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "from".to_string(),
+                    NodeAttrValue::String("evil_from".to_string()),
+                );
+                m.insert(
+                    "to".to_string(),
+                    NodeAttrValue::String("evil_to".to_string()),
+                );
+                m.insert(
+                    "condition".to_string(),
+                    NodeAttrValue::String("evil_condition".to_string()),
+                );
+                m.insert("priority".to_string(), NodeAttrValue::Number(999.0));
+                m
+            },
+        };
+        let json = edge_to_json(&edge);
+        assert_eq!(json["from"], "real_from");
+        assert_eq!(json["to"], "real_to");
+        assert_eq!(json["label"], "real_label");
+        assert_eq!(json["condition"], "real_condition");
+        assert_eq!(json["priority"], 5);
     }
 
     #[test]

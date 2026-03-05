@@ -168,7 +168,8 @@ pub async fn run(dotfile: &Path) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&json).expect("JSON serialization failed")
             );
-            0
+            // Propagate pipeline failure status as a non-zero exit code.
+            if json["status"] == "failure" { 1 } else { 0 }
         }
         Err(e) => {
             eprintln!("pipeline execution error: {e}");

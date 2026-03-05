@@ -54,7 +54,11 @@ fn error_to_type(err: &smasher_llm::types::Error) -> &'static str {
 }
 
 /// Normalize message content fields: the conformance contract sends `"content": "string"`
-/// but smasher expects `"content": [{"kind": "text", "text": "string"}]`.
+/// but smasher expects content as an array of typed content parts.
+///
+/// For `role: "tool"` messages, string content becomes `{"kind": "tool_result", ...}` with the
+/// message's `tool_call_id` preserved. For all other roles, string content becomes
+/// `{"kind": "text", "text": "string"}`.
 fn normalize_message_content(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut()
         && let Some(messages) = obj.get_mut("messages")
@@ -66,10 +70,29 @@ fn normalize_message_content(value: &mut serde_json::Value) {
                 && let Some(text) = content.as_str()
             {
                 let text = text.to_string();
-                msg_obj.insert(
-                    "content".to_string(),
-                    json!([{"kind": "text", "text": text}]),
-                );
+                let role = msg_obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let normalized = if role == "tool" {
+                    let tool_call_id = msg_obj
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    json!([{
+                        "kind": "tool_result",
+                        "tool_call_id": tool_call_id,
+                        "content": text,
+                        "is_error": false
+                    }])
+                } else {
+                    json!([{"kind": "text", "text": text}])
+                };
+
+                msg_obj.insert("content".to_string(), normalized);
             }
         }
     }
@@ -85,9 +108,17 @@ fn normalize_tools(value: &mut serde_json::Value) {
         for tool in arr.iter_mut() {
             if let Some(tool_obj) = tool.as_object_mut()
                 && tool_obj.get("type").and_then(|v| v.as_str()) == Some("function")
-                && let Some(func) = tool_obj.remove("function")
-                && let Some(func_obj) = func.as_object()
+                && tool_obj
+                    .get("function")
+                    .and_then(|v| v.as_object())
+                    .is_some()
             {
+                // Safe to remove now that we have confirmed `function` is an object.
+                let func_val = tool_obj
+                    .remove("function")
+                    .expect("confirmed present above");
+                let func_obj = func_val.as_object().expect("confirmed object above");
+
                 let mut new_tool = serde_json::Map::new();
                 if let Some(name) = func_obj.get("name") {
                     new_tool.insert("name".to_string(), name.clone());

@@ -30,9 +30,10 @@ pub async fn session_create() -> i32 {
     let config = SessionConfig::default();
     let registry = ToolRegistry::new();
     let emitter = EventEmitter::default();
-    let _session = Session::new(config, client, registry, emitter);
+    let session = Session::new(config, client, registry, emitter);
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Use the session's own ID rather than generating a separate UUID.
+    let session_id = session.session_id().to_string();
     let output = json!({
         "session_id": session_id,
         "status": "created",
@@ -71,6 +72,11 @@ pub async fn process_input() -> i32 {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // If _test_base_url is provided, validate it as a URL
     if let Some(base_url) = parsed.get("_test_base_url").and_then(|v| v.as_str())
         && !base_url.starts_with("http://")
@@ -90,7 +96,10 @@ pub async fn process_input() -> i32 {
     if let Some(sp) = system_prompt {
         config = config.with_system_prompt(sp);
     }
-    config = config.with_model("gpt-4o");
+    // Only set the model when explicitly provided; otherwise let the config default apply.
+    if let Some(m) = model {
+        config = config.with_model(m);
+    }
     config = config.with_stream(false);
     config = config.with_max_turns(10);
 
@@ -248,7 +257,7 @@ pub async fn events() -> i32 {
     let client = Arc::new(Client::from_env());
 
     let mut config = SessionConfig::default();
-    config = config.with_model("gpt-4o");
+    // Do not hardcode a model here; let the SessionConfig default apply.
     config = config.with_stream(false);
     config = config.with_max_turns(10);
 
@@ -264,7 +273,7 @@ pub async fn events() -> i32 {
     // Spawn the session task
     let session_handle = tokio::spawn(async move { session.process_input("Say hello").await });
 
-    // Collect events with a timeout
+    // Collect events with a per-event timeout
     let mut events = Vec::new();
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
@@ -276,8 +285,14 @@ pub async fn events() -> i32 {
         }
     }
 
-    // Wait for session to finish
-    let _ = session_handle.await;
+    // Wait for the session task to finish with a hard deadline.  If it hangs,
+    // abort it to avoid stalling indefinitely.
+    match tokio::time::timeout(std::time::Duration::from_secs(60), session_handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!("events: session task timed out after 60 seconds");
+        }
+    }
 
     if events.len() < 3 {
         eprintln!("events: expected at least 3 events, got {}", events.len());

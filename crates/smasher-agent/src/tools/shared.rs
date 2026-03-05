@@ -99,7 +99,7 @@ impl AgentTool for ReadFileTool {
                 let total = all_lines.len();
                 // offset is 1-based, convert to 0-based index
                 let start_idx = (offset - 1).min(total);
-                let end_idx = (start_idx + limit).min(total);
+                let end_idx = start_idx.saturating_add(limit).min(total);
                 let selected = &all_lines[start_idx..end_idx];
 
                 // Determine width for right-aligned line numbers
@@ -821,6 +821,25 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn read_file_saturating_add_does_not_overflow() {
+        // offset + limit would overflow usize if added naively; saturating_add must clamp.
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/small.txt", "line1\nline2\nline3"));
+        let tool = ReadFileTool::new(env);
+
+        // offset=1, limit=usize::MAX — the slice must be clamped to the file length, not panic.
+        let args = format!(
+            r#"{{"path": "/test/small.txt", "offset": 1, "limit": {}}}"#,
+            usize::MAX
+        );
+        let result = tool.execute(&args).await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains("1 | line1"));
+        assert!(result.content.contains("3 | line3"));
     }
 
     // -- WriteFileTool tests --
