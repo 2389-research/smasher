@@ -54,29 +54,88 @@ fn has_explicit_condition(edge: &GraphEdge) -> bool {
     }
 }
 
-/// Select the best outgoing edge from a node using the 5-step priority algorithm.
+/// Normalize a label for comparison during preferred-label matching.
+///
+/// Normalization steps:
+/// 1. Trim whitespace
+/// 2. Strip accelerator prefixes: `[X] `, `X) `, `X - `
+/// 3. Lowercase
+pub fn normalize_label(label: &str) -> String {
+    let trimmed = label.trim();
+
+    let stripped = strip_accelerator_prefix(trimmed);
+
+    stripped.to_lowercase()
+}
+
+/// Strip common accelerator prefixes from a label.
+///
+/// Recognized patterns:
+/// - `[X] rest` — single char in brackets followed by optional space
+/// - `X) rest` — single char followed by `)` and optional space
+/// - `X - rest` — single char followed by ` - `
+fn strip_accelerator_prefix(s: &str) -> &str {
+    let bytes = s.as_bytes();
+
+    // Pattern: [X] rest (or [X]rest)
+    if bytes.len() >= 3 && bytes[0] == b'[' && bytes[2] == b']' {
+        let rest = &s[3..];
+        return if rest.starts_with(' ') {
+            &rest[1..]
+        } else {
+            rest
+        };
+    }
+
+    // Pattern: X) rest (or X)rest)
+    if bytes.len() >= 2 && bytes[1] == b')' {
+        let rest = &s[2..];
+        return if rest.starts_with(' ') {
+            &rest[1..]
+        } else {
+            rest
+        };
+    }
+
+    // Pattern: X - rest
+    if bytes.len() >= 4 && &s[1..4] == " - " {
+        return &s[4..];
+    }
+
+    s
+}
+
+/// Select the best outgoing edge from a node using the spec-compliant 5-step
+/// deterministic edge selection algorithm.
 ///
 /// Steps:
-/// 1. Gather all outgoing edges from `node_id`
-/// 2. Evaluate conditions: filter out edges whose conditions are false
-/// 3. Apply outcome-based filtering if a matching edge exists
-/// 4. Sort remaining edges by priority (descending, default 0)
-/// 5. Return the highest-priority edge, or None if no candidates remain
+/// 1. **Condition matching**: Edges with explicit conditions that evaluate to TRUE.
+///    If any match, use ONLY those (unconditional edges are excluded).
+/// 2. **Preferred label match**: From `outcome.preferred_label()`, match against
+///    edge labels using normalized comparison.
+/// 3. **Suggested next IDs**: From `outcome.suggested_next_ids()`, match against
+///    edge target node IDs.
+/// 4. **Weight/priority selection**: Sort remaining unconditional edges by priority
+///    descending.
+/// 5. **Lexical tiebreak**: Among equal-priority edges, sort by target node ID
+///    alphabetically ascending.
+///
+/// Steps 2-5 only operate on unconditional edges (edges without explicit conditions).
 pub fn select_edge<'a>(
     graph: &'a Graph,
     node_id: &str,
     context: &Context,
     last_outcome: Option<&Outcome>,
 ) -> Result<Option<&'a GraphEdge>, EdgeSelectionError> {
-    // Step 1: Gather candidates
     let candidates = graph.edges_from(node_id);
     if candidates.is_empty() {
         return Ok(None);
     }
 
-    // Step 2: Evaluate conditions
+    // Partition edges into conditional (explicit condition) and unconditional.
     let ctx_map = context.to_string_map();
-    let mut passing: Vec<&GraphEdge> = Vec::new();
+    let mut conditional_passing: Vec<&GraphEdge> = Vec::new();
+    let mut unconditional: Vec<&GraphEdge> = Vec::new();
 
     for edge in &candidates {
         if has_explicit_condition(edge) {
@@ -88,41 +147,94 @@ pub fn select_edge<'a>(
                     message: e.to_string(),
                 })?;
             if evaluate_condition(&parsed, &ctx_map) {
-                passing.push(edge);
+                conditional_passing.push(edge);
             }
         } else {
-            // No explicit condition -- edge passes through
-            passing.push(edge);
+            unconditional.push(edge);
         }
     }
 
-    if passing.is_empty() {
+    // Step 1: If any conditional edges passed, use ONLY those.
+    if !conditional_passing.is_empty() {
+        // Apply priority sort (descending) with lexical tiebreak (ascending by target).
+        conditional_passing.sort_by(|a, b| {
+            let pa = a.priority.unwrap_or(0);
+            let pb = b.priority.unwrap_or(0);
+            pb.cmp(&pa).then_with(|| a.to.cmp(&b.to))
+        });
+        return Ok(conditional_passing.into_iter().next());
+    }
+
+    // Steps 2-5 operate on unconditional edges only.
+    if unconditional.is_empty() {
         return Ok(None);
     }
 
-    // Step 3: Check outcome-based edges
+    // Step 2: Preferred label matching.
     if let Some(outcome) = last_outcome {
-        let outcome_matched: Vec<&GraphEdge> = passing
+        if let Some(pref_label) = outcome.preferred_label() {
+            let normalized_pref = normalize_label(pref_label);
+            let matched: Vec<&GraphEdge> = unconditional
+                .iter()
+                .copied()
+                .filter(|e| {
+                    e.label
+                        .as_ref()
+                        .is_some_and(|l| normalize_label(l) == normalized_pref)
+                })
+                .collect();
+            if !matched.is_empty() {
+                return Ok(pick_best(matched));
+            }
+        }
+    }
+
+    // Step 3: Suggested next IDs.
+    if let Some(outcome) = last_outcome {
+        if let Some(suggested_ids) = outcome.suggested_next_ids() {
+            let matched: Vec<&GraphEdge> = unconditional
+                .iter()
+                .copied()
+                .filter(|e| suggested_ids.contains(&e.to))
+                .collect();
+            if !matched.is_empty() {
+                return Ok(pick_best(matched));
+            }
+        }
+    }
+
+    // Step 3.5: Outcome-type label matching. If any unconditional edges have labels
+    // that match the outcome type (e.g., "success" label with Success outcome),
+    // narrow to those edges before priority sorting.
+    if let Some(outcome) = last_outcome {
+        let outcome_matched: Vec<&GraphEdge> = unconditional
             .iter()
             .copied()
             .filter(|e| edge_matches_outcome(e, outcome))
             .collect();
-
-        // Only filter to outcome-matched edges if at least one exists
         if !outcome_matched.is_empty() {
-            passing = outcome_matched;
+            return Ok(pick_best(outcome_matched));
         }
     }
 
-    // Step 4: Sort by priority (higher number = higher priority, descending)
-    passing.sort_by(|a, b| {
+    // Step 4 & 5: Priority sort (descending) with lexical tiebreak (ascending by target).
+    unconditional.sort_by(|a, b| {
         let pa = a.priority.unwrap_or(0);
         let pb = b.priority.unwrap_or(0);
-        pb.cmp(&pa)
+        pb.cmp(&pa).then_with(|| a.to.cmp(&b.to))
     });
 
-    // Step 5: Return highest priority
-    Ok(passing.into_iter().next())
+    Ok(unconditional.into_iter().next())
+}
+
+/// Pick the best edge from a non-empty set using priority descending, lexical tiebreak ascending.
+fn pick_best(mut edges: Vec<&GraphEdge>) -> Option<&GraphEdge> {
+    edges.sort_by(|a, b| {
+        let pa = a.priority.unwrap_or(0);
+        let pb = b.priority.unwrap_or(0);
+        pb.cmp(&pa).then_with(|| a.to.cmp(&b.to))
+    });
+    edges.into_iter().next()
 }
 
 #[cfg(test)]
