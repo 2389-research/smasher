@@ -11,6 +11,7 @@ use crate::provider::gemini::GeminiAdapter;
 use crate::provider::openai::OpenAiAdapter;
 use crate::provider::{ProviderAdapter, StreamResponse};
 use crate::types::{Error, Provider, Request, Response, infer_provider};
+use crate::util::retry::{RetryPolicy, retry};
 
 use self::middleware::{
     CoreFn, Middleware, execute_middleware_chain, execute_stream_error_middleware_chain,
@@ -21,6 +22,7 @@ use self::middleware::{
 pub struct Client {
     providers: HashMap<Provider, Arc<dyn ProviderAdapter>>,
     middlewares: Vec<Box<dyn Middleware>>,
+    retry_policy: RetryPolicy,
 }
 
 impl Default for Client {
@@ -35,7 +37,14 @@ impl Client {
         Self {
             providers: HashMap::new(),
             middlewares: Vec::new(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Set the retry policy for automatic retries of retryable errors.
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Create a client configured from environment variables.
@@ -108,14 +117,26 @@ impl Client {
     }
 
     /// Send a completion request, routing to the appropriate provider.
+    ///
+    /// Retryable errors (rate limits, transient server errors, etc.) are automatically
+    /// retried according to the configured `RetryPolicy`. Non-retryable errors are
+    /// returned immediately.
     pub async fn complete(&self, request: Request) -> Result<Response, Error> {
         let adapter = self.adapter_for_request(&request)?;
 
-        execute_middleware_chain(
-            &self.middlewares,
-            request,
-            CoreFn(move |req| async move { adapter.complete(&req).await }),
-        )
+        retry(&self.retry_policy, || {
+            let adapter = adapter.clone();
+            let middlewares = &self.middlewares;
+            let req = request.clone();
+            async move {
+                execute_middleware_chain(
+                    middlewares,
+                    req,
+                    CoreFn(move |r| async move { adapter.complete(&r).await }),
+                )
+                .await
+            }
+        })
         .await
     }
 
@@ -125,26 +146,38 @@ impl Client {
     /// to the provider. If the provider returns an error during stream setup,
     /// `on_stream_error` middleware is invoked in reverse order, allowing
     /// middleware to transform or log the error.
+    ///
+    /// Retryable errors during the initial stream connection are automatically
+    /// retried according to the configured `RetryPolicy`.
     pub async fn stream(&self, request: &Request) -> Result<StreamResponse, Error> {
         let adapter = self.adapter_for_request(request)?;
-        let processed_request =
-            execute_stream_middleware_chain(&self.middlewares, request.clone()).await?;
-        match adapter.stream(&processed_request).await {
-            Ok(stream) => Ok(stream),
-            Err(error) => {
-                // Run error middleware chain. If it returns Err, propagate
-                // that (possibly transformed) error. If a middleware suppresses
-                // the error (returns Ok), we still have no stream to return,
-                // so return a descriptive error.
-                match execute_stream_error_middleware_chain(&self.middlewares, error).await {
-                    Err(e) => Err(e),
-                    Ok(()) => Err(Error::Other {
-                        message: "stream setup error was suppressed by middleware but no stream is available".into(),
-                        retryable: false,
-                    }),
+
+        retry(&self.retry_policy, || {
+            let adapter = adapter.clone();
+            let middlewares = &self.middlewares;
+            let req = request.clone();
+            async move {
+                let processed_request =
+                    execute_stream_middleware_chain(middlewares, req).await?;
+                match adapter.stream(&processed_request).await {
+                    Ok(stream) => Ok(stream),
+                    Err(error) => {
+                        // Run error middleware chain. If it returns Err, propagate
+                        // that (possibly transformed) error. If a middleware suppresses
+                        // the error (returns Ok), we still have no stream to return,
+                        // so return a descriptive error.
+                        match execute_stream_error_middleware_chain(middlewares, error).await {
+                            Err(e) => Err(e),
+                            Ok(()) => Err(Error::Other {
+                                message: "stream setup error was suppressed by middleware but no stream is available".into(),
+                                retryable: false,
+                            }),
+                        }
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 
     /// Check whether a provider is registered and available.
@@ -549,6 +582,218 @@ mod tests {
             0,
             "openai adapter should not be called when explicit provider is anthropic"
         );
+    }
+
+    // --- Retry integration tests ---
+
+    /// A mock adapter that fails with a retryable error a configurable number of times,
+    /// then succeeds.
+    struct RetryableFailAdapter {
+        call_count: Arc<AtomicU32>,
+        fail_count: u32,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for RetryableFailAdapter {
+        fn provider_name(&self) -> &str {
+            "retryable_fail"
+        }
+
+        async fn complete(&self, _request: &Request) -> Result<Response, Error> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_count {
+                Err(Error::RateLimited {
+                    provider: "test".into(),
+                    retry_after_ms: Some(1), // 1ms to keep tests fast
+                })
+            } else {
+                Ok(Response {
+                    id: "retry-resp".into(),
+                    model: "mock-model".into(),
+                    content: vec![ContentPart::text("retried successfully")],
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Usage::default(),
+                    warnings: vec![],
+                    rate_limit: None,
+                    provider: None,
+                    raw: None,
+                })
+            }
+        }
+
+        async fn stream(&self, _request: &Request) -> Result<StreamResponse, Error> {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_count {
+                Err(Error::RateLimited {
+                    provider: "test".into(),
+                    retry_after_ms: Some(1),
+                })
+            } else {
+                Err(Error::Other {
+                    message: "stream connected after retry".into(),
+                    retryable: false,
+                })
+            }
+        }
+    }
+
+    /// A mock adapter that always fails with a non-retryable error.
+    struct NonRetryableFailAdapter {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for NonRetryableFailAdapter {
+        fn provider_name(&self) -> &str {
+            "non_retryable_fail"
+        }
+
+        async fn complete(&self, _request: &Request) -> Result<Response, Error> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Authentication {
+                provider: "test".into(),
+                message: "bad key".into(),
+            })
+        }
+
+        async fn stream(&self, _request: &Request) -> Result<StreamResponse, Error> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Authentication {
+                provider: "test".into(),
+                message: "bad key".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_retries_on_retryable_error() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let mut client = Client::new();
+        client.set_retry_policy(
+            RetryPolicy::default()
+                .with_max_retries(3)
+                .with_initial_backoff_ms(1)
+                .with_jitter(false),
+        );
+        client.register_provider(
+            Provider::Anthropic,
+            Arc::new(RetryableFailAdapter {
+                call_count: call_count.clone(),
+                fail_count: 2, // fail twice, succeed on third
+            }),
+        );
+
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
+        let result = client.complete(request).await;
+
+        assert!(result.is_ok(), "should succeed after retries");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "should be called 3 times: initial + 2 retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_does_not_retry_non_retryable_error() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let mut client = Client::new();
+        client.set_retry_policy(
+            RetryPolicy::default()
+                .with_max_retries(3)
+                .with_initial_backoff_ms(1)
+                .with_jitter(false),
+        );
+        client.register_provider(
+            Provider::Anthropic,
+            Arc::new(NonRetryableFailAdapter {
+                call_count: call_count.clone(),
+            }),
+        );
+
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
+        let result = client.complete(request).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "non-retryable error should NOT be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_retries_on_retryable_connection_error() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let mut client = Client::new();
+        client.set_retry_policy(
+            RetryPolicy::default()
+                .with_max_retries(3)
+                .with_initial_backoff_ms(1)
+                .with_jitter(false),
+        );
+        client.register_provider(
+            Provider::Anthropic,
+            Arc::new(RetryableFailAdapter {
+                call_count: call_count.clone(),
+                fail_count: 2,
+            }),
+        );
+
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
+        let result = client.stream(&request).await;
+
+        // The mock returns a non-retryable error after "connecting" on the 3rd attempt
+        match result {
+            Err(err) => {
+                let err_msg = format!("{err}");
+                assert!(
+                    err_msg.contains("stream connected after retry"),
+                    "should have connected after retries, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error after stream retry"),
+        }
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "stream should retry the initial connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_retry_non_retryable_error() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let mut client = Client::new();
+        client.set_retry_policy(
+            RetryPolicy::default()
+                .with_max_retries(3)
+                .with_initial_backoff_ms(1)
+                .with_jitter(false),
+        );
+        client.register_provider(
+            Provider::Anthropic,
+            Arc::new(NonRetryableFailAdapter {
+                call_count: call_count.clone(),
+            }),
+        );
+
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("hello")]);
+        let result = client.stream(&request).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "non-retryable stream error should NOT be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_client_has_retry_policy() {
+        let client = Client::new();
+        // Default retry policy should be set (3 retries)
+        assert_eq!(client.retry_policy.max_retries, 3);
     }
 
     #[tokio::test]
