@@ -177,14 +177,37 @@ impl Handler for ConditionalHandler {
 }
 
 /// Handler for Codergen nodes. Delegates to a pluggable `CodergenBackend`.
+///
+/// Supports dual-backend dispatch: nodes with `backend="agent"` use the
+/// agent backend (if configured), while all other nodes use the default.
 pub struct CodergenHandler {
-    backend: Arc<dyn CodergenBackend>,
+    default_backend: Arc<dyn CodergenBackend>,
+    agent_backend: Option<Arc<dyn CodergenBackend>>,
 }
 
 impl CodergenHandler {
-    /// Create a new CodergenHandler backed by the given backend.
+    /// Create a new CodergenHandler with a single default backend.
+    ///
+    /// Nodes requesting `backend="agent"` will fall back to this default.
     pub fn new(backend: Arc<dyn CodergenBackend>) -> Self {
-        Self { backend }
+        Self {
+            default_backend: backend,
+            agent_backend: None,
+        }
+    }
+
+    /// Create a CodergenHandler with separate default and agent backends.
+    ///
+    /// Nodes with `backend="agent"` will use `agent_backend`; all others
+    /// use `default_backend`.
+    pub fn with_backends(
+        default_backend: Arc<dyn CodergenBackend>,
+        agent_backend: Arc<dyn CodergenBackend>,
+    ) -> Self {
+        Self {
+            default_backend,
+            agent_backend: Some(agent_backend),
+        }
     }
 }
 
@@ -215,7 +238,16 @@ impl Handler for CodergenHandler {
         // Store the current node id so the backend can tag agent-level events.
         context.set("_current_node_id", json!(node.id));
 
-        self.backend.generate(&prompt, model, context).await
+        // Select backend: use agent_backend for nodes with backend="agent",
+        // fall back to default_backend otherwise.
+        let backend = match node.attrs.get("backend") {
+            Some(NodeAttrValue::String(s)) if s == "agent" => {
+                self.agent_backend.as_ref().unwrap_or(&self.default_backend)
+            }
+            _ => &self.default_backend,
+        };
+
+        backend.generate(&prompt, model, context).await
     }
 
     fn handles(&self, node_type: &NodeType) -> bool {
@@ -615,6 +647,171 @@ mod tests {
         assert!(!handler.handles(&NodeType::Start));
         assert!(!handler.handles(&NodeType::Exit));
         assert!(!handler.handles(&NodeType::Conditional));
+    }
+
+    // ---------------------------------------------------------------
+    // CodergenHandler dual-backend tests
+    // ---------------------------------------------------------------
+
+    /// A backend that tags its output with a name, for verifying dispatch.
+    struct NamedBackend {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CodergenBackend for NamedBackend {
+        async fn generate(
+            &self,
+            prompt: &str,
+            _model: Option<&str>,
+            _context: &Context,
+        ) -> Result<Outcome, HandlerError> {
+            Ok(Outcome::success_with(
+                json!({"backend": self.name, "prompt": prompt}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_uses_default_backend_when_no_backend_attr() {
+        let default = Arc::new(NamedBackend { name: "default" });
+        let agent = Arc::new(NamedBackend { name: "agent" });
+        let handler = CodergenHandler::with_backends(default, agent);
+
+        let mut node = make_node("cg_dual1", NodeType::Codergen);
+        node.attrs.insert(
+            "prompt".to_string(),
+            NodeAttrValue::String("do stuff".to_string()),
+        );
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data["backend"], "default");
+                assert_eq!(data["prompt"], "do stuff");
+            }
+            other => panic!("expected success with default backend, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_uses_agent_backend_when_backend_attr_is_agent() {
+        let default = Arc::new(NamedBackend { name: "default" });
+        let agent = Arc::new(NamedBackend { name: "agent" });
+        let handler = CodergenHandler::with_backends(default, agent);
+
+        let mut node = make_node("cg_dual2", NodeType::Codergen);
+        node.attrs.insert(
+            "prompt".to_string(),
+            NodeAttrValue::String("agent task".to_string()),
+        );
+        node.attrs.insert(
+            "backend".to_string(),
+            NodeAttrValue::String("agent".to_string()),
+        );
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data["backend"], "agent");
+                assert_eq!(data["prompt"], "agent task");
+            }
+            other => panic!("expected success with agent backend, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_falls_back_to_default_when_agent_backend_not_configured() {
+        // Created with ::new(), so agent_backend is None.
+        let default = Arc::new(NamedBackend { name: "default" });
+        let handler = CodergenHandler::new(default);
+
+        let mut node = make_node("cg_dual3", NodeType::Codergen);
+        node.attrs.insert(
+            "prompt".to_string(),
+            NodeAttrValue::String("fallback task".to_string()),
+        );
+        node.attrs.insert(
+            "backend".to_string(),
+            NodeAttrValue::String("agent".to_string()),
+        );
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data["backend"], "default");
+                assert_eq!(data["prompt"], "fallback task");
+            }
+            other => panic!("expected success with default backend (fallback), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_new_backwards_compatible() {
+        // Verify that ::new() still works exactly as before: single backend,
+        // no backend attribute handling changes behavior.
+        let backend = Arc::new(TestCodergenBackend);
+        let handler = CodergenHandler::new(backend);
+
+        let mut node = make_node("cg_compat", NodeType::Codergen);
+        node.attrs.insert(
+            "prompt".to_string(),
+            NodeAttrValue::String("compat test".to_string()),
+        );
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data, json!({"generated": "compat test"}));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_uses_default_for_unknown_backend_value() {
+        // backend="something_else" should use default, not agent.
+        let default = Arc::new(NamedBackend { name: "default" });
+        let agent = Arc::new(NamedBackend { name: "agent" });
+        let handler = CodergenHandler::with_backends(default, agent);
+
+        let mut node = make_node("cg_dual4", NodeType::Codergen);
+        node.attrs.insert(
+            "prompt".to_string(),
+            NodeAttrValue::String("other backend".to_string()),
+        );
+        node.attrs.insert(
+            "backend".to_string(),
+            NodeAttrValue::String("something_else".to_string()),
+        );
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data["backend"], "default");
+            }
+            other => panic!("expected success with default backend, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------
