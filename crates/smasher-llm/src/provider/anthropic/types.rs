@@ -34,6 +34,9 @@ pub struct AnthropicRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+    /// Extra provider-specific fields from provider_options, serialized inline.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A system block in the top-level `system` array.
@@ -327,6 +330,21 @@ pub fn convert_request(request: &Request) -> AnthropicRequest {
         }
     });
 
+    // Extract provider-specific options for Anthropic, filtering out reserved keys
+    // like beta_headers which are handled separately via extract_beta_headers().
+    let extra = request
+        .provider_options
+        .as_ref()
+        .and_then(|opts| opts.get("anthropic"))
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| k.as_str() != "beta_headers")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        })
+        .filter(|m| !m.is_empty());
+
     AnthropicRequest {
         model: request.model.clone(),
         messages,
@@ -343,6 +361,7 @@ pub fn convert_request(request: &Request) -> AnthropicRequest {
         tool_choice,
         stream: request.stream,
         thinking,
+        extra,
     }
 }
 
@@ -389,6 +408,25 @@ fn set_cache_control(block: &mut AnthropicContentBlock, cc: CacheControl) {
             // Redacted thinking blocks do not support cache_control.
         }
     }
+}
+
+/// Extract the `beta_headers` list from Anthropic-specific provider_options.
+///
+/// Returns an empty Vec if no provider_options are set or the "anthropic" key
+/// does not contain a `beta_headers` array.
+pub fn extract_beta_headers(request: &Request) -> Vec<String> {
+    request
+        .provider_options
+        .as_ref()
+        .and_then(|opts| opts.get("anthropic"))
+        .and_then(|v| v.get("beta_headers"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Convert a single unified `Message` to an `AnthropicMessage`.
@@ -1652,5 +1690,85 @@ mod tests {
         inject_cache_control(&mut anthropic_req);
         assert!(anthropic_req.system.is_none());
         assert!(anthropic_req.messages.is_empty());
+    }
+
+    // -- provider_options tests --
+
+    #[test]
+    fn convert_request_provider_options_merged_into_extra() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"top_k": 40, "custom_field": "hello"}),
+        );
+        let req = simple_request().provider_options(opts);
+        let anthropic = convert_request(&req);
+
+        let serialized = serde_json::to_value(&anthropic).unwrap();
+        assert_eq!(serialized["top_k"], 40);
+        assert_eq!(serialized["custom_field"], "hello");
+    }
+
+    #[test]
+    fn convert_request_provider_options_ignores_other_providers() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert("openai".into(), json!({"store": true}));
+        let req = simple_request().provider_options(opts);
+        let anthropic = convert_request(&req);
+
+        let serialized = serde_json::to_value(&anthropic).unwrap();
+        assert!(serialized.get("store").is_none());
+    }
+
+    #[test]
+    fn convert_request_provider_options_none_leaves_no_extra() {
+        let req = simple_request();
+        let anthropic = convert_request(&req);
+
+        let serialized = serde_json::to_value(&anthropic).unwrap();
+        // Should not have any unknown keys beyond the known struct fields.
+        assert!(serialized.get("top_k").is_none());
+    }
+
+    #[test]
+    fn extract_beta_headers_from_provider_options() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"beta_headers": ["max-tokens-3-5-sonnet-2024-07-15", "prompt-caching-2024-07-31"]}),
+        );
+        let req = simple_request().provider_options(opts);
+        let headers = extract_beta_headers(&req);
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&"max-tokens-3-5-sonnet-2024-07-15".to_string()));
+        assert!(headers.contains(&"prompt-caching-2024-07-31".to_string()));
+    }
+
+    #[test]
+    fn extract_beta_headers_returns_empty_when_no_provider_options() {
+        let req = simple_request();
+        let headers = extract_beta_headers(&req);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn extract_beta_headers_not_serialized_into_request_body() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"beta_headers": ["some-beta"], "top_k": 5}),
+        );
+        let req = simple_request().provider_options(opts);
+        let anthropic = convert_request(&req);
+
+        let serialized = serde_json::to_value(&anthropic).unwrap();
+        // beta_headers should be extracted, not passed in the body.
+        assert!(serialized.get("beta_headers").is_none());
+        // But top_k should be there.
+        assert_eq!(serialized["top_k"], 5);
     }
 }

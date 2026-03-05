@@ -33,6 +33,9 @@ pub struct OpenAiRequest {
     pub reasoning: Option<OpenAiReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<OpenAiTextConfig>,
+    /// Extra provider-specific fields from provider_options, serialized inline.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// An input item in the Responses API request. Uses internally-tagged JSON.
@@ -332,6 +335,15 @@ pub fn convert_request(request: &Request) -> OpenAiRequest {
         ResponseFormat::Text => None,
     });
 
+    // Extract provider-specific options for OpenAI.
+    let extra = request
+        .provider_options
+        .as_ref()
+        .and_then(|opts| opts.get("openai"))
+        .and_then(|v| v.as_object())
+        .cloned()
+        .filter(|m| !m.is_empty());
+
     OpenAiRequest {
         model: request.model.clone(),
         input: input_items,
@@ -344,6 +356,7 @@ pub fn convert_request(request: &Request) -> OpenAiRequest {
         stream: request.stream,
         reasoning,
         text,
+        extra,
     }
 }
 
@@ -1184,6 +1197,7 @@ mod tests {
             stream: None,
             reasoning: None,
             text: None,
+            extra: None,
         };
 
         let json = serde_json::to_value(&oai).unwrap();
@@ -1244,5 +1258,44 @@ mod tests {
         let parts = serialized["content"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "input_image");
         assert_eq!(parts[0]["image_url"], "data:image/jpeg;base64,aWNvbg==");
+    }
+
+    // -- provider_options tests --
+
+    #[test]
+    fn convert_request_provider_options_merged_into_extra() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "openai".into(),
+            json!({"store": true, "user": "user-abc123"}),
+        );
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).provider_options(opts);
+        let oai = convert_request(&req);
+
+        let serialized = serde_json::to_value(&oai).unwrap();
+        assert_eq!(serialized["store"], true);
+        assert_eq!(serialized["user"], "user-abc123");
+    }
+
+    #[test]
+    fn convert_request_provider_options_ignores_other_providers() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert("anthropic".into(), json!({"top_k": 40}));
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).provider_options(opts);
+        let oai = convert_request(&req);
+
+        let serialized = serde_json::to_value(&oai).unwrap();
+        assert!(serialized.get("top_k").is_none());
+    }
+
+    #[test]
+    fn convert_request_provider_options_none_leaves_no_extra() {
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]);
+        let oai = convert_request(&req);
+
+        let serialized = serde_json::to_value(&oai).unwrap();
+        assert!(serialized.get("store").is_none());
     }
 }

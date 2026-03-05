@@ -24,6 +24,9 @@ pub struct GeminiRequest {
     pub tools: Option<Vec<GeminiToolDeclaration>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<GeminiToolConfig>,
+    /// Extra provider-specific fields from provider_options, serialized inline.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,12 +261,22 @@ pub fn convert_request(request: &Request) -> GeminiRequest {
         }
     });
 
+    // Extract provider-specific options for Gemini.
+    let extra = request
+        .provider_options
+        .as_ref()
+        .and_then(|opts| opts.get("gemini"))
+        .and_then(|v| v.as_object())
+        .cloned()
+        .filter(|m| !m.is_empty());
+
     GeminiRequest {
         contents,
         system_instruction,
         generation_config,
         tools,
         tool_config,
+        extra,
     }
 }
 
@@ -1403,5 +1416,48 @@ mod tests {
         assert_eq!(response.usage.input_tokens, 0);
         assert_eq!(response.usage.output_tokens, 0);
         assert_eq!(response.usage.total_tokens, Some(100));
+    }
+
+    // -- provider_options tests --
+
+    #[test]
+    fn convert_request_provider_options_merged_into_extra() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "gemini".into(),
+            json!({"cachedContent": "projects/123/cachedContents/abc"}),
+        );
+        let req =
+            Request::new("gemini-2.0-flash", vec![Message::user("Hi")]).provider_options(opts);
+        let gemini = convert_request(&req);
+
+        let serialized = serde_json::to_value(&gemini).unwrap();
+        assert_eq!(
+            serialized["cachedContent"],
+            "projects/123/cachedContents/abc"
+        );
+    }
+
+    #[test]
+    fn convert_request_provider_options_ignores_other_providers() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert("openai".into(), json!({"store": true}));
+        let req =
+            Request::new("gemini-2.0-flash", vec![Message::user("Hi")]).provider_options(opts);
+        let gemini = convert_request(&req);
+
+        let serialized = serde_json::to_value(&gemini).unwrap();
+        assert!(serialized.get("store").is_none());
+    }
+
+    #[test]
+    fn convert_request_provider_options_none_leaves_no_extra() {
+        let req = Request::new("gemini-2.0-flash", vec![Message::user("Hi")]);
+        let gemini = convert_request(&req);
+
+        let serialized = serde_json::to_value(&gemini).unwrap();
+        assert!(serialized.get("cachedContent").is_none());
     }
 }
