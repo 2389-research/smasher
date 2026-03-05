@@ -48,20 +48,29 @@ impl fmt::Display for GoalStatus {
 
 /// Manages the set of goal nodes and checks whether they have been visited.
 ///
-/// A goal node is any graph node whose `attrs` map contains the key `"goal"`
-/// with the value `NodeAttrValue::Bool(true)`.
+/// A goal node is any graph node whose `attrs` map contains `goal_gate=true`
+/// (canonical) or `goal=true` (legacy fallback). When both are present,
+/// `goal_gate` takes precedence.
 #[derive(Debug, Clone)]
 pub struct GoalGate {
     goals: Vec<String>,
 }
 
 impl GoalGate {
-    /// Scan all nodes in the graph for `goal=true` attributes and collect their IDs.
+    /// Scan all nodes in the graph for `goal_gate=true` (or legacy `goal=true`)
+    /// attributes and collect their IDs. When both are present, `goal_gate` wins.
     pub fn from_graph(graph: &Graph) -> GoalGate {
         let goals = graph
             .nodes
             .iter()
-            .filter(|node| matches!(node.attrs.get("goal"), Some(NodeAttrValue::Bool(true))))
+            .filter(|node| {
+                // Prefer `goal_gate` attribute; fall back to `goal` for backward compat
+                let attr = node
+                    .attrs
+                    .get("goal_gate")
+                    .or_else(|| node.attrs.get("goal"));
+                matches!(attr, Some(NodeAttrValue::Bool(true)))
+            })
             .map(|node| node.id.clone())
             .collect();
         GoalGate { goals }
@@ -572,7 +581,51 @@ mod tests {
         );
     }
 
-    // ---- Test 26: number goal attribute is ignored ----
+    // ---- Test 26: goal_gate attribute is the canonical attribute name ----
+    #[test]
+    fn goal_gate_attribute_is_recognized() {
+        let mut attrs = HashMap::new();
+        attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+        let graph = make_graph(vec![GraphNode {
+            id: "n1".to_string(),
+            node_type: NodeType::Generic,
+            label: None,
+            attrs,
+        }]);
+        let gate = GoalGate::from_graph(&graph);
+        assert_eq!(gate.goals().len(), 1);
+        assert_eq!(gate.goals()[0], "n1");
+    }
+
+    // ---- Test 27: goal_gate takes precedence over goal attribute ----
+    #[test]
+    fn goal_gate_takes_precedence_over_goal() {
+        let mut attrs = HashMap::new();
+        // goal_gate=false should win over goal=true
+        attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(false));
+        attrs.insert("goal".to_string(), NodeAttrValue::Bool(true));
+        let graph = make_graph(vec![GraphNode {
+            id: "n1".to_string(),
+            node_type: NodeType::Generic,
+            label: None,
+            attrs,
+        }]);
+        let gate = GoalGate::from_graph(&graph);
+        // goal_gate=false takes precedence, so no goals
+        assert!(gate.is_empty());
+    }
+
+    // ---- Test 28: legacy goal attribute still works as fallback ----
+    #[test]
+    fn legacy_goal_attribute_still_works() {
+        // When only "goal" is set (no "goal_gate"), it should still be recognized
+        let graph = make_graph(vec![make_node("g1", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        assert_eq!(gate.goals().len(), 1);
+        assert_eq!(gate.goals()[0], "g1");
+    }
+
+    // ---- Test 29: number goal attribute is ignored ----
     #[test]
     fn number_goal_attribute_is_ignored() {
         let mut attrs = HashMap::new();

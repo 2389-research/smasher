@@ -40,7 +40,7 @@ use crate::edge::{EdgeSelectionError, select_edge};
 use crate::events::{PipelineEvent, PipelineEventEmitter};
 use crate::fidelity::{FidelityConfig, FidelityProcessor};
 use crate::goals::{GoalError, GoalGate};
-use crate::graph::{Graph, NodeType};
+use crate::graph::{Graph, NodeAttrValue, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
 use crate::retry::{RetryPolicy, RetryState, compute_delay};
 use crate::state::{Checkpoint, Context, Outcome};
@@ -641,8 +641,17 @@ impl Engine {
                 }
             }
 
-            // If exit node, break the loop
+            // If exit node, check goal gates before exiting.
+            // When goals are unsatisfied and the exit node has a `retry_target`
+            // attribute, route back to that node instead of exiting.
             if node.node_type == NodeType::Exit {
+                if !self.goal_gate.all_met(&visited_nodes)
+                    && let Some(NodeAttrValue::String(target)) =
+                        node.attrs.get("retry_target")
+                {
+                    current_node_id = target.clone();
+                    continue;
+                }
                 break;
             }
 
@@ -2833,5 +2842,109 @@ mod tests {
         engine.apply_sub_pipeline_transform("/tmp").unwrap();
         let result = engine.run(Context::new()).await.unwrap();
         assert_eq!(result.steps_taken, 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 57: goal_gate attribute is recognized (not just goal)
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn goal_gate_attribute_recognized_in_engine() {
+        let mut goal_attrs = HashMap::new();
+        goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("critical", NodeType::Generic, goal_attrs),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "critical"),
+                make_edge("critical", "exit"),
+            ],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // Should pass because the goal_gate node was visited
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.visited_nodes.contains(&"critical".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 58: Unsatisfied goals with retry_target route back instead of error
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn unsatisfied_goals_retry_target_routes_back() {
+        let mut goal_attrs = HashMap::new();
+        goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+
+        // Exit node has a retry_target pointing back to "middle"
+        let mut exit_attrs = HashMap::new();
+        exit_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("middle".to_string()),
+        );
+
+        // Build a graph where:
+        // start -> exit (first time, goal unmet, so retry_target sends to middle)
+        // middle -> goal_node -> exit (second time, goal met, so complete)
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("exit", NodeType::Exit, exit_attrs),
+                make_node("middle", NodeType::Generic),
+                make_node_with_attrs("goal_node", NodeType::Generic, goal_attrs),
+            ],
+            vec![
+                make_edge("start", "exit"),
+                make_edge("middle", "goal_node"),
+                make_edge("goal_node", "exit"),
+            ],
+        );
+
+        let engine = Engine::with_config(
+            graph,
+            success_registry(),
+            EngineConfig {
+                max_steps: 20,
+                ..EngineConfig::default()
+            },
+        );
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // Should succeed because retry_target routed to "middle" which leads through goal_node
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let result = result.unwrap();
+        assert!(result.visited_nodes.contains(&"goal_node".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 59: Unsatisfied goals without retry_target still errors
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn unsatisfied_goals_without_retry_target_errors() {
+        let mut goal_attrs = HashMap::new();
+        goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+
+        // Exit node has no retry_target
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+                make_node_with_attrs("unreachable_goal", NodeType::Generic, goal_attrs),
+            ],
+            vec![make_edge("start", "exit")],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, EngineError::GoalEnforcement(_)));
     }
 }
