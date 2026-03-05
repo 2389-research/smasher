@@ -44,295 +44,147 @@ fn reachable_from_start(graph: &Graph) -> HashSet<&str> {
     visited
 }
 
+/// All current example filenames.
+const EXAMPLES: &[&str] = &[
+    "consensus_task.dot",
+    "consensus_task_parity.dot",
+    "megaplan.dot",
+    "megaplan_quality.dot",
+    "semport.dot",
+    "semport_thematic.dot",
+    "sprint_exec.dot",
+    "vulnerability_analyzer.dot",
+];
+
 // ============================================================================
 // Per-example lint validation: no Error-level diagnostics
 // ============================================================================
 
 #[test]
-fn hello_world_passes_lint() {
-    let g = load_example("hello-world.dot");
+fn consensus_task_passes_lint() {
+    let g = load_example("consensus_task.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "hello-world.dot has lint errors: {:?}",
+        "consensus_task.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn conditional_passes_lint() {
-    let g = load_example("conditional.dot");
+fn consensus_task_parity_passes_lint() {
+    let g = load_example("consensus_task_parity.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "conditional.dot has lint errors: {:?}",
+        "consensus_task_parity.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn multi_step_passes_lint() {
-    let g = load_example("multi-step.dot");
+fn megaplan_passes_lint() {
+    let g = load_example("megaplan.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "multi-step.dot has lint errors: {:?}",
+        "megaplan.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn retry_loop_passes_lint() {
-    let g = load_example("retry-loop.dot");
+fn megaplan_quality_passes_lint() {
+    let g = load_example("megaplan_quality.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "retry-loop.dot has lint errors: {:?}",
+        "megaplan_quality.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn parallel_fanout_passes_lint() {
-    let g = load_example("parallel-fanout.dot");
+fn semport_passes_lint() {
+    let g = load_example("semport.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "parallel-fanout.dot has lint errors: {:?}",
+        "semport.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn human_gate_passes_lint() {
-    let g = load_example("human-gate.dot");
+fn semport_thematic_passes_lint() {
+    let g = load_example("semport_thematic.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "human-gate.dot has lint errors: {:?}",
+        "semport_thematic.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn codergen_passes_lint() {
-    let g = load_example("codergen.dot");
+fn sprint_exec_passes_lint() {
+    let g = load_example("sprint_exec.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "codergen.dot has lint errors: {:?}",
+        "sprint_exec.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 #[test]
-fn loop_with_exit_passes_lint() {
-    let g = load_example("loop-with-exit.dot");
+fn vulnerability_analyzer_passes_lint() {
+    let g = load_example("vulnerability_analyzer.dot");
     let runner = LintRunner::with_builtins();
     let report = runner.run(&g);
     assert!(
         !report.has_errors(),
-        "loop-with-exit.dot has lint errors: {:?}",
-        report.errors()
-    );
-}
-
-#[test]
-fn multi_gate_passes_lint() {
-    let g = load_example("multi-gate.dot");
-    let runner = LintRunner::with_builtins();
-    let report = runner.run(&g);
-    assert!(
-        !report.has_errors(),
-        "multi-gate.dot has lint errors: {:?}",
+        "vulnerability_analyzer.dot has lint errors: {:?}",
         report.errors()
     );
 }
 
 // ============================================================================
-// Structural validation: start nodes
+// Structural validation: every example has exactly one start node
 // ============================================================================
 
 #[test]
-fn hello_world_has_exactly_one_start() {
-    let g = load_example("hello-world.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "hello-world.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn conditional_has_exactly_one_start() {
-    let g = load_example("conditional.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "conditional.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn multi_step_has_exactly_one_start() {
-    let g = load_example("multi-step.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "multi-step.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn retry_loop_has_exactly_one_start() {
-    let g = load_example("retry-loop.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "retry-loop.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn parallel_fanout_has_exactly_one_start() {
-    let g = load_example("parallel-fanout.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "parallel-fanout.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn human_gate_has_exactly_one_start() {
-    let g = load_example("human-gate.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "human-gate.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn codergen_has_exactly_one_start() {
-    let g = load_example("codergen.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "codergen.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn loop_with_exit_has_exactly_one_start() {
-    let g = load_example("loop-with-exit.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "loop-with-exit.dot should have exactly 1 start node"
-    );
-}
-
-#[test]
-fn multi_gate_has_exactly_one_start() {
-    let g = load_example("multi-gate.dot");
-    assert_eq!(
-        g.start_nodes().len(),
-        1,
-        "multi-gate.dot should have exactly 1 start node"
-    );
+fn all_examples_have_exactly_one_start() {
+    for filename in EXAMPLES {
+        let g = load_example(filename);
+        assert_eq!(
+            g.start_nodes().len(),
+            1,
+            "{filename} should have exactly 1 start node"
+        );
+    }
 }
 
 // ============================================================================
-// Structural validation: exit nodes
+// Structural validation: every example has at least one exit node
 // ============================================================================
 
 #[test]
-fn hello_world_has_at_least_one_exit() {
-    let g = load_example("hello-world.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "hello-world.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn conditional_has_at_least_one_exit() {
-    let g = load_example("conditional.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "conditional.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn multi_step_has_at_least_one_exit() {
-    let g = load_example("multi-step.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "multi-step.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn retry_loop_has_at_least_one_exit() {
-    let g = load_example("retry-loop.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "retry-loop.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn parallel_fanout_has_at_least_one_exit() {
-    let g = load_example("parallel-fanout.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "parallel-fanout.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn human_gate_has_at_least_one_exit() {
-    let g = load_example("human-gate.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "human-gate.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn codergen_has_at_least_one_exit() {
-    let g = load_example("codergen.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "codergen.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn loop_with_exit_has_at_least_one_exit() {
-    let g = load_example("loop-with-exit.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "loop-with-exit.dot should have at least 1 exit node"
-    );
-}
-
-#[test]
-fn multi_gate_has_at_least_one_exit() {
-    let g = load_example("multi-gate.dot");
-    assert!(
-        !g.exit_nodes().is_empty(),
-        "multi-gate.dot should have at least 1 exit node"
-    );
+fn all_examples_have_at_least_one_exit() {
+    for filename in EXAMPLES {
+        let g = load_example(filename);
+        assert!(
+            !g.exit_nodes().is_empty(),
+            "{filename} should have at least 1 exit node"
+        );
+    }
 }
 
 // ============================================================================
@@ -340,211 +192,41 @@ fn multi_gate_has_at_least_one_exit() {
 // ============================================================================
 
 #[test]
-fn hello_world_all_nodes_reachable() {
-    let g = load_example("hello-world.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "hello-world.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn conditional_all_nodes_reachable() {
-    let g = load_example("conditional.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "conditional.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn multi_step_all_nodes_reachable() {
-    let g = load_example("multi-step.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "multi-step.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn retry_loop_all_nodes_reachable() {
-    let g = load_example("retry-loop.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "retry-loop.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn parallel_fanout_all_nodes_reachable() {
-    let g = load_example("parallel-fanout.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "parallel-fanout.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn human_gate_all_nodes_reachable() {
-    let g = load_example("human-gate.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "human-gate.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn codergen_all_nodes_reachable() {
-    let g = load_example("codergen.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "codergen.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn loop_with_exit_all_nodes_reachable() {
-    let g = load_example("loop-with-exit.dot");
-    let reachable = reachable_from_start(&g);
-
-    // The `timed_out` node is a documented orphan: it exists as a safety-valve
-    // exit node that the engine reaches via max_steps, not via graph edges.
-    let documented_orphans: HashSet<&str> = HashSet::from(["timed_out"]);
-
-    for node in &g.nodes {
-        if documented_orphans.contains(node.id.as_str()) {
-            continue;
+fn all_examples_all_nodes_reachable() {
+    for filename in EXAMPLES {
+        let g = load_example(filename);
+        let reachable = reachable_from_start(&g);
+        for node in &g.nodes {
+            assert!(
+                reachable.contains(node.id.as_str()),
+                "{filename}: node '{}' is not reachable from start",
+                node.id
+            );
         }
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "loop-with-exit.dot: node '{}' is not reachable from start",
-            node.id
-        );
-    }
-}
-
-#[test]
-fn multi_gate_all_nodes_reachable() {
-    let g = load_example("multi-gate.dot");
-    let reachable = reachable_from_start(&g);
-    for node in &g.nodes {
-        assert!(
-            reachable.contains(node.id.as_str()),
-            "multi-gate.dot: node '{}' is not reachable from start",
-            node.id
-        );
     }
 }
 
 // ============================================================================
-// Structural validation: no orphan nodes (no incoming AND no outgoing edges,
-// except start nodes which have no incoming by design)
+// Structural validation: no orphan nodes
 // ============================================================================
 
 #[test]
-fn hello_world_no_orphan_nodes() {
-    let g = load_example("hello-world.dot");
-    assert_no_orphans(&g, "hello-world.dot");
-}
-
-#[test]
-fn conditional_no_orphan_nodes() {
-    let g = load_example("conditional.dot");
-    assert_no_orphans(&g, "conditional.dot");
-}
-
-#[test]
-fn multi_step_no_orphan_nodes() {
-    let g = load_example("multi-step.dot");
-    assert_no_orphans(&g, "multi-step.dot");
-}
-
-#[test]
-fn retry_loop_no_orphan_nodes() {
-    let g = load_example("retry-loop.dot");
-    assert_no_orphans(&g, "retry-loop.dot");
-}
-
-#[test]
-fn parallel_fanout_no_orphan_nodes() {
-    let g = load_example("parallel-fanout.dot");
-    assert_no_orphans(&g, "parallel-fanout.dot");
-}
-
-#[test]
-fn human_gate_no_orphan_nodes() {
-    let g = load_example("human-gate.dot");
-    assert_no_orphans(&g, "human-gate.dot");
-}
-
-#[test]
-fn codergen_no_orphan_nodes() {
-    let g = load_example("codergen.dot");
-    assert_no_orphans(&g, "codergen.dot");
-}
-
-#[test]
-fn loop_with_exit_no_orphan_nodes() {
-    let g = load_example("loop-with-exit.dot");
-    // The `timed_out` node is a documented orphan: it exists as a safety-valve
-    // exit node that the engine reaches via max_steps, not via graph edges.
-    assert_no_orphans_except(&g, "loop-with-exit.dot", &["timed_out"]);
-}
-
-#[test]
-fn multi_gate_no_orphan_nodes() {
-    let g = load_example("multi-gate.dot");
-    assert_no_orphans(&g, "multi-gate.dot");
+fn all_examples_no_orphan_nodes() {
+    for filename in EXAMPLES {
+        let g = load_example(filename);
+        assert_no_orphans(&g, filename);
+    }
 }
 
 /// Assert that a graph has no orphan nodes. An orphan is a node that has
 /// no incoming edges AND no outgoing edges. Start nodes are excluded since
 /// they naturally lack incoming edges.
 fn assert_no_orphans(graph: &Graph, filename: &str) {
-    assert_no_orphans_except(graph, filename, &[]);
-}
-
-/// Assert that a graph has no orphan nodes, with an explicit list of
-/// documented exceptions (nodes that are intentionally disconnected).
-fn assert_no_orphans_except(graph: &Graph, filename: &str, exceptions: &[&str]) {
-    let exception_set: HashSet<&str> = exceptions.iter().copied().collect();
     let sources: HashSet<&str> = graph.edges.iter().map(|e| e.from.as_str()).collect();
     let targets: HashSet<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
 
     for node in &graph.nodes {
-        if exception_set.contains(node.id.as_str()) {
-            continue;
-        }
         if node.node_type == NodeType::Start {
-            // Start nodes only need outgoing edges.
             assert!(
                 sources.contains(node.id.as_str()),
                 "{filename}: start node '{}' has no outgoing edges (orphan)",
@@ -823,7 +505,6 @@ fn lint_known_bad_w003_missing_condition() {
     );
     assert_eq!(w003_diags[0].severity, Severity::Warning);
     assert_eq!(w003_diags[0].node_id.as_deref(), Some("check"));
-    // Both edges from check should trigger W003
     assert_eq!(
         w003_diags.len(),
         2,
@@ -862,7 +543,6 @@ fn lint_known_bad_i001_empty_edge_label() {
         "Expected I001 for edges without labels"
     );
     assert_eq!(i001_diags[0].severity, Severity::Info);
-    // Both edges lack labels
     assert_eq!(
         i001_diags.len(),
         2,
@@ -877,7 +557,6 @@ fn lint_known_bad_i001_empty_edge_label() {
 
 #[test]
 fn lint_known_bad_all_errors_combined() {
-    // A graph that triggers every rule at once.
     let source = r#"
         digraph AllBad {
             process [shape=box, label="Process"];
@@ -894,17 +573,11 @@ fn lint_known_bad_all_errors_combined() {
 
     let codes: HashSet<&str> = report.diagnostics.iter().map(|d| d.code.as_str()).collect();
 
-    // E001: no start node
     assert!(codes.contains("E001"), "Expected E001, got: {codes:?}");
-    // E003: no exit node
     assert!(codes.contains("E003"), "Expected E003, got: {codes:?}");
-    // W001: orphan has no incoming edges
     assert!(codes.contains("W001"), "Expected W001, got: {codes:?}");
-    // W002: orphan has no outgoing edges
     assert!(codes.contains("W002"), "Expected W002, got: {codes:?}");
-    // W003: check is conditional with no condition on edges
     assert!(codes.contains("W003"), "Expected W003, got: {codes:?}");
-    // I001: edges have no labels
     assert!(codes.contains("I001"), "Expected I001, got: {codes:?}");
 }
 
@@ -968,19 +641,9 @@ fn lint_known_bad_e002_three_start_nodes() {
         .find(|d| d.code == "E002")
         .expect("Expected E002 for three start nodes");
     assert_eq!(e002.severity, Severity::Error);
-    // All three start node IDs should be mentioned
-    assert!(
-        e002.message.contains("s1"),
-        "E002 message should mention s1"
-    );
-    assert!(
-        e002.message.contains("s2"),
-        "E002 message should mention s2"
-    );
-    assert!(
-        e002.message.contains("s3"),
-        "E002 message should mention s3"
-    );
+    assert!(e002.message.contains("s1"));
+    assert!(e002.message.contains("s2"));
+    assert!(e002.message.contains("s3"));
 }
 
 // ============================================================================
