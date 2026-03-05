@@ -145,16 +145,16 @@ impl ProviderProfile for OpenAiProfile {
             sections.push(format!("# Environment\n{}", env_lines.join("\n")));
         }
 
-        // Tools section
+        // Tools section — OpenAI uses apply_patch for file modifications
         sections.push(
-            "# Available Tools\nYou have access to tools for reading files, writing files, editing files, running commands, searching code, and finding files.".to_string()
+            "# Available Tools\nYou have access to tools for reading files, applying patches via apply_patch, running commands, searching code, and finding files. Use apply_patch to create, modify, or delete files.".to_string()
         );
 
         // Instructions section
         let mut instr_lines = vec![
             "- Read files before modifying them to understand existing code".to_string(),
+            "- Use apply_patch for all file modifications".to_string(),
             "- Make minimal, focused changes".to_string(),
-            "- Prefer editing existing files over creating new ones".to_string(),
             "- Run tests after making changes".to_string(),
         ];
         if let Some(ref proj) = config.project_instructions {
@@ -169,14 +169,7 @@ impl ProviderProfile for OpenAiProfile {
     }
 
     fn tool_names(&self) -> Vec<&str> {
-        vec![
-            "read_file",
-            "write_file",
-            "edit_file",
-            "shell",
-            "grep",
-            "glob_files",
-        ]
+        vec!["read_file", "apply_patch", "shell", "grep", "glob_files"]
     }
 
     fn supports_thinking(&self) -> bool {
@@ -402,19 +395,26 @@ mod tests {
     }
 
     #[test]
-    fn openai_profile_tool_names() {
+    fn openai_profile_tool_names_uses_apply_patch() {
         let profile = OpenAiProfile;
         let tools = profile.tool_names();
         assert_eq!(
             tools,
-            vec![
-                "read_file",
-                "write_file",
-                "edit_file",
-                "shell",
-                "grep",
-                "glob_files"
-            ]
+            vec!["read_file", "apply_patch", "shell", "grep", "glob_files"]
+        );
+    }
+
+    #[test]
+    fn openai_profile_excludes_edit_file_and_write_file() {
+        let profile = OpenAiProfile;
+        let tools = profile.tool_names();
+        assert!(
+            !tools.contains(&"edit_file"),
+            "OpenAI profile should not include edit_file"
+        );
+        assert!(
+            !tools.contains(&"write_file"),
+            "OpenAI profile should not include write_file"
         );
     }
 
@@ -458,6 +458,58 @@ mod tests {
                 "grep",
                 "glob_files"
             ]
+        );
+    }
+
+    #[test]
+    fn anthropic_profile_excludes_apply_patch() {
+        let profile = AnthropicProfile;
+        let tools = profile.tool_names();
+        assert!(
+            !tools.contains(&"apply_patch"),
+            "Anthropic profile should not include apply_patch"
+        );
+    }
+
+    #[test]
+    fn gemini_profile_excludes_apply_patch() {
+        let profile = GeminiProfile;
+        let tools = profile.tool_names();
+        assert!(
+            !tools.contains(&"apply_patch"),
+            "Gemini profile should not include apply_patch"
+        );
+    }
+
+    #[test]
+    fn each_profile_has_distinct_system_prompt() {
+        let config = SystemPromptConfig::default();
+        let anthropic_prompt = AnthropicProfile.system_prompt(&config);
+        let openai_prompt = OpenAiProfile.system_prompt(&config);
+        let gemini_prompt = GeminiProfile.system_prompt(&config);
+
+        // All three must be different from each other
+        assert_ne!(
+            anthropic_prompt, openai_prompt,
+            "Anthropic and OpenAI prompts should differ"
+        );
+        assert_ne!(
+            anthropic_prompt, gemini_prompt,
+            "Anthropic and Gemini prompts should differ"
+        );
+        assert_ne!(
+            openai_prompt, gemini_prompt,
+            "OpenAI and Gemini prompts should differ"
+        );
+    }
+
+    #[test]
+    fn openai_system_prompt_mentions_apply_patch() {
+        let config = SystemPromptConfig::default();
+        let prompt = OpenAiProfile.system_prompt(&config);
+        assert!(
+            prompt.contains("apply_patch"),
+            "OpenAI system prompt should mention apply_patch tool"
         );
     }
 
