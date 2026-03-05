@@ -254,10 +254,32 @@ pub async fn steering() -> i32 {
 }
 
 pub async fn events() -> i32 {
+    // Read optional JSON config from stdin (e.g. {"model": "gpt-4o", "prompt": "..."}).
+    let parsed: serde_json::Value = {
+        let mut buf = String::new();
+        match std::io::stdin().read_to_string(&mut buf) {
+            Ok(_) if !buf.trim().is_empty() => serde_json::from_str(&buf).unwrap_or(json!({})),
+            _ => json!({}),
+        }
+    };
+
+    let prompt = parsed
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Say hello")
+        .to_string();
+
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let client = Arc::new(Client::from_env());
 
     let mut config = SessionConfig::default();
-    // Do not hardcode a model here; let the SessionConfig default apply.
+    if let Some(m) = model {
+        config = config.with_model(m);
+    }
     config = config.with_stream(false);
     config = config.with_max_turns(10);
 
@@ -271,7 +293,7 @@ pub async fn events() -> i32 {
     let mut session = Session::new(config, client, registry, emitter);
 
     // Spawn the session task
-    let session_handle = tokio::spawn(async move { session.process_input("Say hello").await });
+    let session_handle = tokio::spawn(async move { session.process_input(&prompt).await });
 
     // Collect events with a per-event timeout
     let mut events = Vec::new();

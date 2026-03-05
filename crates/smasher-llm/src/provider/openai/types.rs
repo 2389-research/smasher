@@ -277,12 +277,50 @@ pub fn convert_request(request: &Request) -> OpenAiRequest {
     let tools = request.tools.as_ref().map(|tools| {
         tools
             .iter()
-            .map(|t| OpenAiTool {
-                tool_type: "function".to_string(),
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.parameters.clone(),
-                strict: Some(true),
+            .map(|t| {
+                // OpenAI strict mode requires: additionalProperties: false AND
+                // every property listed in required. Only enable strict when the
+                // schema satisfies both conditions; otherwise omit strict so the
+                // tool still works without the extra validation constraints.
+                let mut params = t.parameters.clone();
+                let mut strict_eligible = true;
+
+                if let Some(obj) = params.as_object_mut() {
+                    if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
+                        // Check if all properties are covered by required.
+                        let prop_keys: Vec<String> = obj
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .map(|p| p.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required_keys: Vec<String> = obj
+                            .get("required")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let all_required = prop_keys.iter().all(|k| required_keys.contains(k));
+
+                        if all_required {
+                            obj.entry("additionalProperties")
+                                .or_insert(serde_json::Value::Bool(false));
+                        } else {
+                            strict_eligible = false;
+                        }
+                    }
+                }
+
+                OpenAiTool {
+                    tool_type: "function".to_string(),
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: params,
+                    strict: if strict_eligible { Some(true) } else { None },
+                }
             })
             .collect()
     });
@@ -607,11 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn convert_tools() {
+    fn convert_tools_strict_when_all_required() {
         let tool = ToolDefinition::new(
             "get_weather",
             "Get the weather",
-            json!({"type": "object", "properties": {"location": {"type": "string"}}}),
+            json!({"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}),
         );
         let req = Request::new("gpt-4o", vec![Message::user("Hi")]).tools(vec![tool]);
 
@@ -621,6 +659,27 @@ mod tests {
         assert_eq!(tools[0].tool_type, "function");
         assert_eq!(tools[0].name, "get_weather");
         assert_eq!(tools[0].strict, Some(true));
+        // additionalProperties: false should be injected.
+        assert_eq!(
+            tools[0].parameters["additionalProperties"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn convert_tools_no_strict_when_optional_props() {
+        let tool = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}),
+        );
+        let req = Request::new("gpt-4o", vec![Message::user("Hi")]).tools(vec![tool]);
+
+        let oai = convert_request(&req);
+        let tools = oai.tools.unwrap();
+        assert_eq!(tools[0].strict, None);
+        // additionalProperties should NOT be injected for non-strict tools.
+        assert!(tools[0].parameters.get("additionalProperties").is_none());
     }
 
     #[test]

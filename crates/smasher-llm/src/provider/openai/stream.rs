@@ -38,9 +38,11 @@ pub fn translate_stream(
             match event_type {
                 "response.created" => {
                     // Parse the response object to get id and model.
+                    // The Responses API nests these under a "response" key.
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                        let id = data["id"].as_str().unwrap_or("").to_string();
-                        let model = data["model"].as_str().unwrap_or("").to_string();
+                        let resp = data.get("response").unwrap_or(&data);
+                        let id = resp["id"].as_str().unwrap_or("").to_string();
+                        let model = resp["model"].as_str().unwrap_or("").to_string();
                         yield StreamEvent::start(id, model);
                     }
                 }
