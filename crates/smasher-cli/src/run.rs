@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Args;
 use smasher_agent::environment::LocalExecutionEnvironment;
@@ -149,6 +150,87 @@ impl CodergenBackend for AgentCodergenBackend {
     }
 }
 
+/// CodergenBackend that spawns `claude` CLI as a subprocess.
+///
+/// Builds a combined prompt from pipeline context and the node prompt, then
+/// runs `claude --dangerously-skip-permissions --print -p <prompt>` with a
+/// wall-clock timeout. Captures stdout as the outcome text.
+struct ClaudeCliBackend {
+    working_dir: String,
+    timeout: Duration,
+    /// Override the path to the `claude` binary (for testing).
+    claude_path: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl CodergenBackend for ClaudeCliBackend {
+    async fn generate(
+        &self,
+        prompt: &str,
+        _model: Option<&str>,
+        context: &Context,
+    ) -> Result<Outcome, HandlerError> {
+        // Build context summary from pipeline state, same logic as AgentCodergenBackend.
+        let context_summary = context.to_string_map();
+        let system_parts: Vec<String> = context_summary
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+
+        let combined_prompt = if system_parts.is_empty() {
+            prompt.to_string()
+        } else {
+            format!(
+                "Pipeline context:\n{}\n\n{}",
+                system_parts.join("\n"),
+                prompt
+            )
+        };
+
+        let claude_bin = self.claude_path.as_deref().unwrap_or("claude");
+
+        let mut cmd = tokio::process::Command::new(claude_bin);
+        cmd.arg("--dangerously-skip-permissions")
+            .arg("--print")
+            .arg("-p")
+            .arg(&combined_prompt)
+            .current_dir(&self.working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return Err(HandlerError::Other(format!(
+                    "failed to spawn claude CLI: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(HandlerError::Other(format!(
+                    "claude CLI timed out after {}s",
+                    self.timeout.as_secs()
+                )));
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(HandlerError::Other(format!(
+                "claude CLI exit code {code}: {stderr}"
+            )));
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(Outcome::success_with(serde_json::json!({"response": text})))
+    }
+}
+
 /// Execute a DOT-based pipeline.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -193,6 +275,14 @@ pub struct RunArgs {
     /// Skip lint pre-check before pipeline execution.
     #[arg(long)]
     pub skip_lint: bool,
+
+    /// Backend for codergen nodes: "claude-cli" (default) or "agent".
+    #[arg(long, default_value = "claude-cli")]
+    pub backend: String,
+
+    /// Wall-clock timeout in seconds for the claude-cli backend (default: 600).
+    #[arg(long, default_value = "600")]
+    pub agent_timeout: u64,
 
     /// Interviewer mode for human-in-the-loop nodes: auto, console, or timeout:N
     /// (default: auto if no tty, console if tty).
@@ -355,13 +445,39 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         ..EngineConfig::default()
     };
 
-    let backend = Arc::new(AgentCodergenBackend::new(
-        Arc::clone(&client),
-        args.model.clone(),
-        effective_working_dir.clone(),
-    ));
     let mut registry = default_registry();
-    registry.register(Arc::new(CodergenHandler::new(backend)));
+    match args.backend.as_str() {
+        "claude-cli" => {
+            let claude_backend: Arc<dyn CodergenBackend> = Arc::new(ClaudeCliBackend {
+                working_dir: effective_working_dir.clone(),
+                timeout: Duration::from_secs(args.agent_timeout),
+                claude_path: None,
+            });
+            let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
+                Arc::clone(&client),
+                args.model.clone(),
+                effective_working_dir.clone(),
+            ));
+            registry.register(Arc::new(CodergenHandler::with_backends(
+                claude_backend,
+                agent_backend,
+            )));
+        }
+        "agent" => {
+            let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
+                Arc::clone(&client),
+                args.model.clone(),
+                effective_working_dir.clone(),
+            ));
+            registry.register(Arc::new(CodergenHandler::new(agent_backend)));
+        }
+        other => {
+            return Err(CliError::Other(format!(
+                "unknown --backend value '{}': expected 'claude-cli' or 'agent'",
+                other
+            )));
+        }
+    }
 
     // Build interviewer based on --interviewer flag.
     let interviewer: Arc<dyn Interviewer> = if args.interviewer.starts_with("timeout:") {
@@ -644,5 +760,255 @@ mod tests {
     fn skip_lint_flag_parsed_when_present() {
         let cli = TestCli::parse_from(["test", "--skip-lint", "pipeline.dot"]);
         assert!(cli.run.skip_lint);
+    }
+
+    // ---- Backend flag tests ----
+
+    #[test]
+    fn backend_flag_defaults_to_claude_cli() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert_eq!(cli.run.backend, "claude-cli");
+    }
+
+    #[test]
+    fn backend_flag_parsed_as_agent() {
+        let cli = TestCli::parse_from(["test", "--backend", "agent", "pipeline.dot"]);
+        assert_eq!(cli.run.backend, "agent");
+    }
+
+    #[test]
+    fn backend_flag_parsed_as_claude_cli() {
+        let cli = TestCli::parse_from(["test", "--backend", "claude-cli", "pipeline.dot"]);
+        assert_eq!(cli.run.backend, "claude-cli");
+    }
+
+    // ---- Agent timeout flag tests ----
+
+    #[test]
+    fn agent_timeout_flag_defaults_to_600() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert_eq!(cli.run.agent_timeout, 600);
+    }
+
+    #[test]
+    fn agent_timeout_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--agent-timeout", "120", "pipeline.dot"]);
+        assert_eq!(cli.run.agent_timeout, 120);
+    }
+
+    // ---- ClaudeCliBackend tests ----
+
+    #[tokio::test]
+    async fn claude_cli_backend_captures_stdout_as_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("claude");
+        std::fs::write(&script_path, "#!/bin/sh\necho \"hello from fake claude\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_secs(10),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend.generate("test prompt", None, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                let response = data["response"].as_str().unwrap();
+                assert_eq!(response, "hello from fake claude");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_passes_prompt_to_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Script that writes all args to a file so we can inspect them.
+        let args_file = tmp.path().join("captured_args.txt");
+        let script_path = tmp.path().join("claude");
+        let script_content = format!(
+            "#!/bin/sh\necho \"$@\" > {}\necho \"done\"\n",
+            args_file.display()
+        );
+        std::fs::write(&script_path, script_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_secs(10),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        backend
+            .generate("my special prompt", None, &ctx)
+            .await
+            .unwrap();
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            captured.contains("--dangerously-skip-permissions"),
+            "should pass --dangerously-skip-permissions, got: {captured}"
+        );
+        assert!(
+            captured.contains("--print"),
+            "should pass --print, got: {captured}"
+        );
+        assert!(
+            captured.contains("-p"),
+            "should pass -p flag, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_returns_error_on_nonzero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("claude");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_secs(10),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend.generate("test prompt", None, &ctx).await;
+
+        assert!(result.is_err(), "non-zero exit should produce an error");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exit"),
+            "error should mention exit code, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("claude");
+        // Script that sleeps longer than our timeout.
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_millis(100),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend.generate("test prompt", None, &ctx).await;
+
+        assert!(result.is_err(), "timeout should produce an error");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
+            "error should mention timeout, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_includes_context_in_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Script that writes the prompt arg (everything after -p) to a file.
+        let prompt_file = tmp.path().join("captured_prompt.txt");
+        let script_path = tmp.path().join("claude");
+        // Capture the argument after -p.
+        let script_content = format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-p\" ]; then\n    shift\n    echo \"$1\" > {}\n    break\n  fi\n  shift\ndone\necho \"done\"\n",
+            prompt_file.display()
+        );
+        std::fs::write(&script_path, script_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_secs(10),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        ctx.set("project_name", serde_json::json!("my_project"));
+        ctx.set("_internal", serde_json::json!("hidden"));
+
+        backend.generate("do the thing", None, &ctx).await.unwrap();
+
+        let captured = std::fs::read_to_string(&prompt_file).unwrap();
+        assert!(
+            captured.contains("project_name"),
+            "prompt should include context key, got: {captured}"
+        );
+        assert!(
+            captured.contains("my_project"),
+            "prompt should include context value, got: {captured}"
+        );
+        assert!(
+            !captured.contains("_internal"),
+            "prompt should NOT include underscore-prefixed keys, got: {captured}"
+        );
+        assert!(
+            captured.contains("do the thing"),
+            "prompt should include original prompt, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_sets_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pwd_file = tmp.path().join("captured_pwd.txt");
+        let script_path = tmp.path().join("claude");
+        let script_content = format!("#!/bin/sh\npwd > {}\necho \"done\"\n", pwd_file.display());
+        std::fs::write(&script_path, script_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let work_dir = tmp.path().display().to_string();
+        let backend = ClaudeCliBackend {
+            working_dir: work_dir.clone(),
+            timeout: std::time::Duration::from_secs(10),
+            claude_path: Some(script_path.display().to_string()),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        backend.generate("test", None, &ctx).await.unwrap();
+
+        let captured_pwd = std::fs::read_to_string(&pwd_file).unwrap();
+        let captured_pwd = captured_pwd.trim();
+        // Resolve symlinks for comparison (macOS /tmp -> /private/tmp).
+        let expected = std::fs::canonicalize(tmp.path()).unwrap();
+        let actual = std::fs::canonicalize(captured_pwd).unwrap();
+        assert_eq!(actual, expected, "working dir should match");
     }
 }
