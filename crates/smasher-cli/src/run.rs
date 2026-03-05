@@ -199,14 +199,42 @@ impl CodergenBackend for ClaudeCliBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| HandlerError::Other(format!("failed to spawn claude CLI: {e}")))?;
+
+        // Take stdout/stderr handles before waiting so we retain the Child
+        // handle for kill-on-timeout. `child.wait()` borrows `&mut self`
+        // unlike `wait_with_output()` which consumes `self`.
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+
+        let output = match tokio::time::timeout(self.timeout, async {
+            let status = child.wait().await?;
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            if let Some(ref mut out) = stdout_handle {
+                tokio::io::AsyncReadExt::read_to_end(out, &mut stdout_buf).await?;
+            }
+            if let Some(ref mut err) = stderr_handle {
+                tokio::io::AsyncReadExt::read_to_end(err, &mut stderr_buf).await?;
+            }
+            Ok::<std::process::Output, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            })
+        })
+        .await
+        {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 return Err(HandlerError::Other(format!(
-                    "failed to spawn claude CLI: {e}"
+                    "failed to run claude CLI: {e}"
                 )));
             }
             Err(_) => {
+                let _ = child.kill().await;
                 return Err(HandlerError::Other(format!(
                     "claude CLI timed out after {}s",
                     self.timeout.as_secs()
