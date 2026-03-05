@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 /// Coarse categorisation of a node's execution result.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutcomeKind {
     /// Node completed successfully (Success or PartialSuccess).
     Success,
@@ -53,7 +53,7 @@ impl PipelineStats {
         let total_nodes_visited = node_timings.len();
         let mut nodes_by_outcome: HashMap<OutcomeKind, usize> = HashMap::new();
         for ns in &node_timings {
-            *nodes_by_outcome.entry(ns.outcome_kind.clone()).or_insert(0) += 1;
+            *nodes_by_outcome.entry(ns.outcome_kind).or_insert(0) += 1;
         }
         Self {
             total_nodes_visited,
