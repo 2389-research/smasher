@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 /// Identifies which LLM provider serves a model.
@@ -20,6 +21,19 @@ impl fmt::Display for Provider {
             Provider::Anthropic => write!(f, "anthropic"),
             Provider::OpenAi => write!(f, "openai"),
             Provider::Gemini => write!(f, "gemini"),
+        }
+    }
+}
+
+impl FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "anthropic" => Ok(Provider::Anthropic),
+            "openai" => Ok(Provider::OpenAi),
+            "gemini" | "google" => Ok(Provider::Gemini),
+            other => Err(format!("unknown provider: {other}")),
         }
     }
 }
@@ -1010,5 +1024,45 @@ mod tests {
         let haiku = lookup_model("claude-haiku-4-5-20251001").unwrap();
         assert!(opus.max_output_tokens >= sonnet.max_output_tokens);
         assert!(opus.max_output_tokens >= haiku.max_output_tokens);
+    }
+
+    // ── Provider FromStr ─────────────────────────────────────────────
+
+    #[test]
+    fn provider_from_str_known_names() {
+        assert_eq!(
+            "anthropic".parse::<Provider>().unwrap(),
+            Provider::Anthropic
+        );
+        assert_eq!("openai".parse::<Provider>().unwrap(), Provider::OpenAi);
+        assert_eq!("gemini".parse::<Provider>().unwrap(), Provider::Gemini);
+        assert_eq!("google".parse::<Provider>().unwrap(), Provider::Gemini);
+    }
+
+    #[test]
+    fn provider_from_str_case_insensitive() {
+        assert_eq!(
+            "Anthropic".parse::<Provider>().unwrap(),
+            Provider::Anthropic
+        );
+        assert_eq!("OPENAI".parse::<Provider>().unwrap(), Provider::OpenAi);
+        assert_eq!("Gemini".parse::<Provider>().unwrap(), Provider::Gemini);
+        assert_eq!("GOOGLE".parse::<Provider>().unwrap(), Provider::Gemini);
+    }
+
+    #[test]
+    fn provider_from_str_unknown_errors() {
+        assert!("martian".parse::<Provider>().is_err());
+        assert!("".parse::<Provider>().is_err());
+        assert!("gpt".parse::<Provider>().is_err());
+    }
+
+    #[test]
+    fn provider_from_str_roundtrips_with_display() {
+        for provider in [Provider::Anthropic, Provider::OpenAi, Provider::Gemini] {
+            let s = provider.to_string();
+            let back: Provider = s.parse().unwrap();
+            assert_eq!(provider, back);
+        }
     }
 }

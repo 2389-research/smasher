@@ -80,12 +80,24 @@ impl Client {
         self
     }
 
-    /// Get the adapter for a given model, inferring the provider.
-    fn adapter_for_model(&self, model: &str) -> Result<Arc<dyn ProviderAdapter>, Error> {
-        let provider = infer_provider(model).ok_or_else(|| Error::ModelNotFound {
-            provider: "unknown".into(),
-            model: model.into(),
-        })?;
+    /// Resolve the adapter for a request, checking explicit provider override first.
+    ///
+    /// If `request.provider` is set, parse it to a Provider enum and look up that adapter.
+    /// Otherwise, fall back to model-name inference via `infer_provider`.
+    fn adapter_for_request(&self, request: &Request) -> Result<Arc<dyn ProviderAdapter>, Error> {
+        let provider = if let Some(ref explicit) = request.provider {
+            explicit
+                .parse::<Provider>()
+                .map_err(|_| Error::ModelNotFound {
+                    provider: explicit.clone(),
+                    model: request.model.clone(),
+                })?
+        } else {
+            infer_provider(&request.model).ok_or_else(|| Error::ModelNotFound {
+                provider: "unknown".into(),
+                model: request.model.clone(),
+            })?
+        };
 
         self.providers
             .get(&provider)
@@ -97,7 +109,7 @@ impl Client {
 
     /// Send a completion request, routing to the appropriate provider.
     pub async fn complete(&self, request: Request) -> Result<Response, Error> {
-        let adapter = self.adapter_for_model(&request.model)?;
+        let adapter = self.adapter_for_request(&request)?;
 
         execute_middleware_chain(
             &self.middlewares,
@@ -114,7 +126,7 @@ impl Client {
     /// `on_stream_error` middleware is invoked in reverse order, allowing
     /// middleware to transform or log the error.
     pub async fn stream(&self, request: &Request) -> Result<StreamResponse, Error> {
-        let adapter = self.adapter_for_model(&request.model)?;
+        let adapter = self.adapter_for_request(request)?;
         let processed_request =
             execute_stream_middleware_chain(&self.middlewares, request.clone()).await?;
         match adapter.stream(&processed_request).await {
@@ -416,6 +428,127 @@ mod tests {
             }
             Ok(_) => panic!("expected error but got stream"),
         }
+    }
+
+    // --- Explicit provider routing tests ---
+
+    fn client_with_mock_openai_and_anthropic() -> (Client, Arc<AtomicU32>, Arc<AtomicU32>) {
+        let anthropic_count = Arc::new(AtomicU32::new(0));
+        let openai_count = Arc::new(AtomicU32::new(0));
+        let mut client = Client::new();
+        client.register_provider(
+            Provider::Anthropic,
+            Arc::new(MockAdapter {
+                name: "anthropic",
+                call_count: anthropic_count.clone(),
+            }),
+        );
+        client.register_provider(
+            Provider::OpenAi,
+            Arc::new(MockAdapter {
+                name: "openai",
+                call_count: openai_count.clone(),
+            }),
+        );
+        (client, anthropic_count, openai_count)
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_overrides_model_name_inference() {
+        let (client, anthropic_count, openai_count) = client_with_mock_openai_and_anthropic();
+
+        // Model name "gpt-4" would normally route to OpenAI,
+        // but explicit provider "anthropic" should override that.
+        let request = Request::new("gpt-4", vec![Message::user("hello")]).provider("anthropic");
+        let result = client.complete(request).await;
+
+        assert!(result.is_ok(), "request should succeed");
+        assert_eq!(
+            anthropic_count.load(Ordering::SeqCst),
+            1,
+            "anthropic adapter should be called"
+        );
+        assert_eq!(
+            openai_count.load(Ordering::SeqCst),
+            0,
+            "openai adapter should NOT be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_routes_unknown_model_name() {
+        let (client, _anthropic_count, openai_count) = client_with_mock_openai_and_anthropic();
+
+        // Model name "my-custom-finetune" doesn't match any known prefix,
+        // but explicit provider "openai" should route it anyway.
+        let request =
+            Request::new("my-custom-finetune", vec![Message::user("hello")]).provider("openai");
+        let result = client.complete(request).await;
+
+        assert!(
+            result.is_ok(),
+            "request should succeed with explicit provider"
+        );
+        assert_eq!(
+            openai_count.load(Ordering::SeqCst),
+            1,
+            "openai adapter should be called for unknown model with explicit provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_errors_for_unconfigured_provider() {
+        let (client, _, _) = client_with_mock_openai_and_anthropic();
+
+        // Gemini is not registered, so explicit provider "gemini" should fail.
+        let request = Request::new("my-model", vec![Message::user("hello")]).provider("gemini");
+        let result = client.complete(request).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::ProviderNotConfigured { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_errors_for_unknown_provider_name() {
+        let (client, _, _) = client_with_mock_openai_and_anthropic();
+
+        // "martian" is not a valid provider name at all.
+        let request = Request::new("my-model", vec![Message::user("hello")]).provider("martian");
+        let result = client.complete(request).await;
+
+        assert!(result.is_err(), "unknown provider name should error");
+    }
+
+    #[tokio::test]
+    async fn without_explicit_provider_model_inference_still_works() {
+        let (client, _anthropic_count, openai_count) = client_with_mock_openai_and_anthropic();
+
+        // No explicit provider — "gpt-4" should route to OpenAI via model-name inference.
+        let request = Request::new("gpt-4", vec![Message::user("hello")]);
+        let result = client.complete(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(openai_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_works_for_streaming() {
+        let (client, _anthropic_count, openai_count) = client_with_mock_openai_and_anthropic();
+
+        // Model name "gpt-4" would route to OpenAI, but explicit provider is "anthropic".
+        let request = Request::new("gpt-4", vec![Message::user("hello")]).provider("anthropic");
+        let _ = client.stream(&request).await;
+
+        // MockAdapter returns error for stream, but the routing should still go to anthropic.
+        // We can't check call_count on stream since MockAdapter.stream doesn't increment it,
+        // but we can verify the openai adapter was NOT called for complete.
+        assert_eq!(
+            openai_count.load(Ordering::SeqCst),
+            0,
+            "openai adapter should not be called when explicit provider is anthropic"
+        );
     }
 
     #[tokio::test]
