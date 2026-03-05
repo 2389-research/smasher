@@ -55,6 +55,14 @@ impl AgentTool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from (default 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default 2000)"
                 }
             },
             "required": ["path"]
@@ -72,10 +80,47 @@ impl AgentTool for ReadFileTool {
             Err(e) => return e,
         };
 
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(1);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(2000);
+
         let elapsed = || start.elapsed().as_millis() as u64;
 
         match self.env.read_file(path).await {
-            Ok(content) => ToolOutput::success(content, elapsed()),
+            Ok(content) => {
+                let all_lines: Vec<&str> = content.lines().collect();
+                let total = all_lines.len();
+                // offset is 1-based, convert to 0-based index
+                let start_idx = (offset - 1).min(total);
+                let end_idx = (start_idx + limit).min(total);
+                let selected = &all_lines[start_idx..end_idx];
+
+                // Determine width for right-aligned line numbers
+                let max_line_num = if selected.is_empty() {
+                    1
+                } else {
+                    start_idx + selected.len()
+                };
+                let width = max_line_num.to_string().len();
+
+                let formatted: Vec<String> = selected
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let line_num = start_idx + i + 1;
+                        format!("{line_num:>width$} | {line}")
+                    })
+                    .collect();
+
+                ToolOutput::success(formatted.join("\n"), elapsed())
+            }
             Err(e) => ToolOutput::error(e.to_string(), elapsed()),
         }
     }
@@ -649,7 +694,7 @@ mod tests {
     // -- ReadFileTool tests --
 
     #[tokio::test]
-    async fn read_file_reads_existing_file() {
+    async fn read_file_reads_existing_file_with_line_numbers() {
         let env: Arc<dyn ExecutionEnvironment> =
             Arc::new(MockEnvironment::new().with_file("/test/hello.txt", "hello world"));
         let tool = ReadFileTool::new(env);
@@ -657,7 +702,114 @@ mod tests {
         let result = tool.execute(r#"{"path": "/test/hello.txt"}"#).await;
 
         assert!(!result.is_error);
-        assert_eq!(result.content, "hello world");
+        assert_eq!(result.content, "1 | hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_multiline_line_numbers() {
+        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
+            MockEnvironment::new()
+                .with_file("/test/code.rs", "fn main() {\n    println!(\"hi\");\n}"),
+        );
+        let tool = ReadFileTool::new(env);
+
+        let result = tool.execute(r#"{"path": "/test/code.rs"}"#).await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("1 | fn main() {"));
+        assert!(result.content.contains("2 |     println!(\"hi\");"));
+        assert!(result.content.contains("3 | }"));
+    }
+
+    #[tokio::test]
+    async fn read_file_with_offset_and_limit() {
+        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
+            MockEnvironment::new()
+                .with_file("/test/lines.txt", "line1\nline2\nline3\nline4\nline5"),
+        );
+        let tool = ReadFileTool::new(env);
+
+        let result = tool
+            .execute(r#"{"path": "/test/lines.txt", "offset": 2, "limit": 2}"#)
+            .await;
+
+        assert!(!result.is_error);
+        // Should show lines 2 and 3 with original line numbers
+        assert!(
+            result.content.contains("2 | line2"),
+            "got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("3 | line3"),
+            "got: {}",
+            result.content
+        );
+        assert!(!result.content.contains("line1"));
+        assert!(!result.content.contains("line4"));
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_only_defaults_limit_2000() {
+        // Build a file with 10 lines; offset=3 should give lines 3..10 (well under 2000)
+        let lines: Vec<String> = (1..=10).map(|i| format!("row_{i}")).collect();
+        let content = lines.join("\n");
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/big.txt", &content));
+        let tool = ReadFileTool::new(env);
+
+        let result = tool
+            .execute(r#"{"path": "/test/big.txt", "offset": 3}"#)
+            .await;
+
+        assert!(!result.is_error);
+        assert!(!result.content.contains("row_1\n"));
+        assert!(!result.content.contains("row_2\n"));
+        assert!(result.content.contains(" 3 | row_3"));
+        assert!(result.content.contains("10 | row_10"));
+    }
+
+    #[tokio::test]
+    async fn read_file_limit_only_defaults_offset_1() {
+        let env: Arc<dyn ExecutionEnvironment> = Arc::new(
+            MockEnvironment::new()
+                .with_file("/test/lines.txt", "line1\nline2\nline3\nline4\nline5"),
+        );
+        let tool = ReadFileTool::new(env);
+
+        let result = tool
+            .execute(r#"{"path": "/test/lines.txt", "limit": 3}"#)
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("1 | line1"));
+        assert!(result.content.contains("3 | line3"));
+        assert!(!result.content.contains("line4"));
+    }
+
+    #[tokio::test]
+    async fn read_file_right_aligns_line_numbers() {
+        // A file with 100+ lines should have right-aligned numbers
+        let lines: Vec<String> = (1..=105).map(|i| format!("content{i}")).collect();
+        let content = lines.join("\n");
+        let env: Arc<dyn ExecutionEnvironment> =
+            Arc::new(MockEnvironment::new().with_file("/test/big.txt", &content));
+        let tool = ReadFileTool::new(env);
+
+        let result = tool.execute(r#"{"path": "/test/big.txt"}"#).await;
+
+        assert!(!result.is_error);
+        // Line 1 should be right-aligned to 3 digits width: "  1 | content1"
+        assert!(
+            result.content.contains("  1 | content1"),
+            "got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("105 | content105"),
+            "got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
