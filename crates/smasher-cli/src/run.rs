@@ -167,6 +167,9 @@ impl CodergenBackend for ClaudeCliBackend {
     async fn generate(
         &self,
         prompt: &str,
+        // The model parameter is intentionally not forwarded to the claude CLI —
+        // the CLI uses its own model selection. Per-node model overrides only
+        // apply to the agent backend.
         _model: Option<&str>,
         context: &Context,
     ) -> Result<Outcome, HandlerError> {
@@ -203,26 +206,47 @@ impl CodergenBackend for ClaudeCliBackend {
             .spawn()
             .map_err(|e| HandlerError::Other(format!("failed to spawn claude CLI: {e}")))?;
 
-        // Take stdout/stderr handles before waiting so we retain the Child
-        // handle for kill-on-timeout. `child.wait()` borrows `&mut self`
-        // unlike `wait_with_output()` which consumes `self`.
-        let mut stdout_handle = child.stdout.take();
-        let mut stderr_handle = child.stderr.take();
+        // Take stdout/stderr handles before waiting so we can read them
+        // concurrently with the child process. Reading must happen in parallel
+        // with wait(): if the child produces more output than the OS pipe
+        // buffer (64KB on Linux, 16KB on macOS), the child blocks on write
+        // and wait() never returns, causing a deadlock.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout_handle {
+                tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_handle {
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
 
         let output = match tokio::time::timeout(self.timeout, async {
-            let status = child.wait().await?;
-            let mut stdout_buf = Vec::new();
-            let mut stderr_buf = Vec::new();
-            if let Some(ref mut out) = stdout_handle {
-                tokio::io::AsyncReadExt::read_to_end(out, &mut stdout_buf).await?;
-            }
-            if let Some(ref mut err) = stderr_handle {
-                tokio::io::AsyncReadExt::read_to_end(err, &mut stderr_buf).await?;
-            }
+            let status = child.wait();
+            let stdout_join = async {
+                stdout_task
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            };
+            let stderr_join = async {
+                stderr_task
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            };
+            let (status, stdout, stderr) = tokio::try_join!(status, stdout_join, stderr_join)?;
             Ok::<std::process::Output, std::io::Error>(std::process::Output {
                 status,
-                stdout: stdout_buf,
-                stderr: stderr_buf,
+                stdout,
+                stderr,
             })
         })
         .await
