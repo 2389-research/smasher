@@ -82,16 +82,26 @@ impl Handler for ToolHandler {
 
         // Store the result in context for downstream nodes.
         let serialized = match &outcome {
-            Outcome::Success { data } => json!({
+            Outcome::Success { data, .. } => json!({
                 "status": "success",
                 "data": data,
             }),
-            Outcome::Failure { error, retryable } => json!({
+            Outcome::Failure {
+                error, retryable, ..
+            } => json!({
                 "status": "failure",
                 "error": error,
                 "retryable": retryable,
             }),
-            Outcome::Skip { reason } => json!({
+            Outcome::PartialSuccess { data, .. } => json!({
+                "status": "partial_success",
+                "data": data,
+            }),
+            Outcome::Retry { reason, .. } => json!({
+                "status": "retry",
+                "reason": reason,
+            }),
+            Outcome::Skip { reason, .. } => json!({
                 "status": "skip",
                 "reason": reason,
             }),
@@ -252,7 +262,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["tool"], "echo");
                 assert_eq!(data["args"], json!({}));
             }
@@ -284,7 +296,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["tool"], "format");
                 assert_eq!(data["args"]["input"], "hello");
                 assert_eq!(data["args"]["style"], "bold");
@@ -309,7 +323,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["tool"], "my_tool");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -508,7 +524,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["tool"], "attr_tool");
             }
             other => panic!("expected success, got {other:?}"),

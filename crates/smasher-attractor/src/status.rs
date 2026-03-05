@@ -54,13 +54,27 @@ impl NodeOutcomeStatus {
                 retryable: false,
                 attempts,
             },
-            Outcome::Failure { error, retryable } => Self {
+            Outcome::PartialSuccess { .. } => Self {
+                status: "partial_success".to_string(),
+                error: None,
+                retryable: false,
+                attempts,
+            },
+            Outcome::Failure {
+                error, retryable, ..
+            } => Self {
                 status: "failure".to_string(),
                 error: Some(error.clone()),
                 retryable: *retryable,
                 attempts,
             },
-            Outcome::Skip { reason } => Self {
+            Outcome::Retry { reason, .. } => Self {
+                status: "retry".to_string(),
+                error: Some(reason.clone()),
+                retryable: true,
+                attempts,
+            },
+            Outcome::Skip { reason, .. } => Self {
                 status: "skip".to_string(),
                 error: Some(reason.clone()),
                 retryable: false,

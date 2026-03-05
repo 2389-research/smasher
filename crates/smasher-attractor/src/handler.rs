@@ -165,11 +165,14 @@ impl Handler for ConditionalHandler {
     async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
         let condition_str = match node.attrs.get("condition") {
             Some(NodeAttrValue::String(s)) => s.clone(),
-            _ => {
-                return Ok(Outcome::failure(
-                    "no condition attribute on conditional node",
-                ));
-            }
+            _ => match &node.label {
+                Some(label) => label.clone(),
+                None => {
+                    return Ok(Outcome::failure(
+                        "no condition attribute on conditional node",
+                    ));
+                }
+            },
         };
 
         let parsed = match parse_condition(&condition_str) {
@@ -480,7 +483,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data, json!({"result": true}));
             }
             other => panic!("expected Success with data, got {other:?}"),
@@ -502,7 +507,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data, json!({"result": false}));
             }
             other => panic!("expected Success with data, got {other:?}"),
@@ -510,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_handler_no_condition_attribute() {
+    async fn conditional_handler_no_condition_attribute_no_label() {
         let handler = ConditionalHandler;
         let node = make_node("c3", NodeType::Conditional);
         let ctx = Context::new();
@@ -522,6 +529,27 @@ mod tests {
                 assert!(error.contains("no condition attribute"));
             }
             other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_handler_falls_back_to_label() {
+        let handler = ConditionalHandler;
+        let mut node = make_node("c3b", NodeType::Conditional);
+        node.label = Some("status=done".to_string());
+
+        let ctx = Context::new();
+        ctx.set("status", json!("done"));
+
+        let result = handler.execute(&node, &ctx).await.unwrap();
+        assert!(result.is_success());
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                assert_eq!(data, json!({"result": true}));
+            }
+            other => panic!("expected Success with data, got {other:?}"),
         }
     }
 
@@ -567,7 +595,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data, json!({"generated": "write hello world"}));
             }
             other => panic!("expected success with generated data, got {other:?}"),
@@ -585,7 +615,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data, json!({"generated": "label prompt"}));
             }
             other => panic!("expected success with generated data, got {other:?}"),
@@ -630,7 +662,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["prompt"], "do something");
                 assert_eq!(data["model"], "gpt-4");
             }
@@ -699,7 +733,9 @@ mod tests {
 
         let result = registry.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data, json!({"handler": "generic_test"}));
             }
             other => panic!("expected success, got {other:?}"),

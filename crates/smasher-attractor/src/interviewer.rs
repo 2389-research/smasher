@@ -1020,7 +1020,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "approved");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1038,7 +1040,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "yes please");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1083,7 +1087,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "blue");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1107,7 +1113,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "yes");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1167,7 +1175,7 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Skip { reason } => {
+            Outcome::Skip { reason, .. } => {
                 assert_eq!(reason, "interview cancelled");
             }
             other => panic!("expected skip, got {other:?}"),
@@ -1263,7 +1271,7 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Skip { reason } => {
+            Outcome::Skip { reason, .. } => {
                 assert_eq!(reason, "interview cancelled");
             }
             other => panic!("expected skip, got {other:?}"),
@@ -1290,7 +1298,7 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Skip { reason } => {
+            Outcome::Skip { reason, .. } => {
                 assert_eq!(reason, "interview cancelled");
             }
             other => panic!("expected skip, got {other:?}"),
@@ -1564,7 +1572,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "proceed");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1587,7 +1597,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "go ahead");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1615,7 +1627,9 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "answer to: question attr");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1635,7 +1649,9 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "answer to: label question");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1694,7 +1710,7 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         match result {
-            Outcome::Skip { reason } => {
+            Outcome::Skip { reason, .. } => {
                 assert_eq!(reason, "human gate cancelled");
             }
             other => panic!("expected skip, got {other:?}"),
@@ -2028,7 +2044,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "auto-approved");
                 assert_eq!(data["defaulted"], true);
             }
@@ -2096,7 +2114,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "slow response");
             }
             other => panic!("expected success, got {other:?}"),
@@ -2126,7 +2146,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 // Got the real response, not the default
                 assert_eq!(data["response"], "slow response");
                 assert!(data.get("defaulted").is_none());
@@ -2156,7 +2178,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "node-level-default");
                 assert_eq!(data["defaulted"], true);
             }
@@ -2189,7 +2213,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "node-wins");
             }
             other => panic!("expected success with node override, got {other:?}"),
@@ -2212,7 +2238,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["response"], "slow response");
             }
             other => panic!("expected success, got {other:?}"),

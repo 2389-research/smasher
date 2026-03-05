@@ -75,16 +75,26 @@ impl Handler for ManagerHandler {
 
         // Store the result in context for downstream nodes.
         let serialized = match &outcome {
-            Outcome::Success { data } => json!({
+            Outcome::Success { data, .. } => json!({
                 "status": "success",
                 "data": data,
             }),
-            Outcome::Failure { error, retryable } => json!({
+            Outcome::Failure {
+                error, retryable, ..
+            } => json!({
                 "status": "failure",
                 "error": error,
                 "retryable": retryable,
             }),
-            Outcome::Skip { reason } => json!({
+            Outcome::PartialSuccess { data, .. } => json!({
+                "status": "partial_success",
+                "data": data,
+            }),
+            Outcome::Retry { reason, .. } => json!({
+                "status": "retry",
+                "reason": reason,
+            }),
+            Outcome::Skip { reason, .. } => json!({
                 "status": "skip",
                 "reason": reason,
             }),
@@ -252,7 +262,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["task"], "deploy_pipeline");
                 assert_eq!(data["config"], json!({}));
             }
@@ -284,7 +296,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["task"], "run_tests");
                 assert_eq!(data["config"]["parallelism"], 4);
                 assert_eq!(data["config"]["timeout"], 300);
@@ -309,7 +323,9 @@ mod tests {
 
         assert!(result.is_success());
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["task"], "build_and_deploy");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -404,7 +420,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["task"], "check_upstream");
                 assert_eq!(data["upstream"], "some_value");
             }
@@ -473,7 +491,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["task"], "attr_task");
             }
             other => panic!("expected success, got {other:?}"),
@@ -574,7 +594,9 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
 
         match result {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["config"], json!({}));
             }
             other => panic!("expected success, got {other:?}"),

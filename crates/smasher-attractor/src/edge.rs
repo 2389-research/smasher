@@ -29,8 +29,14 @@ fn edge_matches_outcome(edge: &GraphEdge, outcome: &Outcome) -> bool {
     };
 
     match outcome {
-        Outcome::Success { .. } => matches!(label.as_str(), "success" | "yes" | "true"),
+        Outcome::Success { .. } | Outcome::PartialSuccess { .. } => {
+            matches!(
+                label.as_str(),
+                "success" | "yes" | "true" | "partial_success"
+            )
+        }
         Outcome::Failure { .. } => matches!(label.as_str(), "failure" | "error" | "no" | "false"),
+        Outcome::Retry { .. } => matches!(label.as_str(), "retry" | "failure" | "error"),
         Outcome::Skip { .. } => label.as_str() == "skip",
     }
 }

@@ -596,11 +596,11 @@ impl Engine {
                             });
                         }
                     }
-                    Outcome::Success { .. } => {
+                    Outcome::Success { .. } | Outcome::PartialSuccess { .. } => {
                         // On success, remove any failure signatures for this node.
                         failure_signatures.retain(|_, (nid, _, _)| nid != &current_node_id);
                     }
-                    Outcome::Skip { .. } => {}
+                    Outcome::Retry { .. } | Outcome::Skip { .. } => {}
                 }
             }
 
@@ -649,8 +649,9 @@ impl Engine {
             // Inject outcome status into context so condition expressions like
             // `outcome=success` can match against it during edge selection.
             let outcome_label = match &outcome {
-                Outcome::Success { .. } => "success",
+                Outcome::Success { .. } | Outcome::PartialSuccess { .. } => "success",
                 Outcome::Failure { .. } => "fail",
+                Outcome::Retry { .. } => "retry",
                 Outcome::Skip { .. } => "skip",
             };
             context.set("outcome", serde_json::json!(outcome_label));

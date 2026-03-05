@@ -913,7 +913,9 @@ mod tests {
         let outcome = handler.execute(&node, &ctx).await.unwrap();
         assert!(outcome.is_success());
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["handler"], "parallel");
                 assert_eq!(data["max_concurrency"], 10);
                 assert_eq!(data["fail_fast"], false);
@@ -937,7 +939,9 @@ mod tests {
         let outcome = handler.execute(&node, &ctx).await.unwrap();
 
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["max_concurrency"], 4);
                 assert_eq!(data["fail_fast"], true);
             }
@@ -960,7 +964,9 @@ mod tests {
         let outcome = handler.execute(&node, &ctx).await.unwrap();
 
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["max_concurrency"], 3);
                 assert_eq!(data["fail_fast"], true);
             }
@@ -986,7 +992,9 @@ mod tests {
         let outcome = handler.execute(&node, &ctx).await.unwrap();
 
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["max_concurrency"], 20);
                 // fail_fast falls back to handler config
                 assert_eq!(data["fail_fast"], true);
@@ -1299,7 +1307,9 @@ mod tests {
 
         let outcome = handler.execute(&node, &ctx).await.unwrap();
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["merge_strategy"], "error");
             }
             other => panic!("expected success with data, got {other:?}"),
@@ -1315,7 +1325,9 @@ mod tests {
 
         let outcome = handler.execute(&node, &ctx).await.unwrap();
         match outcome {
-            Outcome::Success { data: Some(data) } => {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
                 assert_eq!(data["merge_strategy"], "last_write_wins");
             }
             other => panic!("expected success with data, got {other:?}"),

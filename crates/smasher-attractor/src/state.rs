@@ -292,22 +292,104 @@ impl Context {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outcome {
     /// Node completed successfully, optionally producing data.
-    Success { data: Option<serde_json::Value> },
+    Success {
+        data: Option<serde_json::Value>,
+        /// Label hint for edge selection (overrides default "success").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preferred_label: Option<String>,
+        /// Downstream node IDs the handler recommends visiting next.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggested_next_ids: Option<Vec<String>>,
+        /// Key-value pairs to merge into the pipeline context.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_updates: Option<HashMap<String, serde_json::Value>>,
+        /// Free-form notes attached by the handler.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
+    /// Node partially succeeded — some work completed but not all.
+    PartialSuccess {
+        data: Option<serde_json::Value>,
+        /// Label hint for edge selection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preferred_label: Option<String>,
+        /// Downstream node IDs the handler recommends visiting next.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggested_next_ids: Option<Vec<String>>,
+        /// Key-value pairs to merge into the pipeline context.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_updates: Option<HashMap<String, serde_json::Value>>,
+        /// Free-form notes attached by the handler.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
     /// Node failed, possibly retryable.
-    Failure { error: String, retryable: bool },
+    Failure {
+        error: String,
+        retryable: bool,
+        /// Free-form notes attached by the handler.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
+    /// The handler explicitly requests a retry (always retryable).
+    Retry {
+        reason: String,
+        /// Free-form notes attached by the handler.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
     /// Node was skipped for the given reason.
-    Skip { reason: String },
+    Skip {
+        reason: String,
+        /// Free-form notes attached by the handler.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
 }
 
 impl Outcome {
     /// Create a success outcome with no data.
     pub fn success() -> Self {
-        Self::Success { data: None }
+        Self::Success {
+            data: None,
+            preferred_label: None,
+            suggested_next_ids: None,
+            context_updates: None,
+            notes: None,
+        }
     }
 
     /// Create a success outcome carrying output data.
     pub fn success_with(data: serde_json::Value) -> Self {
-        Self::Success { data: Some(data) }
+        Self::Success {
+            data: Some(data),
+            preferred_label: None,
+            suggested_next_ids: None,
+            context_updates: None,
+            notes: None,
+        }
+    }
+
+    /// Create a partial-success outcome with no data.
+    pub fn partial_success() -> Self {
+        Self::PartialSuccess {
+            data: None,
+            preferred_label: None,
+            suggested_next_ids: None,
+            context_updates: None,
+            notes: None,
+        }
+    }
+
+    /// Create a partial-success outcome carrying output data.
+    pub fn partial_success_with(data: serde_json::Value) -> Self {
+        Self::PartialSuccess {
+            data: Some(data),
+            preferred_label: None,
+            suggested_next_ids: None,
+            context_updates: None,
+            notes: None,
+        }
     }
 
     /// Create a non-retryable failure outcome.
@@ -315,6 +397,7 @@ impl Outcome {
         Self::Failure {
             error: error.into(),
             retryable: false,
+            notes: None,
         }
     }
 
@@ -323,6 +406,15 @@ impl Outcome {
         Self::Failure {
             error: error.into(),
             retryable: true,
+            notes: None,
+        }
+    }
+
+    /// Create a retry outcome requesting re-execution.
+    pub fn retry(reason: impl Into<String>) -> Self {
+        Self::Retry {
+            reason: reason.into(),
+            notes: None,
         }
     }
 
@@ -330,12 +422,132 @@ impl Outcome {
     pub fn skip(reason: impl Into<String>) -> Self {
         Self::Skip {
             reason: reason.into(),
+            notes: None,
         }
     }
 
-    /// Returns true if this outcome is a success.
+    // ----- Builder methods -----
+
+    /// Set the preferred label for edge selection (Success and PartialSuccess only).
+    pub fn with_preferred_label(mut self, label: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Success {
+                preferred_label, ..
+            }
+            | Self::PartialSuccess {
+                preferred_label, ..
+            } => {
+                *preferred_label = Some(label.into());
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set suggested downstream node IDs (Success and PartialSuccess only).
+    pub fn with_suggested_next_ids(mut self, ids: Vec<String>) -> Self {
+        match &mut self {
+            Self::Success {
+                suggested_next_ids, ..
+            }
+            | Self::PartialSuccess {
+                suggested_next_ids, ..
+            } => {
+                *suggested_next_ids = Some(ids);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set context updates to merge into the pipeline context (Success and PartialSuccess only).
+    pub fn with_context_updates(mut self, updates: HashMap<String, serde_json::Value>) -> Self {
+        match &mut self {
+            Self::Success {
+                context_updates, ..
+            }
+            | Self::PartialSuccess {
+                context_updates, ..
+            } => {
+                *context_updates = Some(updates);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set free-form notes on any outcome variant.
+    pub fn with_notes(mut self, text: impl Into<String>) -> Self {
+        let text = Some(text.into());
+        match &mut self {
+            Self::Success { notes, .. }
+            | Self::PartialSuccess { notes, .. }
+            | Self::Failure { notes, .. }
+            | Self::Retry { notes, .. }
+            | Self::Skip { notes, .. } => {
+                *notes = text;
+            }
+        }
+        self
+    }
+
+    // ----- Accessor methods -----
+
+    /// Returns the preferred label, if set (Success and PartialSuccess only).
+    pub fn preferred_label(&self) -> Option<&str> {
+        match self {
+            Self::Success {
+                preferred_label, ..
+            }
+            | Self::PartialSuccess {
+                preferred_label, ..
+            } => preferred_label.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns suggested next node IDs, if set (Success and PartialSuccess only).
+    pub fn suggested_next_ids(&self) -> Option<&[String]> {
+        match self {
+            Self::Success {
+                suggested_next_ids, ..
+            }
+            | Self::PartialSuccess {
+                suggested_next_ids, ..
+            } => suggested_next_ids.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns context updates, if set (Success and PartialSuccess only).
+    pub fn context_updates(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        match self {
+            Self::Success {
+                context_updates, ..
+            }
+            | Self::PartialSuccess {
+                context_updates, ..
+            } => context_updates.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Returns notes, if set (all variants).
+    pub fn notes(&self) -> Option<&str> {
+        match self {
+            Self::Success { notes, .. }
+            | Self::PartialSuccess { notes, .. }
+            | Self::Failure { notes, .. }
+            | Self::Retry { notes, .. }
+            | Self::Skip { notes, .. } => notes.as_deref(),
+        }
+    }
+
+    // ----- Predicates -----
+
+    /// Returns true if this outcome is a success (full or partial).
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
+        matches!(self, Self::Success { .. } | Self::PartialSuccess { .. })
     }
 
     /// Returns true if this outcome is a failure (retryable or not).
@@ -343,14 +555,14 @@ impl Outcome {
         matches!(self, Self::Failure { .. })
     }
 
-    /// Returns true if this outcome is a retryable failure.
+    /// Returns true if this outcome is retryable (Failure with retryable=true, or Retry).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::Failure {
                 retryable: true,
                 ..
-            }
+            } | Self::Retry { .. }
         )
     }
 }
@@ -1209,7 +1421,10 @@ mod tests {
         assert!(o.is_success());
         assert!(!o.is_failure());
         assert!(!o.is_retryable());
-        assert_eq!(o, Outcome::Success { data: None });
+        match &o {
+            Outcome::Success { data, .. } => assert!(data.is_none()),
+            other => panic!("expected Success, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1217,7 +1432,10 @@ mod tests {
         let data = json!({"result": "ok"});
         let o = Outcome::success_with(data.clone());
         assert!(o.is_success());
-        assert_eq!(o, Outcome::Success { data: Some(data) });
+        match &o {
+            Outcome::Success { data: Some(d), .. } => assert_eq!(*d, data),
+            other => panic!("expected Success with data, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1226,13 +1444,15 @@ mod tests {
         assert!(o.is_failure());
         assert!(!o.is_retryable());
         assert!(!o.is_success());
-        assert_eq!(
-            o,
+        match &o {
             Outcome::Failure {
-                error: "something broke".to_string(),
-                retryable: false,
+                error, retryable, ..
+            } => {
+                assert_eq!(error, "something broke");
+                assert!(!retryable);
             }
-        );
+            other => panic!("expected Failure, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1240,13 +1460,15 @@ mod tests {
         let o = Outcome::retryable_failure("transient error");
         assert!(o.is_failure());
         assert!(o.is_retryable());
-        assert_eq!(
-            o,
+        match &o {
             Outcome::Failure {
-                error: "transient error".to_string(),
-                retryable: true,
+                error, retryable, ..
+            } => {
+                assert_eq!(error, "transient error");
+                assert!(retryable);
             }
-        );
+            other => panic!("expected Failure, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1255,28 +1477,124 @@ mod tests {
         assert!(!o.is_success());
         assert!(!o.is_failure());
         assert!(!o.is_retryable());
-        assert_eq!(
-            o,
-            Outcome::Skip {
-                reason: "not applicable".to_string(),
-            }
-        );
+        match &o {
+            Outcome::Skip { reason, .. } => assert_eq!(reason, "not applicable"),
+            other => panic!("expected Skip, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_partial_success_no_data() {
+        let o = Outcome::partial_success();
+        assert!(o.is_success());
+        assert!(!o.is_failure());
+        assert!(!o.is_retryable());
+        match &o {
+            Outcome::PartialSuccess { data, .. } => assert!(data.is_none()),
+            other => panic!("expected PartialSuccess, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_partial_success_with_data() {
+        let data = json!({"partial": true});
+        let o = Outcome::partial_success_with(data.clone());
+        assert!(o.is_success());
+        match &o {
+            Outcome::PartialSuccess { data: Some(d), .. } => assert_eq!(*d, data),
+            other => panic!("expected PartialSuccess with data, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_retry() {
+        let o = Outcome::retry("rate limited");
+        assert!(!o.is_success());
+        assert!(!o.is_failure());
+        assert!(o.is_retryable());
+        match &o {
+            Outcome::Retry { reason, .. } => assert_eq!(reason, "rate limited"),
+            other => panic!("expected Retry, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_builder_preferred_label() {
+        let o = Outcome::success().with_preferred_label("custom_route");
+        assert_eq!(o.preferred_label(), Some("custom_route"));
+
+        // Builder is a no-op on non-applicable variants.
+        let o2 = Outcome::failure("err").with_preferred_label("ignored");
+        assert_eq!(o2.preferred_label(), None);
+    }
+
+    #[test]
+    fn outcome_builder_suggested_next_ids() {
+        let ids = vec!["node_a".to_string(), "node_b".to_string()];
+        let o = Outcome::success().with_suggested_next_ids(ids.clone());
+        assert_eq!(o.suggested_next_ids(), Some(ids.as_slice()));
+    }
+
+    #[test]
+    fn outcome_builder_context_updates() {
+        let mut updates = HashMap::new();
+        updates.insert("key".to_string(), json!("value"));
+        let o = Outcome::partial_success().with_context_updates(updates.clone());
+        assert_eq!(o.context_updates(), Some(&updates));
+    }
+
+    #[test]
+    fn outcome_builder_notes_all_variants() {
+        let variants = vec![
+            Outcome::success().with_notes("s"),
+            Outcome::partial_success().with_notes("ps"),
+            Outcome::failure("err").with_notes("f"),
+            Outcome::retry("r").with_notes("rt"),
+            Outcome::skip("sk").with_notes("sk_note"),
+        ];
+        let expected = ["s", "ps", "f", "rt", "sk_note"];
+        for (o, exp) in variants.iter().zip(expected.iter()) {
+            assert_eq!(o.notes(), Some(*exp));
+        }
     }
 
     #[test]
     fn outcome_serialization_roundtrip() {
+        let mut ctx_updates = HashMap::new();
+        ctx_updates.insert("k".to_string(), json!(42));
+
         let outcomes = vec![
             Outcome::success(),
             Outcome::success_with(json!({"x": 1})),
+            Outcome::success()
+                .with_preferred_label("custom")
+                .with_suggested_next_ids(vec!["a".into()])
+                .with_context_updates(ctx_updates)
+                .with_notes("annotated"),
+            Outcome::partial_success(),
+            Outcome::partial_success_with(json!({"partial": true})),
             Outcome::failure("err"),
             Outcome::retryable_failure("retry_err"),
+            Outcome::retry("rate limit"),
+            Outcome::retry("again").with_notes("try #3"),
             Outcome::skip("skipped"),
+            Outcome::skip("skipped").with_notes("reason detail"),
         ];
         for original in &outcomes {
             let json_str = serde_json::to_string(original).unwrap();
             let deserialized: Outcome = serde_json::from_str(&json_str).unwrap();
             assert_eq!(*original, deserialized);
         }
+    }
+
+    #[test]
+    fn outcome_optional_fields_omitted_in_json() {
+        // A plain success() should not include optional fields in the JSON output.
+        let json_str = serde_json::to_string(&Outcome::success()).unwrap();
+        assert!(!json_str.contains("preferred_label"));
+        assert!(!json_str.contains("suggested_next_ids"));
+        assert!(!json_str.contains("context_updates"));
+        assert!(!json_str.contains("notes"));
     }
 
     // ---------------------------------------------------------------

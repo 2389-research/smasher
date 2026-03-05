@@ -851,7 +851,9 @@ async fn outcome_handler_returns_failure() {
     let result = handler.execute(&node, &ctx).await.unwrap();
     assert!(result.is_failure());
     match result {
-        Outcome::Failure { error, retryable } => {
+        Outcome::Failure {
+            error, retryable, ..
+        } => {
             assert_eq!(error, "test error");
             assert!(!retryable);
         }
@@ -889,7 +891,7 @@ async fn outcome_handler_returns_skip() {
 
     let result = handler.execute(&node, &ctx).await.unwrap();
     match result {
-        Outcome::Skip { reason } => {
+        Outcome::Skip { reason, .. } => {
             assert_eq!(reason, "not applicable");
         }
         other => panic!("expected Skip, got: {other:?}"),
@@ -911,7 +913,7 @@ async fn outcome_handler_returns_success_with_data() {
 
     let result = handler.execute(&node, &ctx).await.unwrap();
     match result {
-        Outcome::Success { data: Some(d) } => {
+        Outcome::Success { data: Some(d), .. } => {
             assert_eq!(d, data);
         }
         other => panic!("expected Success with data, got: {other:?}"),
@@ -990,7 +992,7 @@ async fn delayed_handler_returns_data_with_node_and_delay() {
 
     let result = handler.execute(&node, &ctx).await.unwrap();
     match result {
-        Outcome::Success { data: Some(d) } => {
+        Outcome::Success { data: Some(d), .. } => {
             assert_eq!(d["node"], "data_node");
             assert_eq!(d["delayed_ms"], 5);
         }
