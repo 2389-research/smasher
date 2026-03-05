@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::EventEmitter;
+use crate::loop_detection::LoopDetector;
 use crate::profile::{ProviderProfile, SystemPromptConfig, profile_for_model};
 use crate::tools::ToolRegistry;
 use crate::types::{SessionConfig, SessionEvent, SessionPhase, SessionState, Turn};
@@ -130,6 +131,7 @@ pub struct Session {
     profile: Box<dyn ProviderProfile>,
     cancel_token: CancellationToken,
     context_tracker: Option<ContextWindowTracker>,
+    loop_detector: LoopDetector,
 }
 
 impl Session {
@@ -157,6 +159,7 @@ impl Session {
             profile,
             cancel_token: CancellationToken::new(),
             context_tracker,
+            loop_detector: LoopDetector::default(),
         }
     }
 
@@ -349,6 +352,29 @@ impl Session {
                     is_error: output.is_error,
                     duration_ms: output.duration_ms,
                 });
+
+                // Record tool call in loop detector and check for repeating patterns
+                self.loop_detector.record(&tc.name, &tc.arguments);
+                if let Some(loop_pattern) = self.loop_detector.detect_loop() {
+                    self.event_emitter.emit(SessionEvent::LoopDetected {
+                        pattern: loop_pattern.description.clone(),
+                        window_size: loop_pattern.pattern.len(),
+                    });
+
+                    // Inject a steering message to warn the model about the detected loop
+                    let warning = format!(
+                        "WARNING: A repeating tool-call loop has been detected: {}. \
+                         You appear to be repeating the same actions without making progress. \
+                         Please try a different approach.",
+                        loop_pattern.description
+                    );
+                    self.state
+                        .messages
+                        .push(smasher_llm::types::Message::user(&warning));
+
+                    // Reset the detector so we don't fire continuously
+                    self.loop_detector.reset();
+                }
             }
 
             // Update request messages for the next iteration
@@ -2141,6 +2167,117 @@ mod tests {
         assert_eq!(
             warning_count, 1,
             "ContextWindowWarning should be emitted exactly once, got {warning_count}"
+        );
+    }
+
+    // ── Loop detection integration ────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_detected_event_emitted_after_repeated_identical_tool_calls() {
+        // LoopDetector default min_repetitions is 3, so we need 3+ identical calls.
+        // We queue 4 identical tool-call responses, then a final text response.
+        let mut responses = VecDeque::new();
+        for i in 0..4 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"same"}"#,
+            ));
+        }
+        responses.push_back(text_response("Done looping."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Loop away").await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let loop_event = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::LoopDetected { .. }));
+        assert!(
+            loop_event.is_some(),
+            "LoopDetected event should be emitted after repeated identical tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_detected_injects_steering_message() {
+        // After loop detection, a steering warning should appear in the conversation messages.
+        let mut responses = VecDeque::new();
+        for i in 0..4 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                r#"{"text":"same"}"#,
+            ));
+        }
+        responses.push_back(text_response("Acknowledged."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Loop").await;
+
+        let messages = session.messages();
+        let has_loop_warning = messages.iter().any(|m| {
+            m.is_user()
+                && m.text()
+                    .map_or(false, |t| t.contains("loop") || t.contains("repeating"))
+        });
+        assert!(
+            has_loop_warning,
+            "A steering message warning about the loop should be injected into conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_loop_detected_for_varied_tool_calls() {
+        // Different tool call arguments each time should not trigger loop detection.
+        let mut responses = VecDeque::new();
+        for i in 0..3 {
+            responses.push_back(tool_call_response(
+                "echo",
+                &format!("call_{i}"),
+                &format!(r#"{{"text":"different_{i}"}}"#),
+            ));
+        }
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(EchoTool);
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let _ = session.process_input("Varied calls").await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let loop_event = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::LoopDetected { .. }));
+        assert!(
+            loop_event.is_none(),
+            "LoopDetected should NOT be emitted for varied tool calls"
         );
     }
 
