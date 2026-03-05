@@ -16,7 +16,7 @@
 //!
 //! - [`StartHandler`] -- marks the pipeline as started.
 //! - [`ExitHandler`] -- marks the pipeline as completed.
-//! - [`ConditionalHandler`] -- evaluates a boolean condition from node attributes.
+//! - [`ConditionalHandler`] -- no-op that returns success; routing via edge conditions.
 //! - [`CodergenHandler`] -- delegates to a pluggable [`CodergenBackend`] for
 //!   LLM-powered code generation.
 //!
@@ -63,7 +63,6 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::condition::{evaluate_condition, parse_condition};
 use crate::graph::{GraphNode, NodeAttrValue, NodeType};
 use crate::state::{Context, Outcome};
 
@@ -152,8 +151,10 @@ impl Handler for ExitHandler {
     }
 }
 
-/// Handler for Conditional nodes. Parses and evaluates the `condition`
-/// attribute against the context's string map.
+/// Handler for Conditional nodes. Returns success unconditionally.
+///
+/// The handler itself is a no-op; actual routing is handled by the execution
+/// engine's edge selection algorithm using edge conditions.
 pub struct ConditionalHandler;
 
 #[async_trait::async_trait]
@@ -162,29 +163,12 @@ impl Handler for ConditionalHandler {
         "conditional"
     }
 
-    async fn execute(&self, node: &GraphNode, context: &Context) -> Result<Outcome, HandlerError> {
-        let condition_str = match node.attrs.get("condition") {
-            Some(NodeAttrValue::String(s)) => s.clone(),
-            _ => match &node.label {
-                Some(label) => label.clone(),
-                None => {
-                    return Ok(Outcome::failure(
-                        "no condition attribute on conditional node",
-                    ));
-                }
-            },
-        };
-
-        let parsed = match parse_condition(&condition_str) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Outcome::failure(e.to_string()));
-            }
-        };
-
-        let string_map = context.to_string_map();
-        let result = evaluate_condition(&parsed, &string_map);
-        Ok(Outcome::success_with(json!({"result": result})))
+    async fn execute(
+        &self,
+        _node: &GraphNode,
+        _context: &Context,
+    ) -> Result<Outcome, HandlerError> {
+        Ok(Outcome::success())
     }
 
     fn handles(&self, node_type: &NodeType) -> bool {
@@ -469,31 +453,27 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn conditional_handler_true_condition() {
+    async fn conditional_handler_is_noop_returns_success() {
+        // Per spec: "The handler itself is a no-op that returns SUCCESS;
+        // the actual routing is handled by the execution engine's edge
+        // selection algorithm."
         let handler = ConditionalHandler;
-        let mut node = make_node("c1", NodeType::Conditional);
-        node.attrs.insert(
-            "condition".to_string(),
-            NodeAttrValue::String("status=done".to_string()),
-        );
-
+        let node = make_node("c1", NodeType::Conditional);
         let ctx = Context::new();
-        ctx.set("status", json!("done"));
 
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
+        // Must return bare success with no data — routing is in edge selection.
         match result {
-            Outcome::Success {
-                data: Some(data), ..
-            } => {
-                assert_eq!(data, json!({"result": true}));
-            }
-            other => panic!("expected Success with data, got {other:?}"),
+            Outcome::Success { data: None, .. } => {}
+            other => panic!("expected bare Success (no data), got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn conditional_handler_false_condition() {
+    async fn conditional_handler_ignores_condition_attribute() {
+        // Even when a condition attribute is present, the handler should
+        // still return bare success without evaluating anything.
         let handler = ConditionalHandler;
         let mut node = make_node("c2", NodeType::Conditional);
         node.attrs.insert(
@@ -507,65 +487,20 @@ mod tests {
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
         match result {
-            Outcome::Success {
-                data: Some(data), ..
-            } => {
-                assert_eq!(data, json!({"result": false}));
-            }
-            other => panic!("expected Success with data, got {other:?}"),
+            Outcome::Success { data: None, .. } => {}
+            other => panic!("expected bare Success (no data), got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn conditional_handler_no_condition_attribute_no_label() {
+    async fn conditional_handler_ignores_missing_condition() {
+        // No condition attribute and no label — should still succeed.
         let handler = ConditionalHandler;
         let node = make_node("c3", NodeType::Conditional);
         let ctx = Context::new();
 
         let result = handler.execute(&node, &ctx).await.unwrap();
-        assert!(result.is_failure());
-        match result {
-            Outcome::Failure { error, .. } => {
-                assert!(error.contains("no condition attribute"));
-            }
-            other => panic!("expected failure, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn conditional_handler_falls_back_to_label() {
-        let handler = ConditionalHandler;
-        let mut node = make_node("c3b", NodeType::Conditional);
-        node.label = Some("status=done".to_string());
-
-        let ctx = Context::new();
-        ctx.set("status", json!("done"));
-
-        let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
-        match result {
-            Outcome::Success {
-                data: Some(data), ..
-            } => {
-                assert_eq!(data, json!({"result": true}));
-            }
-            other => panic!("expected Success with data, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn conditional_handler_invalid_condition() {
-        let handler = ConditionalHandler;
-        let mut node = make_node("c4", NodeType::Conditional);
-        node.attrs.insert(
-            "condition".to_string(),
-            NodeAttrValue::String("".to_string()),
-        );
-
-        let ctx = Context::new();
-
-        let result = handler.execute(&node, &ctx).await.unwrap();
-        assert!(result.is_failure());
     }
 
     #[tokio::test]
