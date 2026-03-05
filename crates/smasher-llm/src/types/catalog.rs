@@ -81,7 +81,7 @@ static CATALOG: LazyLock<Vec<ModelInfo>> = LazyLock::new(|| {
             provider: Provider::Anthropic,
             display_name: "Claude Opus 4.6",
             aliases: &["claude-opus"],
-            context_window: 200_000,
+            context_window: 1_000_000,
             max_output_tokens: 128_000,
             supports_images: true,
             supports_tool_use: true,
@@ -94,10 +94,27 @@ static CATALOG: LazyLock<Vec<ModelInfo>> = LazyLock::new(|| {
             output_cost_per_million: Some(25.0),
         },
         ModelInfo {
+            id: "claude-sonnet-4-6",
+            provider: Provider::Anthropic,
+            display_name: "Claude Sonnet 4.6",
+            aliases: &["claude-sonnet"],
+            context_window: 1_000_000,
+            max_output_tokens: 64_000,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: true,
+            supports_reasoning: true,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(3.0),
+            output_cost_per_million: Some(15.0),
+        },
+        ModelInfo {
             id: "claude-sonnet-4-5-20250929",
             provider: Provider::Anthropic,
             display_name: "Claude Sonnet 4.5",
-            aliases: &["claude-sonnet-4-5", "claude-sonnet"],
+            aliases: &["claude-sonnet-4-5"],
             context_window: 200_000,
             max_output_tokens: 64_000,
             supports_images: true,
@@ -163,6 +180,91 @@ static CATALOG: LazyLock<Vec<ModelInfo>> = LazyLock::new(|| {
             output_cost_per_million: Some(75.0),
         },
         // ── OpenAI models ─────────────────────────────────────────────
+        ModelInfo {
+            id: "gpt-5.2",
+            provider: Provider::OpenAi,
+            display_name: "GPT-5.2",
+            aliases: &[],
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(1.75),
+            output_cost_per_million: Some(14.0),
+        },
+        ModelInfo {
+            id: "gpt-5",
+            provider: Provider::OpenAi,
+            display_name: "GPT-5",
+            aliases: &[],
+            context_window: 128_000,
+            max_output_tokens: 64_000,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(1.25),
+            output_cost_per_million: Some(10.0),
+        },
+        ModelInfo {
+            id: "gpt-5-mini",
+            provider: Provider::OpenAi,
+            display_name: "GPT-5 Mini",
+            aliases: &[],
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(0.25),
+            output_cost_per_million: Some(2.0),
+        },
+        ModelInfo {
+            id: "gpt-5-nano",
+            provider: Provider::OpenAi,
+            display_name: "GPT-5 Nano",
+            aliases: &[],
+            context_window: 128_000,
+            max_output_tokens: 32_768,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(0.05),
+            output_cost_per_million: Some(0.4),
+        },
+        ModelInfo {
+            id: "o3-pro",
+            provider: Provider::OpenAi,
+            display_name: "o3-pro",
+            aliases: &[],
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: true,
+            supports_reasoning: true,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(20.0),
+            output_cost_per_million: Some(80.0),
+        },
         ModelInfo {
             id: "gpt-4.1",
             provider: Provider::OpenAi,
@@ -335,6 +437,23 @@ static CATALOG: LazyLock<Vec<ModelInfo>> = LazyLock::new(|| {
             input_cost_per_million: Some(0.3),
             output_cost_per_million: Some(2.5),
         },
+        ModelInfo {
+            id: "gemini-2.5-flash-lite",
+            provider: Provider::Gemini,
+            display_name: "Gemini 2.5 Flash-Lite",
+            aliases: &[],
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+            supports_images: true,
+            supports_tool_use: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            supports_reasoning: false,
+            supports_json_mode: true,
+            supports_system_prompt: true,
+            input_cost_per_million: Some(0.1),
+            output_cost_per_million: Some(0.4),
+        },
         // Legacy Gemini models
         ModelInfo {
             id: "gemini-2.0-flash",
@@ -391,12 +510,12 @@ pub fn infer_provider(model_id: &str) -> Option<Provider> {
 ///
 /// "Most capable" is defined as the flagship/largest model currently offered by each provider:
 /// - Anthropic: Claude Opus 4.6
-/// - OpenAI: o3
+/// - OpenAI: GPT-5.2
 /// - Gemini: Gemini 2.5 Pro
 pub fn get_latest_model(provider: Provider) -> Option<&'static ModelInfo> {
     let target_id = match provider {
         Provider::Anthropic => "claude-opus-4-6",
-        Provider::OpenAi => "o3",
+        Provider::OpenAi => "gpt-5.2",
         Provider::Gemini => "gemini-2.5-pro",
     };
     CATALOG.iter().find(|m| m.id == target_id)
@@ -486,7 +605,7 @@ mod tests {
         assert_eq!(info.id, "claude-opus-4-6");
         assert_eq!(info.provider, Provider::Anthropic);
         assert_eq!(info.display_name, "Claude Opus 4.6");
-        assert_eq!(info.context_window, 200_000);
+        assert_eq!(info.context_window, 1_000_000);
         assert_eq!(info.max_output_tokens, 128_000);
         assert!(info.supports_images);
         assert!(info.supports_tool_use);
@@ -702,7 +821,7 @@ mod tests {
     #[test]
     fn lookup_by_alias_claude_sonnet() {
         let info = lookup_model("claude-sonnet").unwrap();
-        assert_eq!(info.id, "claude-sonnet-4-5-20250929");
+        assert_eq!(info.id, "claude-sonnet-4-6");
         assert_eq!(info.provider, Provider::Anthropic);
     }
 
@@ -749,8 +868,8 @@ mod tests {
     #[test]
     fn get_latest_model_openai() {
         let info = get_latest_model(Provider::OpenAi).unwrap();
-        assert_eq!(info.id, "o3");
-        assert_eq!(info.display_name, "o3");
+        assert_eq!(info.id, "gpt-5.2");
+        assert_eq!(info.display_name, "GPT-5.2");
     }
 
     #[test]
@@ -773,7 +892,7 @@ mod tests {
     #[test]
     fn lookup_model_or_default_returns_catalog_entry_via_alias() {
         let info = lookup_model_or_default("claude-sonnet");
-        assert_eq!(info.id, "claude-sonnet-4-5-20250929");
+        assert_eq!(info.id, "claude-sonnet-4-6");
         assert_eq!(info.provider, Provider::Anthropic);
     }
 
@@ -866,21 +985,21 @@ mod tests {
     #[test]
     fn models_for_provider_anthropic() {
         let models = models_for_provider(Provider::Anthropic);
-        assert_eq!(models.len(), 5);
+        assert_eq!(models.len(), 6);
         assert!(models.iter().all(|m| m.provider == Provider::Anthropic));
     }
 
     #[test]
     fn models_for_provider_openai() {
         let models = models_for_provider(Provider::OpenAi);
-        assert_eq!(models.len(), 8);
+        assert_eq!(models.len(), 13);
         assert!(models.iter().all(|m| m.provider == Provider::OpenAi));
     }
 
     #[test]
     fn models_for_provider_gemini() {
         let models = models_for_provider(Provider::Gemini);
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert!(models.iter().all(|m| m.provider == Provider::Gemini));
     }
 
@@ -993,6 +1112,7 @@ mod tests {
         for id in &[
             "claude-opus-4-6",
             "o3",
+            "o3-pro",
             "o3-mini",
             "o4-mini",
             "gemini-2.5-pro",
@@ -1002,6 +1122,10 @@ mod tests {
         }
         // Non-reasoning models
         for id in &[
+            "gpt-5.2",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
             "gpt-4.1",
             "gpt-4.1-mini",
             "gpt-4.1-nano",
@@ -1020,9 +1144,11 @@ mod tests {
     #[test]
     fn claude_opus_4_6_is_most_capable_anthropic() {
         let opus = lookup_model("claude-opus-4-6").unwrap();
-        let sonnet = lookup_model("claude-sonnet-4-5-20250929").unwrap();
+        let sonnet_46 = lookup_model("claude-sonnet-4-6").unwrap();
+        let sonnet_45 = lookup_model("claude-sonnet-4-5-20250929").unwrap();
         let haiku = lookup_model("claude-haiku-4-5-20251001").unwrap();
-        assert!(opus.max_output_tokens >= sonnet.max_output_tokens);
+        assert!(opus.max_output_tokens >= sonnet_46.max_output_tokens);
+        assert!(opus.max_output_tokens >= sonnet_45.max_output_tokens);
         assert!(opus.max_output_tokens >= haiku.max_output_tokens);
     }
 

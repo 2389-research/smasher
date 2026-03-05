@@ -162,7 +162,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexerError> {
         // Identifiers and keywords
         if ch.is_ascii_alphabetic() || ch == '_' {
             let start = pos;
-            while pos < chars.len() && (chars[pos].is_ascii_alphanumeric() || chars[pos] == '_') {
+            while pos < chars.len()
+                && (chars[pos].is_ascii_alphanumeric() || chars[pos] == '_' || chars[pos] == '.')
+            {
                 pos += 1;
             }
             let word: String = chars[start..pos].iter().collect();
@@ -352,6 +354,20 @@ mod tests {
             LexerError::UnterminatedComment { pos: _ } => {}
             other => panic!("expected UnterminatedComment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tokenize_dotted_identifiers() {
+        let tokens = tokenize("human.default_choice=\"S\"").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("human.default_choice".to_string()),
+                Token::Equals,
+                Token::StringLit("S".to_string()),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
