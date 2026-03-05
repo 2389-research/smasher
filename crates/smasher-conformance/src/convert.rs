@@ -256,6 +256,7 @@ mod tests {
     use smasher_attractor::engine::LoopCounter;
     use smasher_attractor::graph::{Graph, GraphEdge, GraphNode, NodeAttrValue, NodeType};
     use smasher_attractor::state::Outcome;
+    use smasher_attractor::stats::PipelineStats;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -510,6 +511,7 @@ mod tests {
             steps_taken: 3,
             checkpoint: None,
             loop_restarts: LoopCounter::new(),
+            stats: PipelineStats::from_node_timings(vec![], 0),
         };
 
         let json = execution_result_to_json(&result, &graph);
@@ -533,6 +535,7 @@ mod tests {
             steps_taken: 1,
             checkpoint: None,
             loop_restarts: LoopCounter::new(),
+            stats: PipelineStats::from_node_timings(vec![], 0),
         };
 
         let json = execution_result_to_json(&result, &graph);

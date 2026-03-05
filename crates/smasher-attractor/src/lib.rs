@@ -24,6 +24,7 @@ pub mod retry;
 pub mod run_dir;
 pub mod server;
 pub mod state;
+pub mod stats;
 pub mod status;
 pub mod stylesheet;
 pub mod tool_handler;

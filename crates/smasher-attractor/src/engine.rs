@@ -44,6 +44,7 @@ use crate::graph::{Graph, NodeAttrValue, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
 use crate::retry::{RetryPolicy, RetryState, compute_delay};
 use crate::state::{Checkpoint, Context, Outcome};
+use crate::stats::{NodeStats, OutcomeKind, PipelineStats};
 
 /// Configuration for the pipeline execution engine.
 ///
@@ -219,6 +220,8 @@ pub struct ExecutionResult {
     pub checkpoint: Option<Checkpoint>,
     /// Counts of how many times each loop_restart edge was traversed.
     pub loop_restarts: LoopCounter,
+    /// Aggregate timing and outcome statistics for this run.
+    pub stats: PipelineStats,
 }
 
 /// The core pipeline execution engine.
@@ -399,6 +402,7 @@ impl Engine {
         let mut loop_restarts = LoopCounter::new();
         let pipeline_start = std::time::Instant::now();
         let mut failure_signatures: HashMap<u64, (String, String, u32)> = HashMap::new();
+        let mut node_timings: Vec<NodeStats> = Vec::new();
 
         // Emit PipelineStarted event.
         let graph_name = self
@@ -528,6 +532,19 @@ impl Engine {
             *last_progress.lock().await = std::time::Instant::now();
 
             let node_duration_ms = node_start.elapsed().as_millis() as u64;
+
+            // Record per-node timing and outcome for PipelineStats.
+            let outcome_kind = match &outcome {
+                Outcome::Success { .. } | Outcome::PartialSuccess { .. } => OutcomeKind::Success,
+                Outcome::Failure { .. } => OutcomeKind::Failure,
+                Outcome::Retry { .. } => OutcomeKind::Retry,
+                Outcome::Skip { .. } => OutcomeKind::Skip,
+            };
+            node_timings.push(NodeStats {
+                node_id: current_node_id.clone(),
+                duration_ms: node_duration_ms,
+                outcome_kind,
+            });
 
             // Emit NodeCompleted or NodeFailed event.
             if outcome.is_failure() {
@@ -776,6 +793,8 @@ impl Engine {
             None
         };
 
+        let stats = PipelineStats::from_node_timings(node_timings, pipeline_duration_ms);
+
         Ok(ExecutionResult {
             visited_nodes,
             node_outcomes,
@@ -783,6 +802,7 @@ impl Engine {
             steps_taken: steps,
             checkpoint,
             loop_restarts,
+            stats,
         })
     }
 }
@@ -2946,5 +2966,45 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, EngineError::GoalEnforcement(_)));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 60: PipelineStats fields are populated correctly
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn pipeline_stats_populated_after_run() {
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("middle", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![make_edge("start", "middle"), make_edge("middle", "exit")],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let result = engine.run(Context::new()).await.unwrap();
+
+        // Three nodes were executed.
+        assert_eq!(result.stats.total_nodes_visited, 3);
+        assert_eq!(result.stats.node_timings.len(), 3);
+
+        // All nodes returned Success outcomes.
+        use crate::stats::OutcomeKind;
+        assert_eq!(
+            result
+                .stats
+                .nodes_by_outcome
+                .get(&OutcomeKind::Success)
+                .copied()
+                .unwrap_or(0),
+            3
+        );
+
+        // top_slowest returns at most the available nodes.
+        let slowest = result.stats.top_slowest(2);
+        assert_eq!(slowest.len(), 2);
+
+        // total_duration_ms is always set (may be 0 in fast tests, never panics).
+        let _ = result.stats.total_duration_ms;
     }
 }
