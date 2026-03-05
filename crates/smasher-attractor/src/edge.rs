@@ -80,21 +80,13 @@ fn strip_accelerator_prefix(s: &str) -> &str {
     // Pattern: [X] rest (or [X]rest)
     if bytes.len() >= 3 && bytes[0] == b'[' && bytes[2] == b']' {
         let rest = &s[3..];
-        return if rest.starts_with(' ') {
-            &rest[1..]
-        } else {
-            rest
-        };
+        return rest.strip_prefix(' ').unwrap_or(rest);
     }
 
     // Pattern: X) rest (or X)rest)
     if bytes.len() >= 2 && bytes[1] == b')' {
         let rest = &s[2..];
-        return if rest.starts_with(' ') {
-            &rest[1..]
-        } else {
-            rest
-        };
+        return rest.strip_prefix(' ').unwrap_or(rest);
     }
 
     // Pattern: X - rest
@@ -171,35 +163,35 @@ pub fn select_edge<'a>(
     }
 
     // Step 2: Preferred label matching.
-    if let Some(outcome) = last_outcome {
-        if let Some(pref_label) = outcome.preferred_label() {
-            let normalized_pref = normalize_label(pref_label);
-            let matched: Vec<&GraphEdge> = unconditional
-                .iter()
-                .copied()
-                .filter(|e| {
-                    e.label
-                        .as_ref()
-                        .is_some_and(|l| normalize_label(l) == normalized_pref)
-                })
-                .collect();
-            if !matched.is_empty() {
-                return Ok(pick_best(matched));
-            }
+    if let Some(outcome) = last_outcome
+        && let Some(pref_label) = outcome.preferred_label()
+    {
+        let normalized_pref = normalize_label(pref_label);
+        let matched: Vec<&GraphEdge> = unconditional
+            .iter()
+            .copied()
+            .filter(|e| {
+                e.label
+                    .as_ref()
+                    .is_some_and(|l| normalize_label(l) == normalized_pref)
+            })
+            .collect();
+        if !matched.is_empty() {
+            return Ok(pick_best(matched));
         }
     }
 
     // Step 3: Suggested next IDs.
-    if let Some(outcome) = last_outcome {
-        if let Some(suggested_ids) = outcome.suggested_next_ids() {
-            let matched: Vec<&GraphEdge> = unconditional
-                .iter()
-                .copied()
-                .filter(|e| suggested_ids.contains(&e.to))
-                .collect();
-            if !matched.is_empty() {
-                return Ok(pick_best(matched));
-            }
+    if let Some(outcome) = last_outcome
+        && let Some(suggested_ids) = outcome.suggested_next_ids()
+    {
+        let matched: Vec<&GraphEdge> = unconditional
+            .iter()
+            .copied()
+            .filter(|e| suggested_ids.contains(&e.to))
+            .collect();
+        if !matched.is_empty() {
+            return Ok(pick_best(matched));
         }
     }
 
@@ -657,5 +649,334 @@ mod tests {
         ctx2.set("status", json!("bad"));
         let result2 = select_edge(&graph, "a", &ctx2, None).unwrap();
         assert!(result2.is_none());
+    }
+
+    // =====================================================================
+    // normalize_label tests
+    // =====================================================================
+
+    #[test]
+    fn normalize_label_basic_lowercase_trim() {
+        assert_eq!(normalize_label("  Hello World  "), "hello world");
+    }
+
+    #[test]
+    fn normalize_label_strips_bracket_prefix() {
+        assert_eq!(normalize_label("[Y] Yes, deploy"), "yes, deploy");
+        assert_eq!(normalize_label("[N] No way"), "no way");
+        // Without space after bracket
+        assert_eq!(normalize_label("[X]continue"), "continue");
+    }
+
+    #[test]
+    fn normalize_label_strips_paren_prefix() {
+        assert_eq!(normalize_label("Y) Yes, deploy"), "yes, deploy");
+        assert_eq!(normalize_label("A) Accept"), "accept");
+        // Without space after paren
+        assert_eq!(normalize_label("B)reject"), "reject");
+    }
+
+    #[test]
+    fn normalize_label_strips_dash_prefix() {
+        assert_eq!(normalize_label("Y - Yes, deploy"), "yes, deploy");
+        assert_eq!(normalize_label("N - No thanks"), "no thanks");
+    }
+
+    #[test]
+    fn normalize_label_no_prefix() {
+        assert_eq!(normalize_label("deploy now"), "deploy now");
+        assert_eq!(normalize_label("YES"), "yes");
+    }
+
+    // =====================================================================
+    // strip_accelerator_prefix tests
+    // =====================================================================
+
+    #[test]
+    fn strip_accelerator_bracket() {
+        assert_eq!(strip_accelerator_prefix("[Y] rest"), "rest");
+        assert_eq!(strip_accelerator_prefix("[A]no_space"), "no_space");
+    }
+
+    #[test]
+    fn strip_accelerator_paren() {
+        assert_eq!(strip_accelerator_prefix("X) rest"), "rest");
+        assert_eq!(strip_accelerator_prefix("A)no_space"), "no_space");
+    }
+
+    #[test]
+    fn strip_accelerator_dash() {
+        assert_eq!(strip_accelerator_prefix("X - rest"), "rest");
+    }
+
+    #[test]
+    fn strip_accelerator_none() {
+        assert_eq!(strip_accelerator_prefix("no prefix"), "no prefix");
+        assert_eq!(strip_accelerator_prefix(""), "");
+    }
+
+    // =====================================================================
+    // Step 1: Conditional edges take priority, excluding unconditional
+    // =====================================================================
+
+    #[test]
+    fn conditional_edges_exclude_unconditional() {
+        let graph = make_graph(vec![
+            conditional_edge("a", "cond_target", "flag=on"),
+            plain_edge("a", "uncond_target"),
+        ]);
+        let ctx = Context::new();
+        ctx.set("flag", json!("on"));
+        let result = select_edge(&graph, "a", &ctx, None).unwrap();
+        assert!(result.is_some());
+        // The conditional edge wins; the unconditional is excluded.
+        assert_eq!(result.unwrap().to, "cond_target");
+    }
+
+    #[test]
+    fn failing_conditions_fall_through_to_unconditional() {
+        let graph = make_graph(vec![
+            conditional_edge("a", "cond_target", "flag=on"),
+            plain_edge("a", "uncond_target"),
+        ]);
+        let ctx = Context::new();
+        ctx.set("flag", json!("off"));
+        let result = select_edge(&graph, "a", &ctx, None).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "uncond_target");
+    }
+
+    // =====================================================================
+    // Step 2: Preferred label matching
+    // =====================================================================
+
+    #[test]
+    fn preferred_label_selects_matching_edge() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "deploy_path", "Yes, deploy"),
+            labeled_edge("a", "skip_path", "No, skip"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_preferred_label("yes, deploy");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "deploy_path");
+    }
+
+    #[test]
+    fn preferred_label_matches_with_accelerator_prefix() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "yes_path", "[Y] Yes, deploy"),
+            labeled_edge("a", "no_path", "[N] No, skip"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_preferred_label("yes, deploy");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "yes_path");
+    }
+
+    #[test]
+    fn preferred_label_case_insensitive() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "target", "SUCCESS"),
+            labeled_edge("a", "other", "failure"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_preferred_label("Success");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "target");
+    }
+
+    #[test]
+    fn preferred_label_no_match_falls_through() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "alpha", "go"),
+            labeled_edge("a", "beta", "stop"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_preferred_label("nonexistent");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        // Falls through to step 4/5, picks lexically first target
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "alpha");
+    }
+
+    // =====================================================================
+    // Step 3: Suggested next IDs
+    // =====================================================================
+
+    #[test]
+    fn suggested_next_ids_selects_matching_target() {
+        let graph = make_graph(vec![
+            plain_edge("a", "node_x"),
+            plain_edge("a", "node_y"),
+            plain_edge("a", "node_z"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_suggested_next_ids(vec!["node_y".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "node_y");
+    }
+
+    #[test]
+    fn suggested_next_ids_multiple_matches_uses_priority() {
+        let graph = make_graph(vec![
+            priority_edge("a", "node_x", 5),
+            priority_edge("a", "node_y", 10),
+            plain_edge("a", "node_z"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success()
+            .with_suggested_next_ids(vec!["node_x".to_string(), "node_y".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "node_y");
+    }
+
+    #[test]
+    fn suggested_next_ids_no_match_falls_through() {
+        let graph = make_graph(vec![plain_edge("a", "node_x"), plain_edge("a", "node_y")]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_suggested_next_ids(vec!["nonexistent".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        // Falls through to step 4/5
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "node_x");
+    }
+
+    // =====================================================================
+    // Steps 4 & 5: Priority and lexical tiebreak
+    // =====================================================================
+
+    #[test]
+    fn lexical_tiebreak_ascending_by_target() {
+        let graph = make_graph(vec![
+            plain_edge("a", "zebra"),
+            plain_edge("a", "apple"),
+            plain_edge("a", "mango"),
+        ]);
+        let ctx = Context::new();
+        let result = select_edge(&graph, "a", &ctx, None).unwrap();
+        assert!(result.is_some());
+        // All priority 0, so lexically first target wins
+        assert_eq!(result.unwrap().to, "apple");
+    }
+
+    #[test]
+    fn priority_beats_lexical_order() {
+        let graph = make_graph(vec![
+            priority_edge("a", "aaa_low", 1),
+            priority_edge("a", "zzz_high", 10),
+        ]);
+        let ctx = Context::new();
+        let result = select_edge(&graph, "a", &ctx, None).unwrap();
+        assert!(result.is_some());
+        // Higher priority wins despite being lexically later
+        assert_eq!(result.unwrap().to, "zzz_high");
+    }
+
+    // =====================================================================
+    // Step ordering: preferred_label before suggested_next_ids
+    // =====================================================================
+
+    #[test]
+    fn preferred_label_beats_suggested_next_ids() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "label_match", "deploy"),
+            plain_edge("a", "id_match"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success()
+            .with_preferred_label("deploy")
+            .with_suggested_next_ids(vec!["id_match".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "label_match");
+    }
+
+    // =====================================================================
+    // Conditional edges exclude unconditional from steps 2-5
+    // =====================================================================
+
+    #[test]
+    fn conditional_edges_beat_preferred_label_and_suggested_ids() {
+        let graph = make_graph(vec![
+            conditional_edge("a", "cond_target", "mode=fast"),
+            labeled_edge("a", "label_target", "deploy"),
+            plain_edge("a", "suggested_target"),
+        ]);
+        let ctx = Context::new();
+        ctx.set("mode", json!("fast"));
+        let outcome = Outcome::success()
+            .with_preferred_label("deploy")
+            .with_suggested_next_ids(vec!["suggested_target".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "cond_target");
+    }
+
+    // =====================================================================
+    // PartialSuccess also supports preferred_label/suggested_next_ids
+    // =====================================================================
+
+    #[test]
+    fn partial_success_preferred_label_works() {
+        let graph = make_graph(vec![
+            labeled_edge("a", "retry_path", "retry"),
+            labeled_edge("a", "continue_path", "continue"),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::partial_success().with_preferred_label("continue");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "continue_path");
+    }
+
+    #[test]
+    fn partial_success_suggested_next_ids_works() {
+        let graph = make_graph(vec![plain_edge("a", "node_a"), plain_edge("a", "node_b")]);
+        let ctx = Context::new();
+        let outcome =
+            Outcome::partial_success().with_suggested_next_ids(vec!["node_b".to_string()]);
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to, "node_b");
+    }
+
+    // =====================================================================
+    // Failure/Skip/Retry outcomes use priority and lexical tiebreak
+    // =====================================================================
+
+    #[test]
+    fn failure_outcome_uses_priority_and_lexical() {
+        let graph = make_graph(vec![plain_edge("a", "beta"), plain_edge("a", "alpha")]);
+        let ctx = Context::new();
+        let outcome = Outcome::failure("oops");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        // No preferred_label or suggested_next_ids on Failure, so lexical tiebreak
+        assert_eq!(result.unwrap().to, "alpha");
+    }
+
+    // =====================================================================
+    // Preferred label with priority among matched edges
+    // =====================================================================
+
+    #[test]
+    fn preferred_label_with_priority_sort() {
+        let graph = make_graph(vec![
+            labeled_priority_edge("a", "low_yes", "yes", 1),
+            labeled_priority_edge("a", "high_yes", "YES", 10),
+            labeled_priority_edge("a", "failure_path", "failure", 100),
+        ]);
+        let ctx = Context::new();
+        let outcome = Outcome::success().with_preferred_label("yes");
+        let result = select_edge(&graph, "a", &ctx, Some(&outcome)).unwrap();
+        assert!(result.is_some());
+        // "yes" and "YES" both normalize to "yes", so both match. "high_yes" wins on priority.
+        assert_eq!(result.unwrap().to, "high_yes");
     }
 }
