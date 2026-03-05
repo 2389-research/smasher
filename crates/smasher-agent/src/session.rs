@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use futures::future::join_all;
+
 use crate::events::EventEmitter;
 use crate::loop_detection::LoopDetector;
 use crate::profile::{ProviderProfile, SystemPromptConfig, profile_for_model};
@@ -322,15 +324,30 @@ impl Session {
                 return Err(SessionError::Cancelled);
             }
 
-            // Execute each tool call
+            // Emit ToolCallStarted for each tool call before execution
             for tc in &tool_calls {
                 self.event_emitter.emit(SessionEvent::ToolCallStarted {
                     tool_name: tc.name.clone(),
                     tool_call_id: tc.id.clone(),
                 });
+            }
 
-                let output = self.tool_registry.execute(&tc.name, &tc.arguments).await;
+            // Execute all tool calls concurrently using join_all
+            let tool_futures: Vec<_> = tool_calls
+                .iter()
+                .map(|tc| {
+                    let name = tc.name.clone();
+                    let arguments = tc.arguments.clone();
+                    let registry = &self.tool_registry;
+                    async move { registry.execute_untruncated(&name, &arguments).await }
+                })
+                .collect();
 
+            let outputs = join_all(tool_futures).await;
+
+            // Process results in order after all tool calls complete
+            for (tc, output) in tool_calls.iter().zip(outputs) {
+                // Emit the event with FULL untruncated output for observability
                 self.event_emitter.emit(SessionEvent::ToolCallCompleted {
                     tool_name: tc.name.clone(),
                     tool_call_id: tc.id.clone(),
@@ -339,16 +356,21 @@ impl Session {
                     duration_ms: output.duration_ms,
                 });
 
-                // Add tool result to conversation
-                self.state
-                    .add_tool_result(&tc.id, &output.content, output.is_error);
+                // Apply per-tool truncation for the LLM conversation message
+                let truncated_content = self
+                    .tool_registry
+                    .truncate_for_tool(&tc.name, &output.content);
 
-                // Record the tool execution turn
+                // Add truncated tool result to conversation
+                self.state
+                    .add_tool_result(&tc.id, &truncated_content, output.is_error);
+
+                // Record the tool execution turn with truncated content
                 self.state.turns.push(Turn::ToolExecution {
                     tool_name: tc.name.clone(),
                     tool_call_id: tc.id.clone(),
                     arguments: tc.arguments.clone(),
-                    result: output.content,
+                    result: truncated_content,
                     is_error: output.is_error,
                     duration_ms: output.duration_ms,
                 });
@@ -524,6 +546,31 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
             let text = v["text"].as_str().unwrap_or("no text");
             ToolOutput::success(text, 1)
+        }
+    }
+
+    /// Tool that produces output of a configurable size, for testing truncation behavior.
+    struct BigOutputTool {
+        output_size: usize,
+    }
+
+    #[async_trait]
+    impl AgentTool for BigOutputTool {
+        fn name(&self) -> &str {
+            "big_output"
+        }
+
+        fn description(&self) -> &str {
+            "Produces large output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _arguments: &str) -> ToolOutput {
+            let content = "x".repeat(self.output_size);
+            ToolOutput::success(content, 5)
         }
     }
 
@@ -2526,6 +2573,246 @@ mod tests {
         assert!(
             warning.is_none(),
             "No ContextWindowWarning should be emitted without tracker"
+        );
+    }
+
+    // ── Parallel tool execution ─────────────────────────────────
+
+    /// A tool that sleeps for a fixed duration before returning, used to verify
+    /// that multiple tool calls execute concurrently rather than sequentially.
+    struct SlowEchoTool {
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl AgentTool for SlowEchoTool {
+        fn name(&self) -> &str {
+            "slow_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes input after a delay"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(&self, arguments: &str) -> ToolOutput {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+            let text = v["text"].as_str().unwrap_or("no text");
+            ToolOutput::success(text, self.delay_ms)
+        }
+    }
+
+    fn multi_slow_tool_call_response() -> Response {
+        Response {
+            id: "resp_slow_multi".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            content: vec![
+                ContentPart::ToolCall(ToolCallData {
+                    id: "slow_a".into(),
+                    name: "slow_echo".into(),
+                    arguments: r#"{"text":"first"}"#.into(),
+                    raw_arguments: None,
+                }),
+                ContentPart::ToolCall(ToolCallData {
+                    id: "slow_b".into(),
+                    name: "slow_echo".into(),
+                    arguments: r#"{"text":"second"}"#.into(),
+                    raw_arguments: None,
+                }),
+            ],
+            finish_reason: Some(FinishReason::ToolUse),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 30,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                raw: None,
+            },
+            warnings: vec![],
+            rate_limit: None,
+            provider: None,
+            raw: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_execute_concurrently() {
+        // Each tool call sleeps for 100ms. If executed sequentially, total
+        // wall time would be >= 200ms. If parallel, it should be ~100ms.
+        let delay_ms = 100;
+
+        let mut responses = VecDeque::new();
+        responses.push_back(multi_slow_tool_call_response());
+        responses.push_back(text_response("Both slow tools done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(SlowEchoTool { delay_ms });
+        let event_emitter = EventEmitter::default();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        let start = std::time::Instant::now();
+        let output = session.process_input("Run slow tools").await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(output.text.as_deref(), Some("Both slow tools done."));
+
+        // If parallel: elapsed should be around 100ms (not 200ms+)
+        // Allow generous margin: less than 180ms means parallel
+        assert!(
+            elapsed.as_millis() < 180,
+            "Two 100ms tool calls should complete in ~100ms (parallel), \
+             but took {}ms (sequential would be >=200ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_preserve_result_order() {
+        // Verify that tool results are added to conversation in the same
+        // order as the original tool_calls, even when executed in parallel.
+        let mut responses = VecDeque::new();
+        responses.push_back(multi_slow_tool_call_response());
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(SlowEchoTool { delay_ms: 10 });
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Run tools").await.unwrap();
+
+        // Collect ToolCallCompleted events in order
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let completed_ids: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolCallCompleted { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(completed_ids.len(), 2);
+        // Results should be in the same order as the tool calls
+        assert_eq!(completed_ids[0], "slow_a");
+        assert_eq!(completed_ids[1], "slow_b");
+
+        // Verify tool result messages are in correct order
+        let tool_msgs: Vec<_> = session.messages().iter().filter(|m| m.is_tool()).collect();
+        assert_eq!(tool_msgs.len(), 2);
+    }
+
+    // ── ToolCallCompleted event carries full untruncated output ──────
+
+    #[tokio::test]
+    async fn tool_call_completed_event_contains_full_untruncated_output() {
+        let mut responses = VecDeque::new();
+        // LLM calls the big_output tool
+        responses.push_back(tool_call_response("big_output", "call_big", r#"{}"#));
+        // Then produces final text
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        // Use a small max_output_chars so truncation is triggered
+        let mut tool_registry = ToolRegistry::new().with_max_output_chars(200);
+        tool_registry.register(BigOutputTool { output_size: 5000 });
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Generate big output").await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // The ToolCallCompleted event should contain the FULL untruncated output
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ToolCallCompleted { .. }));
+        assert!(completed.is_some(), "Should have ToolCallCompleted event");
+        if let Some(SessionEvent::ToolCallCompleted { result, .. }) = completed {
+            assert_eq!(
+                result.len(),
+                5000,
+                "Event result should contain full untruncated output (5000 chars), got {}",
+                result.len()
+            );
+            assert!(
+                !result.contains("[... truncated"),
+                "Event result should NOT contain truncation marker"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_message_contains_truncated_output_while_event_is_full() {
+        let mut responses = VecDeque::new();
+        responses.push_back(tool_call_response("big_output", "call_big", r#"{}"#));
+        responses.push_back(text_response("Done."));
+
+        let client = make_client(responses);
+        let mut tool_registry = ToolRegistry::new().with_max_output_chars(200);
+        tool_registry.register(BigOutputTool { output_size: 5000 });
+        let event_emitter = EventEmitter::default();
+        let mut rx = event_emitter.subscribe();
+        let config = SessionConfig::default();
+        let mut session = Session::new(config, client, tool_registry, event_emitter);
+
+        session.process_input("Generate big output").await.unwrap();
+
+        // Collect events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Event should have full output
+        if let Some(SessionEvent::ToolCallCompleted { result, .. }) = events
+            .iter()
+            .find(|e| matches!(e, SessionEvent::ToolCallCompleted { .. }))
+        {
+            assert_eq!(result.len(), 5000, "Event should have full output");
+        }
+
+        // Conversation tool result message should have truncated output
+        let tool_msgs: Vec<_> = session.messages().iter().filter(|m| m.is_tool()).collect();
+        assert_eq!(tool_msgs.len(), 1, "Should have one tool result message");
+        // Tool result content is stored as ToolResult ContentPart, not Text
+        let tool_content = match &tool_msgs[0].content[0] {
+            ContentPart::ToolResult(data) => &data.content,
+            other => panic!("Expected ToolResult, got {:?}", other),
+        };
+        assert!(
+            tool_content.contains("[... truncated"),
+            "Conversation tool result should be truncated, got len {}",
+            tool_content.len()
+        );
+        assert!(
+            tool_content.len() <= 250,
+            "Conversation tool result should be near max 200, got {}",
+            tool_content.len()
         );
     }
 }

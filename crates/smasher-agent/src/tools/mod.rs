@@ -141,6 +141,8 @@ impl ToolRegistry {
     /// Execute a tool by name, applying per-tool output truncation if needed.
     ///
     /// Returns an error `ToolOutput` if the tool is not found.
+    /// The returned output has truncation already applied. For the full untruncated
+    /// output (e.g. for event logging), use `execute_untruncated` instead.
     pub async fn execute(&self, name: &str, arguments: &str) -> ToolOutput {
         let tool = match self.tools.get(name) {
             Some(t) => t,
@@ -157,6 +159,35 @@ impl ToolRegistry {
         }
 
         output
+    }
+
+    /// Execute a tool by name WITHOUT applying output truncation.
+    ///
+    /// Returns the full, untruncated tool output. Callers are responsible for
+    /// truncating the output before sending it to the LLM conversation.
+    /// Returns an error `ToolOutput` if the tool is not found.
+    pub async fn execute_untruncated(&self, name: &str, arguments: &str) -> ToolOutput {
+        let tool = match self.tools.get(name) {
+            Some(t) => t,
+            None => {
+                return ToolOutput::error(format!("tool '{}' not found", name), 0);
+            }
+        };
+
+        tool.execute(arguments).await
+    }
+
+    /// Apply per-tool output truncation to the given content string.
+    ///
+    /// Returns the truncated content if it exceeds the tool's limit,
+    /// or the original content if it fits within the limit.
+    pub fn truncate_for_tool(&self, tool_name: &str, content: &str) -> String {
+        let limit = self.output_limit_for(tool_name);
+        if content.len() > limit {
+            truncate_output(content, limit)
+        } else {
+            content.to_string()
+        }
     }
 
     /// Return the number of registered tools.
@@ -423,6 +454,56 @@ mod tests {
         assert!(!output.is_error);
         assert!(!output.content.contains("[... truncated"));
         assert_eq!(output.content.len(), 40_000);
+    }
+
+    #[tokio::test]
+    async fn execute_untruncated_returns_full_output() {
+        let mut registry = ToolRegistry::new().with_max_output_chars(200);
+        registry.register(BigOutputTool { output_size: 5000 });
+
+        let output = registry.execute_untruncated("big_output", "{}").await;
+        assert!(!output.is_error);
+        assert_eq!(
+            output.content.len(),
+            5000,
+            "Untruncated output should be full size"
+        );
+        assert!(
+            !output.content.contains("[... truncated"),
+            "Should not contain truncation marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_untruncated_unknown_tool_returns_error() {
+        let registry = ToolRegistry::new();
+        let output = registry.execute_untruncated("nonexistent", "{}").await;
+        assert!(output.is_error);
+        assert!(output.content.contains("tool 'nonexistent' not found"));
+    }
+
+    #[test]
+    fn truncate_for_tool_applies_per_tool_limit() {
+        let registry = ToolRegistry::new();
+        // read_file limit is 50_000
+        let big_content = "x".repeat(60_000);
+        let truncated = registry.truncate_for_tool("read_file", &big_content);
+        assert!(
+            truncated.contains("[... truncated"),
+            "Should contain truncation marker"
+        );
+        assert!(truncated.len() <= 55_000, "Should be near max 50000");
+    }
+
+    #[test]
+    fn truncate_for_tool_returns_original_when_within_limit() {
+        let registry = ToolRegistry::new();
+        let small_content = "x".repeat(1000);
+        let result = registry.truncate_for_tool("read_file", &small_content);
+        assert_eq!(
+            result, small_content,
+            "Should return original content unchanged"
+        );
     }
 
     #[test]
