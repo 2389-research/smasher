@@ -1,0 +1,141 @@
+digraph BuildTui {
+  graph [
+    label="Build Boba TUI for Smasher Pipeline Execution",
+    goal="Implement a real-time TUI using the boba framework that shows pipeline node status, agentic turns, and scrollable per-node logs during smasher run.",
+    rankdir=LR,
+    default_max_retry=3,
+    default_fidelity="full"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit [shape=Msquare, label="Exit"];
+
+  // =========================================================================
+  // Phase 1: Gather Context (parallel)
+  // =========================================================================
+
+  GatherContext [shape=component, label="Gather Context (Parallel)"];
+  GatherJoin [shape=tripleoctagon, label="Context Join"];
+
+  ReadBobaApi [
+    shape=box,
+    label="Read Boba API",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    prompt="Gather API documentation for the boba TUI framework (Bubble Tea-inspired for Rust/ratatui).\n\nThe boba framework source is at /Users/harper/workspace/2389/boba. Read these files using their absolute paths:\n- /Users/harper/workspace/2389/boba/crates/boba-core/src/model.rs (Model trait: init/update/view)\n- /Users/harper/workspace/2389/boba/crates/boba-core/src/command.rs (Command enum)\n- /Users/harper/workspace/2389/boba/crates/boba-core/src/runtime.rs (Program, ProgramHandle, ProgramOptions, OutputTarget)\n- /Users/harper/workspace/2389/boba/crates/boba-core/src/subscription.rs (Subscription system)\n- /Users/harper/workspace/2389/boba/crates/boba-core/src/subscriptions/terminal.rs (terminal_events)\n- /Users/harper/workspace/2389/boba/crates/boba-widgets/src/spinner.rs (Spinner widget)\n- /Users/harper/workspace/2389/boba/crates/boba-widgets/src/viewport.rs (Viewport scrollable widget)\n- /Users/harper/workspace/2389/boba/crates/boba-widgets/src/status_bar.rs (StatusBar)\n- /Users/harper/workspace/2389/boba/crates/boba-widgets/src/stopwatch.rs (Stopwatch)\n- /Users/harper/workspace/2389/boba/crates/boba/src/lib.rs (re-exports)\n\nWrite .ai/boba_api_summary.md with exact Rust type signatures and usage examples for: Model trait, Component trait, Command variants, Program/ProgramHandle/ProgramOptions, OutputTarget, Subscriptions, and each widget listed above."
+  ];
+
+  ReadPipelineEvents [
+    shape=box,
+    label="Read Pipeline Events",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    prompt="Document the smasher pipeline event system. All files are relative to CWD.\n\nRead:\n- crates/smasher-attractor/src/events.rs (PipelineEvent enum, PipelineEventEmitter, PipelineEventLog)\n- crates/smasher-attractor/src/engine.rs (Engine struct, with_emitter method, all emit() call sites)\n- crates/smasher-web/src/sse.rs (existing SSE bridge pattern)\n- crates/smasher-web/src/backend.rs (agent SessionEvent -> PipelineEvent forwarding)\n\nWrite .ai/pipeline_events_summary.md covering: all PipelineEvent variants with fields, PipelineEventEmitter API, Engine::with_emitter, all emit() call sites, the SSE bridge pattern, and agent event forwarding. Include exact Rust type signatures."
+  ];
+
+  ReadCurrentRun [
+    shape=box,
+    label="Read Current Run Implementation",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    prompt="Document the current smasher run command implementation. All files are relative to CWD.\n\nRead:\n- crates/smasher-cli/src/run.rs (run() function, RunArgs, ClaudeCliBackend, AgentCodergenBackend)\n- crates/smasher-cli/src/main.rs (how run is invoked)\n- crates/smasher-cli/Cargo.toml (current dependencies)\n- crates/smasher-attractor/src/handler.rs (CodergenBackend trait, CodergenHandler)\n\nWrite .ai/current_run_summary.md covering: RunArgs fields, run() flow, ClaudeCliBackend subprocess handling, AgentCodergenBackend session creation, backend selection via --backend flag, current eprintln event logging, where engine.with_emitter should be wired, worktree flow, and dependencies."
+  ];
+
+  // =========================================================================
+  // Phase 2: Design the TUI
+  // =========================================================================
+
+  DesignTui [
+    shape=box,
+    label="Design TUI Architecture",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    prompt="Design the TUI architecture. Read .ai/boba_api_summary.md, .ai/pipeline_events_summary.md, and .ai/current_run_summary.md.\n\nWrite .ai/tui_design.md with:\n\n1. Layout: two-panel (30/70 split) — node list left, scrollable logs right. Top status bar with pipeline name, spinner, elapsed time, node count. Bottom key bindings.\n\n2. Rust types: PipelineTui struct (Model impl), Msg enum, NodeState, NodeStatus, LogEntry, LogKind, PanelFocus.\n\n3. Message flow: PipelineEvent -> Msg via ProgramHandle::send(), terminal events via subscriptions.\n\n4. Update logic for each Msg variant.\n\n5. View layout using ratatui Layout splits.\n\n6. Wiring plan for run(): create emitter, subscribe, engine.with_emitter, ProgramOptions with OutputTarget::Stderr, bridge task, engine in background, boba on main task.\n\n7. CLI flags: --tui (default when stderr is tty), --no-tui.\n\nBe precise with Rust types. This is the implementation blueprint."
+  ];
+
+  // =========================================================================
+  // Phase 3: Implementation (sequential — each builds on previous)
+  // =========================================================================
+
+  AddDependency [
+    shape=parallelogram,
+    label="Add boba dependency",
+    tool_command="set -eu\nmkdir -p .ai\n\n# Add boba as a workspace dependency if not present\nif ! grep -q 'boba' Cargo.toml; then\n  sed -i '' '/^# DOT parsing/i\\\n# TUI framework\\\nboba = { path = \"/Users/harper/workspace/2389/boba/crates/boba\" }\\\nratatui = \"0.30\"\\\ncrossterm = { version = \"0.29\", features = [\"event-stream\"] }\\\n' Cargo.toml\nfi\n\n# Add boba to smasher-cli dependencies if not present\nif ! grep -q 'boba' crates/smasher-cli/Cargo.toml; then\n  sed -i '' '/^smasher-web.workspace/a\\\nboba.workspace = true\\\nratatui.workspace = true\\\ncrossterm.workspace = true' crates/smasher-cli/Cargo.toml\nfi\n\ncargo check --workspace 2>&1 | tail -5\nprintf 'dependencies-added'"
+  ];
+
+  StreamingBackend [
+    shape=box,
+    label="Streaming Backend",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    allow_partial=true,
+    prompt="Modify ClaudeCliBackend to support streaming JSON output for the TUI. Read .ai/tui_design.md and crates/smasher-cli/src/run.rs.\n\nChanges to crates/smasher-cli/src/run.rs:\n\n1. Add fields to ClaudeCliBackend: `streaming: bool` (default false), `emitter: Option<Arc<PipelineEventEmitter>>`, `node_id: Option<String>`.\n\n2. When streaming=true, use `--output-format stream-json` instead of `--print`, and read stdout line-by-line as NDJSON. Parse each JSON line and emit PipelineEvent variants through the emitter (AgentToolCallStarted, AgentToolCallCompleted, AgentMessage).\n\n3. When streaming=false, keep existing behavior unchanged.\n\n4. All existing tests must pass — streaming defaults to false.\n\n5. Keep ABOUTME comments. Run `cargo check --workspace` after changes."
+  ];
+
+  TuiModel [
+    shape=box,
+    label="TUI Model Implementation",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    allow_partial=true,
+    prompt="Create the TUI model. Read .ai/tui_design.md, .ai/boba_api_summary.md, .ai/pipeline_events_summary.md, and crates/smasher-cli/src/run.rs.\n\nCreate crates/smasher-cli/src/tui.rs with ABOUTME comments. Implement:\n- TuiFlags, Msg enum, NodeState/NodeStatus, LogEntry/LogKind, PanelFocus\n- PipelineTui struct with nodes, selected_node, node_logs, spinner, stopwatch, viewport, panel_focus, counters\n- boba::Model impl: init (extract nodes from graph, start spinner+stopwatch), update (handle all PipelineEvent variants, keyboard nav, widget messages), view (two-panel layout), subscriptions (terminal_events, spinner/stopwatch ticks)\n\nAdd `pub mod tui;` to the module tree. The boba dependency path is: boba = { path = \"/Users/harper/workspace/2389/boba/crates/boba\" }.\n\nRun `cargo check --workspace` to verify."
+  ];
+
+  TuiView [
+    shape=box,
+    label="TUI View Polish",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    allow_partial=true,
+    prompt="Polish the TUI view rendering. Read crates/smasher-cli/src/tui.rs and .ai/tui_design.md.\n\nEnhance view():\n- Top bar: pipeline name left, spinner+elapsed center, N/M nodes right. Bold white.\n- Node list: status icons (green check=done, green spinner=running, dim circle=pending, red X=fail). Selected node highlighted.\n- Log panel: formatted entries — [tool] cyan, [text] white, [node] yellow, [edge] dim.\n- Bottom bar: key bindings help.\n- Active panel border white, inactive dim. Dark theme.\n- Pipeline complete: green COMPLETED. Failed: red FAILED.\n\nOnly modify view() and helpers, not the model logic. Run `cargo check --workspace`."
+  ];
+
+  Wiring [
+    shape=box,
+    label="Wire TUI into run()",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    allow_partial=true,
+    prompt="Wire the TUI into smasher run. Read crates/smasher-cli/src/tui.rs, crates/smasher-cli/src/run.rs, and .ai/tui_design.md.\n\nModify crates/smasher-cli/src/run.rs:\n\n1. Add --tui and --no-tui flags to RunArgs. Default: TUI enabled when stderr is a tty (use std::io::IsTerminal).\n\n2. When TUI enabled: create PipelineEventEmitter(256), subscribe, engine.with_emitter(), build TuiFlags, ProgramOptions with OutputTarget::Stderr, create Program, get ProgramHandle, spawn bridge task (event_rx -> handle.send(Msg::PipelineEvent)), spawn engine in background, run boba on main task, await engine result after boba exits.\n\n3. When TUI disabled: existing behavior unchanged.\n\n4. Pass emitter to ClaudeCliBackend when TUI is on (streaming: true).\n\n5. Print final JSON to stdout AFTER TUI exits.\n\nRun `cargo check --workspace` and `cargo test --workspace`."
+  ];
+
+  Tests [
+    shape=box,
+    label="Write Tests",
+    llm_provider="anthropic",
+    llm_model="claude-opus-4-6",
+    reasoning_effort="high",
+    allow_partial=true,
+    prompt="Write tests for the TUI. Read crates/smasher-cli/src/tui.rs and crates/smasher-cli/src/run.rs.\n\nIn tui.rs #[cfg(test)] mod tests:\n- test_init_creates_nodes_from_graph\n- test_node_started/completed/failed_updates_status\n- test_pipeline_completed_stops_running\n- test_key_j_k_navigation\n- test_key_q_returns_quit\n- test_tab_toggles_focus\n- test_agent_tool_call_adds_log\n- test_agent_message_adds_log\n\nIn run.rs existing tests module:\n- test_tui_flag_defaults (both false)\n- test_tui_flag_parsed\n- test_no_tui_flag_parsed\n\nUse real types, not mocks. Run `cargo test --workspace` — all tests must pass."
+  ];
+
+  // =========================================================================
+  // Edges
+  // =========================================================================
+
+  Start -> GatherContext;
+  GatherContext -> ReadBobaApi;
+  GatherContext -> ReadPipelineEvents;
+  GatherContext -> ReadCurrentRun;
+  ReadBobaApi -> GatherJoin;
+  ReadPipelineEvents -> GatherJoin;
+  ReadCurrentRun -> GatherJoin;
+
+  GatherJoin -> DesignTui;
+
+  DesignTui -> AddDependency;
+  AddDependency -> StreamingBackend;
+  StreamingBackend -> TuiModel;
+  TuiModel -> TuiView;
+  TuiView -> Wiring;
+  Wiring -> Tests;
+  Tests -> Exit;
+}
