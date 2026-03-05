@@ -202,6 +202,14 @@ impl CodergenBackend for ClaudeCliBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // Strip env vars that cause the inner claude process to detect a nested
+        // session and refuse to launch. The outer Claude Code session sets these.
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY");
+        cmd.env_remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
+        cmd.env_remove("CLAUDE_CODE_SESSION");
+
         let mut child = cmd
             .spawn()
             .map_err(|e| HandlerError::Other(format!("failed to spawn claude CLI: {e}")))?;
