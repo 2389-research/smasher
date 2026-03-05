@@ -232,16 +232,8 @@ impl CodergenBackend for ClaudeCliBackend {
 
         let output = match tokio::time::timeout(self.timeout, async {
             let status = child.wait();
-            let stdout_join = async {
-                stdout_task
-                    .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-            };
-            let stderr_join = async {
-                stderr_task
-                    .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-            };
+            let stdout_join = async { stdout_task.await.map_err(std::io::Error::other)? };
+            let stderr_join = async { stderr_task.await.map_err(std::io::Error::other)? };
             let (status, stdout, stderr) = tokio::try_join!(status, stdout_join, stderr_join)?;
             Ok::<std::process::Output, std::io::Error>(std::process::Output {
                 status,
