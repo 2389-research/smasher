@@ -25,6 +25,8 @@ pub enum NodeType {
     Interviewer,
     /// Parallel fan-out node.
     Parallel,
+    /// Fan-in (join/synchronization) node that collects parallel branches.
+    FanIn,
     /// Manager/coordinator node.
     Manager,
     /// Sub-pipeline node referencing an external DOT file for inline composition.
@@ -179,9 +181,10 @@ fn node_type_from_shape(shape: &str) -> NodeType {
         "box" | "rectangle" => NodeType::Codergen,
         "diamond" => NodeType::Conditional,
         "hexagon" | "oval" | "ellipse" => NodeType::Interviewer,
-        "parallelogram" | "tripleoctagon" => NodeType::Parallel,
+        "parallelogram" => NodeType::Tool,
+        "component" => NodeType::Parallel,
+        "tripleoctagon" => NodeType::FanIn,
         "house" => NodeType::Manager,
-        "component" => NodeType::SubPipeline,
         _ => NodeType::Generic,
     }
 }
@@ -449,10 +452,10 @@ mod tests {
             ("hexagon", NodeType::Interviewer),
             ("oval", NodeType::Interviewer),
             ("ellipse", NodeType::Interviewer),
-            ("parallelogram", NodeType::Parallel),
-            ("tripleoctagon", NodeType::Parallel),
+            ("parallelogram", NodeType::Tool),
+            ("component", NodeType::Parallel),
+            ("tripleoctagon", NodeType::FanIn),
             ("house", NodeType::Manager),
-            ("component", NodeType::SubPipeline),
             ("unknownshape", NodeType::Generic),
         ];
 
@@ -994,5 +997,61 @@ mod tests {
         let g = resolve(&dot).unwrap();
         let models = g.referenced_models();
         assert!(models.is_empty());
+    }
+
+    // ---- Spec-critical shape mapping: no shape maps to SubPipeline ----
+    #[test]
+    fn no_shape_maps_to_sub_pipeline() {
+        // SubPipeline is assigned via child_dotfile attribute, not shape.
+        let known_shapes = [
+            "circle",
+            "point",
+            "Mdiamond",
+            "doublecircle",
+            "Msquare",
+            "box",
+            "rectangle",
+            "diamond",
+            "hexagon",
+            "oval",
+            "ellipse",
+            "parallelogram",
+            "component",
+            "tripleoctagon",
+            "house",
+        ];
+        for shape in known_shapes {
+            let dot = make_graph(vec![node_with_shape("n", shape)]);
+            let g = resolve(&dot).unwrap();
+            assert_ne!(
+                g.nodes[0].node_type,
+                NodeType::SubPipeline,
+                "shape '{shape}' should not map to SubPipeline"
+            );
+        }
+    }
+
+    // ---- Spec-critical: component shape maps to Parallel ----
+    #[test]
+    fn component_shape_maps_to_parallel() {
+        let dot = make_graph(vec![node_with_shape("n", "component")]);
+        let g = resolve(&dot).unwrap();
+        assert_eq!(g.nodes[0].node_type, NodeType::Parallel);
+    }
+
+    // ---- Spec-critical: parallelogram shape maps to Tool ----
+    #[test]
+    fn parallelogram_shape_maps_to_tool() {
+        let dot = make_graph(vec![node_with_shape("n", "parallelogram")]);
+        let g = resolve(&dot).unwrap();
+        assert_eq!(g.nodes[0].node_type, NodeType::Tool);
+    }
+
+    // ---- Spec-critical: tripleoctagon shape maps to FanIn ----
+    #[test]
+    fn tripleoctagon_shape_maps_to_fanin() {
+        let dot = make_graph(vec![node_with_shape("n", "tripleoctagon")]);
+        let g = resolve(&dot).unwrap();
+        assert_eq!(g.nodes[0].node_type, NodeType::FanIn);
     }
 }

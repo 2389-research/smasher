@@ -69,6 +69,7 @@ pub fn node_type_name(node_type: &NodeType) -> &str {
         NodeType::Tool => "tool",
         NodeType::Interviewer => "interviewer",
         NodeType::Parallel => "parallel",
+        NodeType::FanIn => "fanin",
         NodeType::Manager => "manager",
         NodeType::SubPipeline => "subpipeline",
         NodeType::Generic => "generic",
@@ -760,6 +761,7 @@ mod tests {
         assert_eq!(node_type_name(&NodeType::Tool), "tool");
         assert_eq!(node_type_name(&NodeType::Interviewer), "interviewer");
         assert_eq!(node_type_name(&NodeType::Parallel), "parallel");
+        assert_eq!(node_type_name(&NodeType::FanIn), "fanin");
         assert_eq!(node_type_name(&NodeType::Manager), "manager");
         assert_eq!(node_type_name(&NodeType::Generic), "generic");
     }
@@ -800,6 +802,7 @@ mod tests {
             NodeType::Tool,
             NodeType::Interviewer,
             NodeType::Parallel,
+            NodeType::FanIn,
             NodeType::Manager,
             NodeType::Generic,
         ];

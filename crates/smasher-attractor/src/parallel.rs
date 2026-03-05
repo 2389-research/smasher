@@ -342,7 +342,7 @@ impl Handler for ParallelHandler {
     }
 
     fn handles(&self, node_type: &NodeType) -> bool {
-        matches!(node_type, NodeType::Parallel)
+        matches!(node_type, NodeType::Parallel | NodeType::FanIn)
     }
 }
 
@@ -888,11 +888,12 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn parallel_handler_handles_only_parallel_nodes() {
+    fn parallel_handler_handles_parallel_and_fanin_nodes() {
         let registry = Arc::new(HandlerRegistry::new());
         let handler = ParallelHandler::new(registry);
 
         assert!(handler.handles(&NodeType::Parallel));
+        assert!(handler.handles(&NodeType::FanIn));
         assert!(!handler.handles(&NodeType::Start));
         assert!(!handler.handles(&NodeType::Exit));
         assert!(!handler.handles(&NodeType::Codergen));

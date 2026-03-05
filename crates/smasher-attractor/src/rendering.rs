@@ -132,8 +132,14 @@ pub fn style_for_node_type(node_type: &NodeType) -> NodeStyle {
             style: "filled",
         },
         NodeType::Parallel => NodeStyle {
-            shape: "parallelogram",
+            shape: "component",
             fill_color: "#00BCD4",
+            font_color: "white",
+            style: "filled",
+        },
+        NodeType::FanIn => NodeStyle {
+            shape: "tripleoctagon",
+            fill_color: "#009688",
             font_color: "white",
             style: "filled",
         },
@@ -907,8 +913,15 @@ mod tests {
     #[test]
     fn style_for_parallel_node() {
         let style = style_for_node_type(&NodeType::Parallel);
-        assert_eq!(style.shape, "parallelogram");
+        assert_eq!(style.shape, "component");
         assert_eq!(style.fill_color, "#00BCD4");
+    }
+
+    #[test]
+    fn style_for_fanin_node() {
+        let style = style_for_node_type(&NodeType::FanIn);
+        assert_eq!(style.shape, "tripleoctagon");
+        assert_eq!(style.fill_color, "#009688");
     }
 
     #[test]
@@ -1060,6 +1073,7 @@ mod tests {
             ("mgr", NodeType::Manager),
             ("sub", NodeType::SubPipeline),
             ("par", NodeType::Parallel),
+            ("fan", NodeType::FanIn),
             ("tool", NodeType::Tool),
             ("iv", NodeType::Interviewer),
         ];

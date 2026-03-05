@@ -602,6 +602,7 @@ async fn test_all_node_types_have_handlers() {
         NodeType::Tool,
         NodeType::Interviewer,
         NodeType::Parallel,
+        NodeType::FanIn,
         NodeType::Manager,
         NodeType::SubPipeline,
         NodeType::Generic,

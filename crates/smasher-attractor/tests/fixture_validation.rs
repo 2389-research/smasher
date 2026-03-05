@@ -390,6 +390,7 @@ async fn counting_handler_handles_all_node_types() {
     assert!(handler.handles(&NodeType::Codergen));
     assert!(handler.handles(&NodeType::Tool));
     assert!(handler.handles(&NodeType::Parallel));
+    assert!(handler.handles(&NodeType::FanIn));
 }
 
 #[tokio::test]
@@ -795,6 +796,7 @@ async fn failing_handler_handles_all_node_types() {
     assert!(handler.handles(&NodeType::Tool));
     assert!(handler.handles(&NodeType::Manager));
     assert!(handler.handles(&NodeType::SubPipeline));
+    assert!(handler.handles(&NodeType::FanIn));
 }
 
 #[tokio::test]
@@ -932,6 +934,7 @@ async fn outcome_handler_handles_all_node_types() {
     assert!(handler.handles(&NodeType::Tool));
     assert!(handler.handles(&NodeType::Manager));
     assert!(handler.handles(&NodeType::SubPipeline));
+    assert!(handler.handles(&NodeType::FanIn));
 }
 
 // ============================================================================
@@ -1012,6 +1015,7 @@ async fn delayed_handler_handles_all_node_types() {
     assert!(handler.handles(&NodeType::Tool));
     assert!(handler.handles(&NodeType::Manager));
     assert!(handler.handles(&NodeType::SubPipeline));
+    assert!(handler.handles(&NodeType::FanIn));
 }
 
 #[tokio::test]
