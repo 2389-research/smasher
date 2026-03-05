@@ -8,9 +8,13 @@ check:
 
 build:
 	cargo build --workspace
+	mkdir -p bin
+	cp target/debug/conformance bin/conformance
 
 release:
 	cargo build --workspace --release
+	mkdir -p bin
+	cp target/release/conformance bin/conformance
 
 # ── Quality ──────────────────────────────────────────────────────────
 test:

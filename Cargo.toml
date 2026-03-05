@@ -6,6 +6,7 @@ members = [
     "crates/smasher-attractor",
     "crates/smasher-cli",
     "crates/smasher-web",
+    "crates/smasher-conformance",
 ]
 
 [workspace.package]
