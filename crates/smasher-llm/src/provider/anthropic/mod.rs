@@ -61,6 +61,30 @@ impl AnthropicAdapter {
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
+
+    /// Build the `anthropic-beta` header value from feature flags and explicit provider_options.
+    ///
+    /// Returns `None` when no beta features are active, avoiding an empty header.
+    /// Feature-specific betas (e.g. thinking) are merged with any explicit entries
+    /// from `provider_options.anthropic.beta_headers`, deduplicated, and joined with commas.
+    fn build_beta_header(&self, request: &Request) -> Option<String> {
+        let mut betas: Vec<String> = types::extract_beta_headers(request);
+
+        // Add thinking beta when extended thinking is enabled.
+        let thinking_enabled = request.thinking.as_ref().is_some_and(|t| t.enabled);
+        if thinking_enabled {
+            let thinking_beta = "interleaved-thinking-2025-05-14".to_string();
+            if !betas.contains(&thinking_beta) {
+                betas.push(thinking_beta);
+            }
+        }
+
+        if betas.is_empty() {
+            None
+        } else {
+            Some(betas.join(","))
+        }
+    }
 }
 
 #[async_trait]
@@ -81,19 +105,21 @@ impl ProviderAdapter for AnthropicAdapter {
         let body = serde_json::to_string(&anthropic_req)
             .map_err(|e| Error::Serialization { source: e })?;
 
-        let response = self
+        let mut http_req = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| Error::Http {
-                provider: "anthropic".into(),
-                source: e,
-            })?;
+            .header("content-type", "application/json");
+
+        if let Some(beta_value) = self.build_beta_header(request) {
+            http_req = http_req.header("anthropic-beta", beta_value);
+        }
+
+        let response = http_req.body(body).send().await.map_err(|e| Error::Http {
+            provider: "anthropic".into(),
+            source: e,
+        })?;
 
         let status = response.status().as_u16();
         let headers = response.headers().clone();
@@ -131,19 +157,21 @@ impl ProviderAdapter for AnthropicAdapter {
         let body = serde_json::to_string(&anthropic_req)
             .map_err(|e| Error::Serialization { source: e })?;
 
-        let response = self
+        let mut http_req = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| Error::Http {
-                provider: "anthropic".into(),
-                source: e,
-            })?;
+            .header("content-type", "application/json");
+
+        if let Some(beta_value) = self.build_beta_header(request) {
+            http_req = http_req.header("anthropic-beta", beta_value);
+        }
+
+        let response = http_req.body(body).send().await.map_err(|e| Error::Http {
+            provider: "anthropic".into(),
+            source: e,
+        })?;
 
         let status = response.status().as_u16();
 
@@ -512,6 +540,131 @@ mod tests {
         assert_eq!(response.text().as_deref(), Some("The answer is 42."));
         assert_eq!(response.usage.cache_read_tokens, Some(30));
         assert_eq!(response.usage.cache_creation_tokens, Some(10));
+    }
+
+    #[test]
+    fn build_beta_header_includes_thinking_when_enabled() {
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]).thinking(
+            ThinkingConfig {
+                enabled: true,
+                budget_tokens: Some(10000),
+            },
+        );
+
+        let adapter = AnthropicAdapter::new("key".into());
+        let header = adapter.build_beta_header(&request);
+        assert!(header.is_some());
+        let value = header.unwrap();
+        assert!(
+            value.contains("interleaved-thinking-2025-05-14"),
+            "expected thinking beta flag, got: {value}"
+        );
+    }
+
+    #[test]
+    fn build_beta_header_none_when_no_betas_needed() {
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]);
+
+        let adapter = AnthropicAdapter::new("key".into());
+        let header = adapter.build_beta_header(&request);
+        assert!(header.is_none(), "expected None when no betas needed");
+    }
+
+    #[test]
+    fn build_beta_header_merges_explicit_and_thinking() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"beta_headers": ["prompt-caching-2024-07-31"]}),
+        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")])
+            .thinking(ThinkingConfig {
+                enabled: true,
+                budget_tokens: Some(10000),
+            })
+            .provider_options(opts);
+
+        let adapter = AnthropicAdapter::new("key".into());
+        let header = adapter.build_beta_header(&request);
+        assert!(header.is_some());
+        let value = header.unwrap();
+        assert!(value.contains("prompt-caching-2024-07-31"));
+        assert!(value.contains("interleaved-thinking-2025-05-14"));
+    }
+
+    #[test]
+    fn build_beta_header_deduplicates() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"beta_headers": ["interleaved-thinking-2025-05-14"]}),
+        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")])
+            .thinking(ThinkingConfig {
+                enabled: true,
+                budget_tokens: Some(10000),
+            })
+            .provider_options(opts);
+
+        let adapter = AnthropicAdapter::new("key".into());
+        let header = adapter.build_beta_header(&request);
+        assert!(header.is_some());
+        let value = header.unwrap();
+        // Should appear only once.
+        assert_eq!(
+            value.matches("interleaved-thinking-2025-05-14").count(),
+            1,
+            "thinking beta should not be duplicated"
+        );
+    }
+
+    #[test]
+    fn build_beta_header_explicit_only() {
+        use std::collections::HashMap;
+        let mut opts = HashMap::new();
+        opts.insert(
+            "anthropic".into(),
+            json!({"beta_headers": ["prompt-caching-2024-07-31"]}),
+        );
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")])
+            .provider_options(opts);
+
+        let adapter = AnthropicAdapter::new("key".into());
+        let header = adapter.build_beta_header(&request);
+        assert!(header.is_some());
+        assert_eq!(header.unwrap(), "prompt-caching-2024-07-31");
+    }
+
+    #[tokio::test]
+    async fn complete_sends_beta_header_when_thinking_enabled() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("anthropic-beta", "interleaved-thinking-2025-05-14"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_beta",
+                "model": "claude-sonnet-4-20250514",
+                "content": [{"type": "text", "text": "Ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = test_adapter(&server);
+        let request = Request::new("claude-sonnet-4-20250514", vec![Message::user("Hi")]).thinking(
+            ThinkingConfig {
+                enabled: true,
+                budget_tokens: Some(10000),
+            },
+        );
+
+        let response = adapter.complete(&request).await.unwrap();
+        assert_eq!(response.id, "msg_beta");
     }
 
     #[tokio::test]
