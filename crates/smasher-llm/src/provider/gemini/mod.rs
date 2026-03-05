@@ -15,14 +15,21 @@ use crate::util::sse::parse_sse_stream;
 use self::stream::translate_stream;
 use self::types::{convert_request, convert_response};
 
+const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+
 /// Adapter for Google's Gemini API (native generateContent endpoint).
 ///
-/// Uses API key authentication via query parameter rather than HTTP headers.
-/// The model name is embedded in the URL path rather than the request body.
+/// Uses API key authentication via query parameter for direct Google API
+/// access. When a custom base URL is configured (e.g. Cloudflare AI Gateway),
+/// the key is sent as a Bearer token header instead.
 pub struct GeminiAdapter {
     client: Client,
     api_key: String,
     base_url: String,
+    /// When true, send the API key as an Authorization header instead of a
+    /// query parameter. Enabled automatically for non-default base URLs
+    /// (proxies and gateways).
+    use_header_auth: bool,
 }
 
 impl GeminiAdapter {
@@ -31,33 +38,47 @@ impl GeminiAdapter {
         Self {
             client: Client::new(),
             api_key,
-            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            use_header_auth: false,
         }
     }
 
     /// Create a GeminiAdapter with a custom base URL (for testing or proxies).
     pub fn with_base_url(api_key: String, base_url: String) -> Self {
+        let use_header_auth = base_url != DEFAULT_BASE_URL;
         Self {
             client: Client::new(),
             api_key,
             base_url,
+            use_header_auth,
         }
     }
 
     /// Build the URL for the generateContent (non-streaming) endpoint.
     fn complete_url(&self, model: &str) -> String {
-        format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.base_url, model, self.api_key
-        )
+        if self.use_header_auth {
+            format!("{}/v1beta/models/{}:generateContent", self.base_url, model)
+        } else {
+            format!(
+                "{}/v1beta/models/{}:generateContent?key={}",
+                self.base_url, model, self.api_key
+            )
+        }
     }
 
     /// Build the URL for the streamGenerateContent (streaming) endpoint.
     fn stream_url(&self, model: &str) -> String {
-        format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, model, self.api_key
-        )
+        if self.use_header_auth {
+            format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.base_url, model
+            )
+        } else {
+            format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                self.base_url, model, self.api_key
+            )
+        }
     }
 }
 
@@ -74,10 +95,14 @@ impl ProviderAdapter for GeminiAdapter {
         let body =
             serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization { source: e })?;
 
-        let http_response = self
+        let mut req_builder = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if self.use_header_auth {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let http_response = req_builder
             .body(body)
             .send()
             .await
@@ -119,10 +144,14 @@ impl ProviderAdapter for GeminiAdapter {
         let body =
             serde_json::to_string(&gemini_req).map_err(|e| Error::Serialization { source: e })?;
 
-        let http_response = self
+        let mut req_builder = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if self.use_header_auth {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let http_response = req_builder
             .body(body)
             .send()
             .await
@@ -191,11 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn custom_base_url() {
+    fn custom_base_url_uses_header_auth() {
         let adapter =
             GeminiAdapter::with_base_url("key".to_string(), "http://localhost:9999".to_string());
+        assert!(adapter.use_header_auth);
         let url = adapter.complete_url("gemini-pro");
         assert!(url.starts_with("http://localhost:9999"));
+        // Custom base URL should NOT include the API key in the query string.
+        assert!(!url.contains("key="));
     }
 
     #[tokio::test]
