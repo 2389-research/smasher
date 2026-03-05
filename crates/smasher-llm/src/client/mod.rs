@@ -51,23 +51,41 @@ impl Client {
     ///
     /// Checks for:
     /// - `ANTHROPIC_API_KEY` → registers Anthropic adapter
+    ///   - `ANTHROPIC_BASE_URL` → optional custom base URL
     /// - `OPENAI_API_KEY` → registers OpenAI adapter
+    ///   - `OPENAI_BASE_URL` → optional custom base URL
     /// - `GEMINI_API_KEY` or `GOOGLE_API_KEY` → registers Gemini adapter
+    ///   - `GEMINI_BASE_URL` → optional custom base URL
     pub fn from_env() -> Self {
         let mut client = Self::new();
 
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            client.register_provider(Provider::Anthropic, Arc::new(AnthropicAdapter::new(key)));
+            let adapter = if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
+                AnthropicAdapter::with_base_url(key, base_url)
+            } else {
+                AnthropicAdapter::new(key)
+            };
+            client.register_provider(Provider::Anthropic, Arc::new(adapter));
         }
 
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            client.register_provider(Provider::OpenAi, Arc::new(OpenAiAdapter::new(key)));
+            let adapter = if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                OpenAiAdapter::with_base_url(key, base_url)
+            } else {
+                OpenAiAdapter::new(key)
+            };
+            client.register_provider(Provider::OpenAi, Arc::new(adapter));
         }
 
         if let Ok(key) =
             std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY"))
         {
-            client.register_provider(Provider::Gemini, Arc::new(GeminiAdapter::new(key)));
+            let adapter = if let Ok(base_url) = std::env::var("GEMINI_BASE_URL") {
+                GeminiAdapter::with_base_url(key, base_url)
+            } else {
+                GeminiAdapter::new(key)
+            };
+            client.register_provider(Provider::Gemini, Arc::new(adapter));
         }
 
         client

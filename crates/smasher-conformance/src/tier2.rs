@@ -11,8 +11,10 @@ use smasher_agent::events::EventEmitter;
 use smasher_agent::session::Session;
 use smasher_agent::tools::ToolRegistry;
 use smasher_agent::tools::shared::register_shared_tools;
-use smasher_agent::types::{SessionConfig, SessionEvent};
+use smasher_agent::types::SessionConfig;
 use smasher_llm::client::Client;
+
+use crate::convert::session_event_to_json;
 
 /// Read all of stdin into a string, returning an error message on failure.
 fn read_stdin() -> Result<String, String> {
@@ -21,88 +23,6 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| e.to_string())?;
     Ok(buf)
-}
-
-/// Convert a SessionEvent to a JSON value for NDJSON output.
-fn session_event_to_json(event: &SessionEvent) -> serde_json::Value {
-    match event {
-        SessionEvent::SessionStarted { session_id } => json!({
-            "type": "session_started",
-            "session_id": session_id,
-        }),
-        SessionEvent::TurnStarted { turn_number } => json!({
-            "type": "turn_started",
-            "turn_number": turn_number,
-        }),
-        SessionEvent::AssistantMessage { response } => json!({
-            "type": "assistant_message",
-            "text": response.text().unwrap_or_default(),
-        }),
-        SessionEvent::ToolCallStarted {
-            tool_name,
-            tool_call_id,
-        } => json!({
-            "type": "tool_call_started",
-            "tool_name": tool_name,
-            "tool_call_id": tool_call_id,
-        }),
-        SessionEvent::ToolCallCompleted {
-            tool_name,
-            tool_call_id,
-            result,
-            is_error,
-            duration_ms,
-        } => json!({
-            "type": "tool_call_completed",
-            "tool_name": tool_name,
-            "tool_call_id": tool_call_id,
-            "result": result,
-            "is_error": is_error,
-            "duration_ms": duration_ms,
-        }),
-        SessionEvent::TextDelta { text } => json!({
-            "type": "text_delta",
-            "text": text,
-        }),
-        SessionEvent::SteeringApplied { text } => json!({
-            "type": "steering_applied",
-            "text": text,
-        }),
-        SessionEvent::SessionCompleted {
-            session_id,
-            total_turns,
-            total_usage,
-        } => json!({
-            "type": "session_completed",
-            "session_id": session_id,
-            "total_turns": total_turns,
-            "input_tokens": total_usage.input_tokens,
-            "output_tokens": total_usage.output_tokens,
-        }),
-        SessionEvent::SessionError { session_id, error } => json!({
-            "type": "session_error",
-            "session_id": session_id,
-            "error": error,
-        }),
-        SessionEvent::LoopDetected {
-            pattern,
-            window_size,
-        } => json!({
-            "type": "loop_detected",
-            "pattern": pattern,
-            "window_size": window_size,
-        }),
-        SessionEvent::ContextWindowWarning {
-            used,
-            limit,
-            fraction,
-        } => json!({
-            "type": "context_window_warning",
-            "used": used,
-            "limit": limit,
-            "fraction": fraction,
-        }),
-    }
 }
 
 pub async fn session_create() -> i32 {

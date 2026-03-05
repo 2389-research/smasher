@@ -53,27 +53,90 @@ fn error_to_type(err: &smasher_llm::types::Error) -> &'static str {
     }
 }
 
-/// Adapt incoming conformance JSON: extract _test_endpoint and map response_schema to
-/// response_format. Returns the cleaned-up Value and the optional test endpoint.
+/// Normalize message content fields: the conformance contract sends `"content": "string"`
+/// but smasher expects `"content": [{"kind": "text", "text": "string"}]`.
+fn normalize_message_content(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut()
+        && let Some(messages) = obj.get_mut("messages")
+        && let Some(arr) = messages.as_array_mut()
+    {
+        for msg in arr.iter_mut() {
+            if let Some(msg_obj) = msg.as_object_mut()
+                && let Some(content) = msg_obj.get("content")
+                && let Some(text) = content.as_str()
+            {
+                let text = text.to_string();
+                msg_obj.insert(
+                    "content".to_string(),
+                    json!([{"kind": "text", "text": text}]),
+                );
+            }
+        }
+    }
+}
+
+/// Normalize tools from OpenAI format `{type: "function", function: {name, parameters}}`
+/// to smasher format `{name, description, parameters}`.
+fn normalize_tools(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut()
+        && let Some(tools) = obj.get_mut("tools")
+        && let Some(arr) = tools.as_array_mut()
+    {
+        for tool in arr.iter_mut() {
+            if let Some(tool_obj) = tool.as_object_mut()
+                && tool_obj.get("type").and_then(|v| v.as_str()) == Some("function")
+                && let Some(func) = tool_obj.remove("function")
+                && let Some(func_obj) = func.as_object()
+            {
+                let mut new_tool = serde_json::Map::new();
+                if let Some(name) = func_obj.get("name") {
+                    new_tool.insert("name".to_string(), name.clone());
+                }
+                new_tool.insert(
+                    "description".to_string(),
+                    func_obj.get("description").cloned().unwrap_or(json!("")),
+                );
+                let params = func_obj
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or(json!({"type": "object"}));
+                new_tool.insert("parameters".to_string(), params);
+                *tool = serde_json::Value::Object(new_tool);
+            }
+        }
+    }
+}
+
+/// Adapt incoming conformance JSON: extract _test_endpoint, normalize message content
+/// and tools, and map response_schema to response_format. Returns the cleaned-up Value
+/// and the optional test endpoint.
 fn adapt_request_json(mut value: serde_json::Value) -> (serde_json::Value, Option<String>) {
     let test_endpoint = value
         .as_object_mut()
         .and_then(|obj| obj.remove("_test_endpoint"))
         .and_then(|v| v.as_str().map(String::from));
 
-    // Map `response_schema` into `response_format` if present.
-    if let Some(obj) = value.as_object_mut() {
-        if let Some(schema) = obj.remove("response_schema") {
-            obj.insert(
-                "response_format".to_string(),
-                json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "schema": schema
-                    }
-                }),
-            );
-        }
+    // Normalize string content in messages to array format.
+    normalize_message_content(&mut value);
+
+    // Normalize OpenAI-format tools to smasher format.
+    normalize_tools(&mut value);
+
+    // Map `response_schema` into our `ResponseFormat::JsonSchema` format.
+    // Conformance sends `response_schema: {...}`, which we convert to
+    // `response_format: {type: "json_schema", name: "response", schema: ..., strict: false}`.
+    if let Some(obj) = value.as_object_mut()
+        && let Some(schema) = obj.remove("response_schema")
+    {
+        obj.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_schema",
+                "name": "response",
+                "schema": schema,
+                "strict": false
+            }),
+        );
     }
 
     (value, test_endpoint)
