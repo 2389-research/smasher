@@ -786,6 +786,11 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
         if should_resume {
             eprintln!("Resuming run {}", incomplete.run_id);
+            // Ensure graph.dot exists in the run directory (older runs may lack it).
+            let graph_dot = incomplete.run_dir.join("graph.dot");
+            if !graph_dot.exists() {
+                std::fs::write(&graph_dot, &dot_source)?;
+            }
             let resume_args = crate::resume::ResumeArgs {
                 run_dir: Some(incomplete.run_dir.display().to_string()),
                 checkpoint: None,
