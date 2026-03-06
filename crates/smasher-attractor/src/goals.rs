@@ -218,6 +218,7 @@ mod tests {
             edges: vec![],
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 

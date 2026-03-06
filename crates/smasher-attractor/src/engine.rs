@@ -336,6 +336,7 @@ impl Engine {
     ///     ],
     ///     default_node_attrs: HashMap::new(),
     ///     default_edge_attrs: HashMap::new(),
+    ///     graph_attrs: HashMap::new(),
     /// };
     ///
     /// let mut registry = HandlerRegistry::new();
@@ -901,6 +902,7 @@ mod tests {
             edges,
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 
@@ -1621,6 +1623,7 @@ mod tests {
             edges: vec![make_edge("start", "exit")],
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         };
         let config = EngineConfig {
             max_steps: 1000,

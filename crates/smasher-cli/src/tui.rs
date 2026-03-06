@@ -1242,6 +1242,7 @@ mod tests {
             edges: vec![],
             default_node_attrs: Default::default(),
             default_edge_attrs: Default::default(),
+            graph_attrs: Default::default(),
         }
     }
 

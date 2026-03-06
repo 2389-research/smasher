@@ -109,6 +109,7 @@ fn make_graph(nodes: Vec<GraphNode>, edges: Vec<GraphEdge>) -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
