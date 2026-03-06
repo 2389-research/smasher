@@ -40,7 +40,7 @@ use crate::edge::{EdgeSelectionError, select_edge};
 use crate::events::{PipelineEvent, PipelineEventEmitter};
 use crate::fidelity::{FidelityConfig, FidelityProcessor};
 use crate::goals::{GoalError, GoalGate};
-use crate::graph::{Graph, NodeAttrValue, NodeType};
+use crate::graph::{Graph, GraphNode, NodeAttrValue, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
 use crate::retry::{RetryPolicy, RetryState, compute_delay};
 use crate::state::{Checkpoint, Context, Outcome};
@@ -222,6 +222,43 @@ pub struct ExecutionResult {
     pub loop_restarts: LoopCounter,
     /// Aggregate timing and outcome statistics for this run.
     pub stats: PipelineStats,
+}
+
+/// Resolve a retry target for a node using the spec's 4-level fallback chain.
+///
+/// Checks in order (spec section 3.4):
+/// 1. node.retry_target
+/// 2. node.fallback_retry_target
+/// 3. graph.retry_target (graph-level attribute)
+/// 4. graph.fallback_retry_target (graph-level attribute)
+///
+/// Returns None if no retry target is found at any level.
+pub(crate) fn resolve_retry_target(node: &GraphNode, graph: &Graph) -> Option<String> {
+    // 1. Node-level retry_target
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 2. Node-level fallback_retry_target
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("fallback_retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 3. Graph-level retry_target
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 4. Graph-level fallback_retry_target
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("fallback_retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    None
 }
 
 /// The core pipeline execution engine.
@@ -3009,5 +3046,208 @@ mod tests {
 
         // total_duration_ms is always set (may be 0 in fast tests, never panics).
         let _ = result.stats.total_duration_ms;
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_retry_target tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_retry_target_from_node_attr() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("recovery".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_node_fallback() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("fb_target".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("fb_target".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_graph_level() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("graph_rt".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("graph_rt".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_graph_fallback() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("graph_fb".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("graph_fb".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_none_when_empty() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(resolve_retry_target(&node, &graph), None);
+    }
+
+    #[test]
+    fn resolve_retry_target_priority_order() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("node_rt".to_string()),
+        );
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("node_fb".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("graph_rt".to_string()),
+        );
+        graph_attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("graph_fb".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        // Node-level retry_target should win
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("node_rt".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_skips_empty_strings() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("".to_string()),
+        );
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("actual_target".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("actual_target".to_string())
+        );
     }
 }
