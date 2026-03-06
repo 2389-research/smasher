@@ -547,8 +547,22 @@ impl Engine {
                 timestamp: Utc::now(),
             });
 
-            // Execute the handler for this node
-            let mut outcome = self.registry.execute(node, &context).await?;
+            // Execute the handler for this node.
+            // Handler errors are converted to failure outcomes so that normal
+            // event flow (NodeFailed, edge selection, failure routing) still
+            // runs. This ensures the TUI and headless output always see the
+            // error instead of the pipeline silently dying.
+            let mut outcome = match self.registry.execute(node, &context).await {
+                Ok(o) => o,
+                Err(handler_err) => {
+                    tracing::error!(
+                        node = %current_node_id,
+                        error = %handler_err,
+                        "handler error, converting to failure outcome"
+                    );
+                    Outcome::failure(handler_err.to_string())
+                }
+            };
 
             // Handle retries for retryable failures
             if outcome.is_retryable() {
@@ -560,7 +574,17 @@ impl Engine {
                     let delay = compute_delay(&policy, retry_state.attempts);
                     tokio::time::sleep(delay).await;
 
-                    outcome = self.registry.execute(node, &context).await?;
+                    outcome = match self.registry.execute(node, &context).await {
+                        Ok(o) => o,
+                        Err(handler_err) => {
+                            tracing::error!(
+                                node = %current_node_id,
+                                error = %handler_err,
+                                "handler error during retry, converting to failure outcome"
+                            );
+                            Outcome::failure(handler_err.to_string())
+                        }
+                    };
                     retry_state.record_attempt(&outcome);
                 }
 
@@ -1296,10 +1320,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Test 8: Handler error propagates
+    // Test 8: Handler error converts to failure outcome
     // ---------------------------------------------------------------
     #[tokio::test]
-    async fn handler_error_propagates() {
+    async fn handler_error_converts_to_failure_outcome() {
         let graph = make_graph(
             vec![
                 make_node("start", NodeType::Start),
@@ -1313,10 +1337,21 @@ mod tests {
         let ctx = Context::new();
         let result = engine.run(ctx).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, EngineError::Handler(_)));
-        assert!(err.to_string().contains("catastrophic failure"));
+        // Handler errors are converted to Outcome::Failure so that normal
+        // event flow (NodeFailed, edge selection) runs. The pipeline completes
+        // with failure outcomes rather than aborting silently.
+        let result = result.expect("pipeline should complete, not abort on handler error");
+        let start_outcome = result.node_outcomes.get("start").unwrap();
+        assert!(start_outcome.is_failure());
+        match start_outcome {
+            Outcome::Failure { error, .. } => {
+                assert!(
+                    error.contains("catastrophic failure"),
+                    "failure outcome should preserve the handler error message, got: {error}"
+                );
+            }
+            other => panic!("expected Failure outcome, got: {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------

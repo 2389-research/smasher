@@ -403,12 +403,20 @@ async fn test_engine_error_paths_covered() {
     registry.register(Arc::new(ErrorOnNodeHandler {
         target: "bad".to_string(),
     }));
-    let err = Engine::new(handler_err_graph, registry)
+    // Handler errors are now converted to Outcome::Failure so the pipeline
+    // completes with failure outcomes rather than aborting.
+    let result = Engine::new(handler_err_graph, registry)
         .run(Context::new())
         .await
-        .unwrap_err();
-    assert!(matches!(err, EngineError::Handler(_)));
-    assert!(err.to_string().contains("deliberate test failure"));
+        .expect("pipeline should complete with failure outcome, not abort");
+    let bad_outcome = result.node_outcomes.get("bad").unwrap();
+    assert!(bad_outcome.is_failure());
+    match bad_outcome {
+        Outcome::Failure { error, .. } => {
+            assert!(error.contains("deliberate test failure"));
+        }
+        other => panic!("expected Failure outcome, got: {other:?}"),
+    }
 
     // 5. GoalEnforcement error
     let mut goal_attrs = HashMap::new();
@@ -635,14 +643,25 @@ async fn test_handler_error_propagation() {
     }));
     let engine = Engine::new(graph, registry);
 
-    let err = engine.run(Context::new()).await.unwrap_err();
+    // Handler errors are now converted to Outcome::Failure so the pipeline
+    // completes with failure outcomes rather than aborting.
+    let result = engine
+        .run(Context::new())
+        .await
+        .expect("pipeline should complete with failure outcome, not abort");
+    let worker_outcome = result.node_outcomes.get("worker").unwrap();
+    assert!(worker_outcome.is_failure());
+    match worker_outcome {
+        Outcome::Failure { error, .. } => {
+            assert!(
+                error.contains("deliberate test failure"),
+                "failure outcome should contain handler error message, got: {error}"
+            );
+        }
+        other => panic!("expected Failure outcome, got: {other:?}"),
+    }
 
-    // The error chain: HandlerError -> EngineError::Handler
-    assert!(matches!(err, EngineError::Handler(_)));
-    let msg = err.to_string();
-    assert!(msg.contains("handler error") || msg.contains("deliberate test failure"));
-
-    // Also verify no-handler case
+    // Also verify no-handler case produces failure outcome
     let graph2 = make_graph(
         vec![
             make_node("start", NodeType::Start),
@@ -656,12 +675,21 @@ async fn test_handler_error_propagation() {
     );
     // Empty registry: no handlers at all
     let empty_reg = HandlerRegistry::new();
-    let err2 = Engine::new(graph2, empty_reg)
+    let result2 = Engine::new(graph2, empty_reg)
         .run(Context::new())
         .await
-        .unwrap_err();
-    assert!(matches!(err2, EngineError::Handler(_)));
-    assert!(err2.to_string().contains("no handler"));
+        .expect("pipeline should complete with failure outcome, not abort");
+    let tool_outcome = result2.node_outcomes.get("tool_node").unwrap();
+    assert!(tool_outcome.is_failure());
+    match tool_outcome {
+        Outcome::Failure { error, .. } => {
+            assert!(
+                error.contains("no handler"),
+                "expected 'no handler' message, got: {error}"
+            );
+        }
+        other => panic!("expected Failure outcome, got: {other:?}"),
+    }
 }
 
 // ===========================================================================

@@ -690,10 +690,20 @@ async fn error_handler_returns_handler_error() {
     let mut registry = HandlerRegistry::new();
     registry.register(Arc::new(ErrorOnNodeHandler::new("bad_node")));
     let engine = Engine::new(graph, registry);
-    let err = engine.run(Context::new()).await.unwrap_err();
-
-    assert!(matches!(err, EngineError::Handler(_)));
-    assert!(err.to_string().contains("deliberate test failure"));
+    // Handler errors are converted to Outcome::Failure so the pipeline
+    // completes rather than aborting.
+    let result = engine
+        .run(Context::new())
+        .await
+        .expect("pipeline should complete with failure outcome, not abort");
+    let bad_outcome = result.node_outcomes.get("bad_node").unwrap();
+    assert!(bad_outcome.is_failure());
+    match bad_outcome {
+        Outcome::Failure { error, .. } => {
+            assert!(error.contains("deliberate test failure"));
+        }
+        other => panic!("expected Failure outcome, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -709,9 +719,14 @@ async fn error_handler_on_start_node() {
     let mut registry = HandlerRegistry::new();
     registry.register(Arc::new(ErrorOnNodeHandler::new("start")));
     let engine = Engine::new(graph, registry);
-    let err = engine.run(Context::new()).await.unwrap_err();
-
-    assert!(matches!(err, EngineError::Handler(_)));
+    // Handler errors are converted to Outcome::Failure so the pipeline
+    // completes rather than aborting.
+    let result = engine
+        .run(Context::new())
+        .await
+        .expect("pipeline should complete with failure outcome, not abort");
+    let start_outcome = result.node_outcomes.get("start").unwrap();
+    assert!(start_outcome.is_failure());
 }
 
 // ============================================================================
