@@ -127,6 +127,10 @@ pub struct PipelineTui {
     /// Scrollable viewport for the unified console panel.
     console_viewport: Viewport,
     focus: PanelFocus,
+    /// Scroll offset for the node list panel (first visible node index).
+    node_scroll_offset: usize,
+    /// Last known visible height of the node panel (updated each render).
+    node_panel_height: std::cell::Cell<usize>,
     finished_node_count: usize,
     /// Cumulative input tokens across all nodes.
     total_input_tokens: u64,
@@ -187,6 +191,8 @@ impl Model for PipelineTui {
             log_viewport,
             console_viewport,
             focus: PanelFocus::Nodes,
+            node_scroll_offset: 0,
+            node_panel_height: std::cell::Cell::new(20),
             finished_node_count: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -228,16 +234,28 @@ impl Model for PipelineTui {
                 self.console_viewport.update(m).map(Msg::ConsoleViewportMsg)
             }
 
-            Msg::MouseScroll { up } => {
-                let wheel = viewport::Message::MouseWheel { up };
-                match self.focus {
-                    PanelFocus::Console => self
-                        .console_viewport
-                        .update(wheel)
-                        .map(Msg::ConsoleViewportMsg),
-                    _ => self.log_viewport.update(wheel).map(Msg::ViewportMsg),
+            Msg::MouseScroll { up } => match self.focus {
+                PanelFocus::Nodes => {
+                    if up {
+                        self.selected_node = self.selected_node.saturating_sub(1);
+                    } else if self.selected_node + 1 < self.nodes.len() {
+                        self.selected_node += 1;
+                    }
+                    self.scroll_nodes_to_selected();
+                    self.refresh_viewport();
+                    Command::none()
                 }
-            }
+                PanelFocus::Console => {
+                    let wheel = viewport::Message::MouseWheel { up };
+                    self.console_viewport
+                        .update(wheel)
+                        .map(Msg::ConsoleViewportMsg)
+                }
+                PanelFocus::Logs => {
+                    let wheel = viewport::Message::MouseWheel { up };
+                    self.log_viewport.update(wheel).map(Msg::ViewportMsg)
+                }
+            },
 
             Msg::PipelineDone => Command::quit(),
 
@@ -366,6 +384,9 @@ impl PipelineTui {
             } => {
                 if let Some(&idx) = self.node_index.get(node_id) {
                     self.nodes[idx].status = NodeStatus::Running;
+                    // Auto-select the newly running node and scroll to it
+                    self.selected_node = idx;
+                    self.scroll_nodes_to_selected();
                 }
                 self.push_both(LogEntry {
                     timestamp: *timestamp,
@@ -402,6 +423,7 @@ impl PipelineTui {
                     .position(|n| n.status == NodeStatus::Running)
                 {
                     self.selected_node = next;
+                    self.scroll_nodes_to_selected();
                 }
                 Command::none()
             }
@@ -623,12 +645,30 @@ impl PipelineTui {
                 KeyCode::Char('j') | KeyCode::Down => {
                     if self.selected_node + 1 < self.nodes.len() {
                         self.selected_node += 1;
+                        self.scroll_nodes_to_selected();
                         self.refresh_viewport();
                     }
                     Command::none()
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.selected_node = self.selected_node.saturating_sub(1);
+                    self.scroll_nodes_to_selected();
+                    self.refresh_viewport();
+                    Command::none()
+                }
+                KeyCode::Char('G') => {
+                    // Jump to last node
+                    if !self.nodes.is_empty() {
+                        self.selected_node = self.nodes.len() - 1;
+                        self.scroll_nodes_to_selected();
+                        self.refresh_viewport();
+                    }
+                    Command::none()
+                }
+                KeyCode::Char('g') => {
+                    // Jump to first node
+                    self.selected_node = 0;
+                    self.scroll_nodes_to_selected();
                     self.refresh_viewport();
                     Command::none()
                 }
@@ -684,6 +724,19 @@ impl PipelineTui {
                 self.focus = PanelFocus::Nodes;
                 self.console_viewport.blur();
             }
+        }
+    }
+
+    /// Adjust `node_scroll_offset` so that `selected_node` is visible.
+    fn scroll_nodes_to_selected(&mut self) {
+        let h = self.node_panel_height.get();
+        if h == 0 {
+            return;
+        }
+        if self.selected_node < self.node_scroll_offset {
+            self.node_scroll_offset = self.selected_node;
+        } else if self.selected_node >= self.node_scroll_offset + h {
+            self.node_scroll_offset = self.selected_node - h + 1;
         }
     }
 
@@ -876,10 +929,17 @@ impl PipelineTui {
             .title(" Nodes ")
             .border_style(border_style);
 
+        let inner = block.inner(area);
+        let visible_height = inner.height as usize;
+        self.node_panel_height.set(visible_height);
+
+        // Build visible items starting from scroll offset.
         let items: Vec<ListItem> = self
             .nodes
             .iter()
             .enumerate()
+            .skip(self.node_scroll_offset)
+            .take(visible_height)
             .map(|(i, node)| {
                 // Running nodes show the current spinner frame in green
                 let icon_span = match node.status {
@@ -1495,6 +1555,52 @@ mod tests {
         assert_eq!(model.nodes[2].status, NodeStatus::Pending); // c
         assert_eq!(model.nodes[3].status, NodeStatus::Pending); // d
         assert_eq!(model.finished_node_count, 2);
+    }
+
+    #[test]
+    fn node_scroll_follows_selection() {
+        let (mut model, _) = PipelineTui::init(make_flags(
+            "test",
+            &["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"],
+        ));
+        // Simulate a small panel (3 rows visible)
+        model.node_panel_height.set(3);
+
+        assert_eq!(model.node_scroll_offset, 0);
+        assert_eq!(model.selected_node, 0);
+
+        // Move down past visible area
+        model.selected_node = 4;
+        model.scroll_nodes_to_selected();
+        // Offset should adjust so node 4 is visible: 4 - 3 + 1 = 2
+        assert_eq!(model.node_scroll_offset, 2);
+
+        // Move back up past visible area
+        model.selected_node = 1;
+        model.scroll_nodes_to_selected();
+        assert_eq!(model.node_scroll_offset, 1);
+
+        // Jump to top
+        model.selected_node = 0;
+        model.scroll_nodes_to_selected();
+        assert_eq!(model.node_scroll_offset, 0);
+    }
+
+    #[test]
+    fn node_started_auto_selects_and_scrolls() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c", "d", "e"]));
+        model.node_panel_height.set(2);
+
+        // Start node at index 4 (beyond visible)
+        model.handle_pipeline_event(PipelineEvent::NodeStarted {
+            node_id: "e".into(),
+            node_type: "codergen".into(),
+            timestamp: Utc::now(),
+        });
+
+        assert_eq!(model.selected_node, 4);
+        // Should have scrolled so node 4 is visible
+        assert!(model.node_scroll_offset > 0);
     }
 
     #[test]
