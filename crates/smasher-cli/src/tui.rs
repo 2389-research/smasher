@@ -38,6 +38,7 @@ pub enum Msg {
     StopwatchMsg(stopwatch::Message),
     ViewportMsg(viewport::Message),
     ConsoleViewportMsg(viewport::Message),
+    MouseScroll { up: bool },
     PipelineDone,
     Quit,
 }
@@ -211,6 +212,17 @@ impl Model for PipelineTui {
                 self.console_viewport.update(m).map(Msg::ConsoleViewportMsg)
             }
 
+            Msg::MouseScroll { up } => {
+                let wheel = viewport::Message::MouseWheel { up };
+                match self.focus {
+                    PanelFocus::Console => self
+                        .console_viewport
+                        .update(wheel)
+                        .map(Msg::ConsoleViewportMsg),
+                    _ => self.log_viewport.update(wheel).map(Msg::ViewportMsg),
+                }
+            }
+
             Msg::PipelineDone => Command::quit(),
 
             Msg::Quit => Command::quit(),
@@ -239,14 +251,8 @@ impl Model for PipelineTui {
             TerminalEvent::Mouse(m) => {
                 use boba::crossterm::event::MouseEventKind;
                 match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        Some(Msg::ViewportMsg(viewport::Message::MouseWheel { up: true }))
-                    }
-                    MouseEventKind::ScrollDown => {
-                        Some(Msg::ViewportMsg(viewport::Message::MouseWheel {
-                            up: false,
-                        }))
-                    }
+                    MouseEventKind::ScrollUp => Some(Msg::MouseScroll { up: true }),
+                    MouseEventKind::ScrollDown => Some(Msg::MouseScroll { up: false }),
                     _ => None,
                 }
             }
