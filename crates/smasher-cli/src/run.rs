@@ -404,9 +404,13 @@ impl CodergenBackend for ClaudeCliBackend {
                 }
                 Err(_) => {
                     let _ = child.kill().await;
-                    return Err(self.record_timeout());
+                    return self.record_timeout();
                 }
             };
+
+            // Any non-timeout completion (success or error) resets the counter.
+            self.consecutive_timeouts
+                .store(0, std::sync::atomic::Ordering::Relaxed);
 
             if !status.success() {
                 let stderr = String::from_utf8_lossy(&stderr);
@@ -420,8 +424,6 @@ impl CodergenBackend for ClaudeCliBackend {
             }
 
             let text = result_text.unwrap_or_default();
-            self.consecutive_timeouts
-                .store(0, std::sync::atomic::Ordering::Relaxed);
             return Ok(Outcome::success_with(serde_json::json!({"response": text})));
         }
 
@@ -472,9 +474,13 @@ impl CodergenBackend for ClaudeCliBackend {
             }
             Err(_) => {
                 let _ = child.kill().await;
-                return Err(self.record_timeout());
+                return self.record_timeout();
             }
         };
+
+        // Any non-timeout completion (success or error) resets the counter.
+        self.consecutive_timeouts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -489,35 +495,34 @@ impl CodergenBackend for ClaudeCliBackend {
         }
 
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        self.consecutive_timeouts
-            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(Outcome::success_with(serde_json::json!({"response": text})))
     }
 }
 
 impl ClaudeCliBackend {
-    /// Record a timeout and return the appropriate error. Increments the
-    /// consecutive timeout counter and aborts the pipeline if the threshold
-    /// is reached.
-    fn record_timeout(&self) -> HandlerError {
+    /// Record a timeout. Returns `Ok(Outcome::failure(...))` for non-abort
+    /// timeouts (so the engine can route to error edges or retry), and
+    /// `Err(HandlerError)` when the consecutive threshold is reached (to
+    /// kill the pipeline immediately).
+    fn record_timeout(&self) -> Result<Outcome, HandlerError> {
         let count = self
             .consecutive_timeouts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if count >= self.max_consecutive_timeouts {
-            HandlerError::Other(format!(
+        if self.max_consecutive_timeouts > 0 && count >= self.max_consecutive_timeouts {
+            Err(HandlerError::Other(format!(
                 "aborting: {} consecutive timeouts ({}s each). \
                  Consider increasing --agent-timeout or simplifying node prompts.",
                 count,
                 self.timeout.as_secs()
-            ))
+            )))
         } else {
-            HandlerError::Other(format!(
+            Ok(Outcome::failure(format!(
                 "claude CLI timed out after {}s ({}/{} consecutive timeouts)",
                 self.timeout.as_secs(),
                 count,
                 self.max_consecutive_timeouts
-            ))
+            )))
         }
     }
 }
@@ -721,7 +726,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub resume: bool,
 
-    /// Abort pipeline after this many consecutive agent timeouts. Default: 3.
+    /// Abort pipeline after this many consecutive agent timeouts. Set to 0
+    /// to disable (never abort on timeouts alone). Default: 3.
     #[arg(long, default_value = "3")]
     pub max_timeouts: u32,
 }
@@ -1859,12 +1865,16 @@ mod tests {
         let ctx = smasher_attractor::state::Context::new();
         let result = backend.generate("test prompt", None, &ctx).await;
 
-        assert!(result.is_err(), "timeout should produce an error");
-        let err = result.unwrap_err();
-        let msg = err.to_string();
+        // Non-abort timeout returns Ok(Outcome::failure), not Err
+        let outcome = result.expect("timeout should return Ok(failure), not Err");
+        assert!(
+            outcome.is_failure(),
+            "timeout should produce a failure outcome"
+        );
+        let msg = format!("{outcome:?}");
         assert!(
             msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
-            "error should mention timeout, got: {msg}"
+            "outcome should mention timeout, got: {msg}"
         );
     }
 
@@ -1891,18 +1901,16 @@ mod tests {
 
         let ctx = smasher_attractor::state::Context::new();
 
-        // First timeout: shows 1/2
-        let err1 = backend
-            .generate("test", None, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        // First timeout: returns Ok(failure) with "1/2"
+        let outcome1 = backend.generate("test", None, &ctx).await.unwrap();
+        assert!(outcome1.is_failure());
+        let msg1 = format!("{outcome1:?}");
         assert!(
-            err1.contains("1/2"),
-            "first timeout should show 1/2, got: {err1}"
+            msg1.contains("1/2"),
+            "first timeout should show 1/2, got: {msg1}"
         );
 
-        // Second timeout: triggers abort
+        // Second timeout: triggers abort (returns Err)
         let err2 = backend
             .generate("test", None, &ctx)
             .await
@@ -2041,6 +2049,31 @@ mod tests {
     fn should_enable_tui_no_tui_overrides_tui() {
         let cli = TestCli::parse_from(["test", "--tui", "--no-tui", "pipeline.dot"]);
         assert!(!should_enable_tui(&cli.run));
+    }
+
+    #[test]
+    fn headless_flag_disables_tui() {
+        let cli = TestCli::parse_from(["test", "--headless", "pipeline.dot"]);
+        assert!(cli.run.headless);
+        assert!(!should_enable_tui(&cli.run));
+    }
+
+    #[test]
+    fn headless_overrides_tui() {
+        let cli = TestCli::parse_from(["test", "--tui", "--headless", "pipeline.dot"]);
+        assert!(!should_enable_tui(&cli.run));
+    }
+
+    #[test]
+    fn max_timeouts_defaults_to_three() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert_eq!(cli.run.max_timeouts, 3);
+    }
+
+    #[test]
+    fn max_timeouts_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--max-timeouts", "5", "pipeline.dot"]);
+        assert_eq!(cli.run.max_timeouts, 5);
     }
 
     // ---- Shell backend flag test ----

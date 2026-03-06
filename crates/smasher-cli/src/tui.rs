@@ -383,9 +383,12 @@ impl PipelineTui {
                 ..
             } => {
                 if let Some(&idx) = self.node_index.get(node_id) {
+                    // Only increment if not already marked completed (e.g. from resume).
+                    if self.nodes[idx].status != NodeStatus::Completed {
+                        self.finished_node_count += 1;
+                    }
                     self.nodes[idx].status = NodeStatus::Completed;
                 }
-                self.finished_node_count += 1;
                 self.push_both(LogEntry {
                     timestamp: *timestamp,
                     node_id: Some(node_id.clone()),
@@ -410,9 +413,13 @@ impl PipelineTui {
                 ..
             } => {
                 if let Some(&idx) = self.node_index.get(node_id) {
+                    if self.nodes[idx].status != NodeStatus::Completed
+                        && self.nodes[idx].status != NodeStatus::Failed
+                    {
+                        self.finished_node_count += 1;
+                    }
                     self.nodes[idx].status = NodeStatus::Failed;
                 }
-                self.finished_node_count += 1;
                 self.status = PipelineStatus::Failed;
                 self.push_both(LogEntry {
                     timestamp: *timestamp,
@@ -986,9 +993,8 @@ fn style_for_log_entry(entry: &LogEntry) -> Style {
         LogKind::PipelineStart | LogKind::PipelineEnd => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        LogKind::NodeStart | LogKind::NodeComplete | LogKind::NodeFail => {
-            Style::default().fg(Color::Yellow)
-        }
+        LogKind::NodeStart | LogKind::NodeComplete => Style::default().fg(Color::Yellow),
+        LogKind::NodeFail => Style::default().fg(Color::Red),
         LogKind::EdgeTraversal => Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
