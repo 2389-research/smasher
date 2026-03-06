@@ -267,6 +267,11 @@ impl CodergenBackend for ClaudeCliBackend {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
                 let mut result_text: Option<String> = None;
+                // Track cumulative token counts to emit deltas. Claude CLI reports
+                // cumulative usage per assistant message, so we subtract the previous
+                // cumulative value to get the incremental tokens for each step.
+                let mut prev_input_tokens: u64 = 0;
+                let mut prev_output_tokens: u64 = 0;
                 // Deduplicate per-step token emissions by message ID (parallel tool
                 // calls share the same ID with identical usage data).
                 let mut seen_msg_ids: std::collections::HashSet<String> =
@@ -287,17 +292,23 @@ impl CodergenBackend for ClaudeCliBackend {
                                 let msg_id =
                                     obj["message"]["id"].as_str().unwrap_or("").to_string();
                                 if !msg_id.is_empty() && seen_msg_ids.insert(msg_id) {
-                                    let input_tokens = obj["message"]["usage"]["input_tokens"]
+                                    let cumulative_in = obj["message"]["usage"]["input_tokens"]
                                         .as_u64()
                                         .unwrap_or(0);
-                                    let output_tokens = obj["message"]["usage"]["output_tokens"]
+                                    let cumulative_out = obj["message"]["usage"]["output_tokens"]
                                         .as_u64()
                                         .unwrap_or(0);
-                                    if input_tokens > 0 || output_tokens > 0 {
+                                    // Emit the delta (increment since last message).
+                                    let delta_in = cumulative_in.saturating_sub(prev_input_tokens);
+                                    let delta_out =
+                                        cumulative_out.saturating_sub(prev_output_tokens);
+                                    prev_input_tokens = cumulative_in;
+                                    prev_output_tokens = cumulative_out;
+                                    if delta_in > 0 || delta_out > 0 {
                                         emitter.emit(PipelineEvent::AgentTokenUsage {
                                             node_id: node_id.clone(),
-                                            input_tokens,
-                                            output_tokens,
+                                            input_tokens: delta_in,
+                                            output_tokens: delta_out,
                                             cost_usd: 0.0,
                                             timestamp: chrono::Utc::now(),
                                         });
@@ -864,6 +875,19 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         std::fs::write(&graph_dot_path, &dot_source)?;
         (run_id, rd, None)
     };
+
+    // Extract completed node IDs from checkpoint for TUI display. The
+    // checkpoint's current_node will be re-executed, so exclude it.
+    let resumed_completed_nodes: Vec<String> = if let Some(ref cp) = resume_checkpoint {
+        cp.visited_nodes
+            .iter()
+            .filter(|id| id.as_str() != cp.current_node)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let run_working_dir = run_directory
         .manifest()
         .directories
@@ -1049,6 +1073,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             graph: tui_graph.unwrap(),
             run_id: run_id.clone(),
             pipeline_name: tui_pipeline_name,
+            completed_node_ids: resumed_completed_nodes,
         };
 
         let program = crate::tui::build_program(flags)

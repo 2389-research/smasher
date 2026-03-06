@@ -265,15 +265,21 @@ pub fn render_event_html(event: &PipelineEvent) -> String {
             node_id,
             input_tokens,
             output_tokens,
+            cost_usd,
             timestamp,
-            ..
         } => {
+            let cost_part = if *cost_usd > 0.0 {
+                format!(" ${:.2}", cost_usd)
+            } else {
+                String::new()
+            };
             format!(
-                r#"<div class="event-item event-agent_token_usage"><span class="event-time">{}</span><span class="event-icon">⊛</span><div class="event-body"><span class="event-kind">TOKENS</span><span class="event-detail"><span class="event-node">{}</span> in:{} out:{}</span></div></div>"#,
+                r#"<div class="event-item event-agent_token_usage"><span class="event-time">{}</span><span class="event-icon">⊛</span><div class="event-body"><span class="event-kind">TOKENS</span><span class="event-detail"><span class="event-node">{}</span> in:{} out:{}{}</span></div></div>"#,
                 format_time(timestamp),
                 escape_html(node_id),
                 input_tokens,
-                output_tokens
+                output_tokens,
+                cost_part
             )
         }
     }

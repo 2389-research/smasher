@@ -26,6 +26,8 @@ pub struct TuiFlags {
     pub graph: Graph,
     pub run_id: String,
     pub pipeline_name: String,
+    /// Node IDs that were already completed before this run (e.g. from a resumed checkpoint).
+    pub completed_node_ids: Vec<String>,
 }
 
 /// Messages handled by the PipelineTui model.
@@ -169,7 +171,7 @@ impl Model for PipelineTui {
         let log_viewport = Viewport::new("").with_mouse_wheel(true);
         let console_viewport = Viewport::new("").with_mouse_wheel(true);
 
-        let model = PipelineTui {
+        let mut model = PipelineTui {
             nodes,
             node_index,
             selected_node: 0,
@@ -191,6 +193,14 @@ impl Model for PipelineTui {
             total_cost_usd: 0.0,
             files_touched: std::collections::HashSet::new(),
         };
+
+        // Mark nodes that were already completed in a previous run (resume).
+        for id in &flags.completed_node_ids {
+            if let Some(&idx) = model.node_index.get(id) {
+                model.nodes[idx].status = NodeStatus::Completed;
+                model.finished_node_count += 1;
+            }
+        }
 
         (model, Command::none())
     }
@@ -725,34 +735,7 @@ impl PipelineTui {
                 None => true,
             })
             .map(|entry| {
-                let style = match entry.kind {
-                    LogKind::PipelineStart | LogKind::PipelineEnd => Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                    // All node lifecycle events in yellow
-                    LogKind::NodeStart | LogKind::NodeComplete | LogKind::NodeFail => {
-                        Style::default().fg(Color::Yellow)
-                    }
-                    // Edge traversal dimmed
-                    LogKind::EdgeTraversal => Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    LogKind::AgentTurn => Style::default().fg(Color::Cyan),
-                    // Tool call invocations in cyan
-                    LogKind::ToolCallStart => Style::default().fg(Color::Cyan),
-                    // Tool results: green for ok, red for ERR
-                    LogKind::ToolCallComplete => {
-                        if entry.content.contains("ERR") {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default().fg(Color::Green)
-                        }
-                    }
-                    LogKind::AgentText => Style::default().fg(Color::White),
-                    LogKind::HumanPrompt => Style::default().fg(Color::Magenta),
-                    LogKind::HumanResponse => Style::default().fg(Color::Magenta),
-                    LogKind::Info => Style::default().fg(Color::Gray),
-                };
+                let style = style_for_log_entry(entry);
                 Line::from(vec![Span::styled(entry.content.clone(), style)])
             })
             .collect()
@@ -781,30 +764,7 @@ impl PipelineTui {
                             .add_modifier(Modifier::DIM),
                     ),
                 };
-                let style = match entry.kind {
-                    LogKind::PipelineStart | LogKind::PipelineEnd => Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                    LogKind::NodeStart | LogKind::NodeComplete | LogKind::NodeFail => {
-                        Style::default().fg(Color::Yellow)
-                    }
-                    LogKind::EdgeTraversal => Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    LogKind::AgentTurn => Style::default().fg(Color::Cyan),
-                    LogKind::ToolCallStart => Style::default().fg(Color::Cyan),
-                    LogKind::ToolCallComplete => {
-                        if entry.content.contains("ERR") {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default().fg(Color::Green)
-                        }
-                    }
-                    LogKind::AgentText => Style::default().fg(Color::White),
-                    LogKind::HumanPrompt => Style::default().fg(Color::Magenta),
-                    LogKind::HumanResponse => Style::default().fg(Color::Magenta),
-                    LogKind::Info => Style::default().fg(Color::Gray),
-                };
+                let style = style_for_log_entry(entry);
                 Line::from(vec![
                     time_span,
                     prefix,
@@ -1020,6 +980,34 @@ fn format_token_count(tokens: u64) -> String {
     }
 }
 
+/// Map a log entry's kind to a ratatui Style for consistent coloring.
+fn style_for_log_entry(entry: &LogEntry) -> Style {
+    match entry.kind {
+        LogKind::PipelineStart | LogKind::PipelineEnd => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        LogKind::NodeStart | LogKind::NodeComplete | LogKind::NodeFail => {
+            Style::default().fg(Color::Yellow)
+        }
+        LogKind::EdgeTraversal => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+        LogKind::AgentTurn => Style::default().fg(Color::Cyan),
+        LogKind::ToolCallStart => Style::default().fg(Color::Cyan),
+        LogKind::ToolCallComplete => {
+            if entry.content.contains("ERR") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green)
+            }
+        }
+        LogKind::AgentText => Style::default().fg(Color::White),
+        LogKind::HumanPrompt => Style::default().fg(Color::Magenta),
+        LogKind::HumanResponse => Style::default().fg(Color::Magenta),
+        LogKind::Info => Style::default().fg(Color::Gray),
+    }
+}
+
 /// Build a boba Program for the pipeline TUI, rendering to stderr.
 ///
 /// Renders to stderr so that stdout remains clean for pipeline JSON output.
@@ -1063,6 +1051,7 @@ mod tests {
             graph: make_graph(node_ids),
             run_id: "test-run".into(),
             pipeline_name: pipeline_name.into(),
+            completed_node_ids: Vec::new(),
         }
     }
 
@@ -1484,6 +1473,22 @@ mod tests {
         assert_eq!(model.focus, PanelFocus::Console);
         model.toggle_focus();
         assert_eq!(model.focus, PanelFocus::Nodes);
+    }
+
+    #[test]
+    fn resumed_nodes_marked_completed_on_init() {
+        let flags = TuiFlags {
+            graph: make_graph(&["a", "b", "c", "d"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: vec!["a".into(), "b".into()],
+        };
+        let (model, _) = PipelineTui::init(flags);
+        assert_eq!(model.nodes[0].status, NodeStatus::Completed); // a
+        assert_eq!(model.nodes[1].status, NodeStatus::Completed); // b
+        assert_eq!(model.nodes[2].status, NodeStatus::Pending); // c
+        assert_eq!(model.nodes[3].status, NodeStatus::Pending); // d
+        assert_eq!(model.finished_node_count, 2);
     }
 
     #[test]
