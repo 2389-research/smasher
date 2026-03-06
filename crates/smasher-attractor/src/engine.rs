@@ -163,6 +163,8 @@ pub enum EngineError {
         error: String,
         count: u32,
     },
+    #[error("node '{node_id}' failed with no available route: {error}")]
+    UnroutableFailure { node_id: String, error: String },
     #[error("composition error: {0}")]
     Composition(#[from] crate::composition::CompositionError),
 }
@@ -795,18 +797,28 @@ impl Engine {
                 None => {
                     // Spec 3.7: When a node fails and no edge matches,
                     // try the node's retry_target fallback chain.
-                    if outcome.is_failure()
-                        && let Some(target) = resolve_retry_target(node, &self.graph)
-                    {
-                        tracing::info!(
-                            node = %current_node_id,
-                            retry_target = %target,
-                            "no fail edge found, routing to retry target"
-                        );
-                        current_node_id = target;
-                        continue;
+                    if outcome.is_failure() {
+                        if let Some(target) = resolve_retry_target(node, &self.graph) {
+                            tracing::info!(
+                                node = %current_node_id,
+                                retry_target = %target,
+                                "no fail edge found, routing to retry target"
+                            );
+                            current_node_id = target;
+                            continue;
+                        }
+                        // Spec 3.7 step 4: no failure route found — pipeline fails
+                        // with the stage's failure reason.
+                        let error_msg = match &outcome {
+                            Outcome::Failure { error, .. } => error.clone(),
+                            _ => "unknown failure".to_string(),
+                        };
+                        return Err(EngineError::UnroutableFailure {
+                            node_id: current_node_id.clone(),
+                            error: error_msg,
+                        });
                     }
-                    // No edge and no retry target (or not a failure) — end execution.
+                    // Success/skip with no outgoing edge — end execution.
                     break;
                 }
             }
@@ -3340,14 +3352,16 @@ mod tests {
         );
         let engine = Engine::new(graph, selective_fail_registry());
         let ctx = Context::new();
-        let result = engine.run(ctx).await.unwrap();
+        let result = engine.run(ctx).await;
 
-        // Engine should terminate after fail_node with no further routing
-        assert!(result.visited_nodes.contains(&"fail_node".to_string()));
-        assert!(
-            !result.visited_nodes.contains(&"exit".to_string()),
-            "exit should not be visited when fail_node has no edge and no retry_target"
-        );
+        // Spec 3.7 step 4: node failed with no route — pipeline should fail.
+        let err = result.unwrap_err();
+        match &err {
+            EngineError::UnroutableFailure { node_id, .. } => {
+                assert_eq!(node_id, "fail_node");
+            }
+            other => panic!("expected UnroutableFailure, got: {other}"),
+        }
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use crate::state::{Checkpoint, Outcome};
 /// Errors related to goal enforcement.
 #[derive(Debug, thiserror::Error)]
 pub enum GoalError {
-    #[error("pipeline completion blocked: {unmet_count} goal(s) not yet visited: {unmet_goals}")]
+    #[error("pipeline completion blocked: {unmet_count} goal(s) unsatisfied: {unmet_goals}")]
     GoalsNotMet {
         unmet_count: usize,
         unmet_goals: String,
@@ -441,7 +441,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("2 goal(s) not yet visited"));
+        assert!(msg.contains("2 goal(s) unsatisfied"));
         assert!(msg.contains("g2"));
         assert!(msg.contains("g3"));
     }
@@ -622,7 +622,7 @@ mod tests {
         let msg = err.to_string();
         assert_eq!(
             msg,
-            "pipeline completion blocked: 2 goal(s) not yet visited: deploy, validate"
+            "pipeline completion blocked: 2 goal(s) unsatisfied: deploy, validate"
         );
     }
 

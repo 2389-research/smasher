@@ -396,7 +396,7 @@ async fn failure_routing_with_retry_target() {
 // ---------------------------------------------------------------------------
 // Graph: Start → Risky → [no edges from Risky], no retry_target
 // Risky always fails.
-// Expected: Pipeline terminates (loop breaks). visited_nodes has Start and Risky but not Exit.
+// Expected: Pipeline fails per spec 3.7 step 4 — no failure route found.
 #[tokio::test]
 async fn failure_routing_terminates_without_retry_target() {
     let graph = make_graph(
@@ -417,18 +417,15 @@ async fn failure_routing_terminates_without_retry_target() {
     let engine = Engine::with_config(graph, registry, config_with_max_steps(20));
     let result = engine.run(Context::new()).await;
 
-    // The engine should return Ok since it just ran out of edges (no goal gates defined).
-    let result = result.expect("pipeline should terminate without error (no goal gates)");
+    // Spec 3.7 step 4: node failed with no route — pipeline should fail.
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
     assert!(
-        result.visited_nodes.contains(&"Start".to_string()),
-        "Start should have been visited"
+        err_msg.contains("Risky"),
+        "error should mention the failing node: {err_msg}"
     );
     assert!(
-        result.visited_nodes.contains(&"Risky".to_string()),
-        "Risky should have been visited"
-    );
-    assert!(
-        !result.visited_nodes.contains(&"Exit".to_string()),
-        "Exit should NOT have been visited — pipeline terminated early"
+        err_msg.contains("no available route"),
+        "error should indicate no route: {err_msg}"
     );
 }
