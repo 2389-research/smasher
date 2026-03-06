@@ -767,6 +767,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let hash = graph_hash(&dot_source);
 
     // Check for a previous incomplete run that can be resumed.
+    let mut resume_from: Option<IncompleteRun> = None;
     if let Some(incomplete) = find_latest_incomplete_run(&artifacts_base, &hash) {
         let should_resume = if args.resume {
             true
@@ -791,14 +792,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             if !graph_dot.exists() {
                 std::fs::write(&graph_dot, &dot_source)?;
             }
-            let resume_args = crate::resume::ResumeArgs {
-                run_dir: Some(incomplete.run_dir.display().to_string()),
-                checkpoint: None,
-                model: args.model.clone(),
-                max_steps: args.max_steps,
-                skip_preflight: args.skip_preflight,
-            };
-            return crate::resume::run(resume_args).await;
+            resume_from = Some(incomplete);
         }
     } else if args.resume {
         return Err(CliError::Other(
@@ -806,20 +800,37 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         ));
     }
 
-    // Create per-run artifact directory for isolation.
-    let run_id = generate_run_id();
-    let graph_name =
-        smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
-    let run_directory = smasher_attractor::run_dir::RunDirectory::create(
-        &artifacts_base,
-        &run_id,
-        &graph_name,
-        &dot_source,
-    )?;
-
-    // Write graph.dot to the run directory so `smasher resume` can find it.
-    let graph_dot_path = run_directory.manifest().directories.root.join("graph.dot");
-    std::fs::write(&graph_dot_path, &dot_source)?;
+    // Load checkpoint if resuming, or create a fresh run directory.
+    let (run_id, run_directory, resume_checkpoint) = if let Some(ref incomplete) = resume_from {
+        let rd = smasher_attractor::run_dir::RunDirectory::open(&incomplete.run_dir)?;
+        let cp_path = incomplete
+            .run_dir
+            .join("checkpoints")
+            .join("checkpoint.json");
+        let cp_json = std::fs::read_to_string(&cp_path)?;
+        let checkpoint = smasher_attractor::state::Checkpoint::from_json(&cp_json)?;
+        eprintln!(
+            "Resuming from node '{}' ({} node(s) already visited)",
+            checkpoint.current_node,
+            checkpoint.visited_nodes.len()
+        );
+        (incomplete.run_id.clone(), rd, Some(checkpoint))
+    } else {
+        let run_id = generate_run_id();
+        let graph_name = smasher_attractor::run_dir::sanitize_graph_name(
+            &resolved.name.clone().unwrap_or_default(),
+        );
+        let rd = smasher_attractor::run_dir::RunDirectory::create(
+            &artifacts_base,
+            &run_id,
+            &graph_name,
+            &dot_source,
+        )?;
+        // Write graph.dot to the run directory so `smasher resume` can find it.
+        let graph_dot_path = rd.manifest().directories.root.join("graph.dot");
+        std::fs::write(&graph_dot_path, &dot_source)?;
+        (run_id, rd, None)
+    };
     let run_working_dir = run_directory
         .manifest()
         .directories
@@ -1035,7 +1046,13 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         });
 
         // Run the engine as a background task so the TUI can render concurrently.
-        let engine_task = tokio::spawn(async move { engine.run(context).await });
+        let engine_task = tokio::spawn(async move {
+            if let Some(checkpoint) = resume_checkpoint {
+                engine.run_from_checkpoint(checkpoint, context).await
+            } else {
+                engine.run(context).await
+            }
+        });
 
         // Block the current task running the TUI until the user quits or the
         // pipeline finishes (PipelineDone sends Command::quit()).
@@ -1048,6 +1065,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         engine_task
             .await
             .map_err(|e| CliError::Other(format!("engine task panicked: {e}")))?
+    } else if let Some(checkpoint) = resume_checkpoint {
+        engine.run_from_checkpoint(checkpoint, context).await
     } else {
         engine.run(context).await
     };
