@@ -28,6 +28,9 @@ pub struct TuiFlags {
     pub pipeline_name: String,
     /// Node IDs that were already completed before this run (e.g. from a resumed checkpoint).
     pub completed_node_ids: Vec<String>,
+    /// Channel for sending human gate responses back to the bridge task.
+    /// When `None`, human gate prompts are display-only (no interactive input).
+    pub human_response_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Messages handled by the PipelineTui model.
@@ -40,7 +43,13 @@ pub enum Msg {
     StopwatchMsg(stopwatch::Message),
     ViewportMsg(viewport::Message),
     ConsoleViewportMsg(viewport::Message),
-    MouseScroll { up: bool },
+    MouseScroll {
+        up: bool,
+    },
+    /// A human gate question has arrived; show the input overlay.
+    HumanPromptRequest {
+        question: String,
+    },
     PipelineDone,
     Quit,
 }
@@ -140,6 +149,12 @@ pub struct PipelineTui {
     total_cost_usd: f64,
     /// Set of file paths touched by Write/Edit tool calls.
     files_touched: std::collections::HashSet<String>,
+    /// When a human gate question is pending, holds the question text.
+    pending_human_question: Option<String>,
+    /// Text buffer for the human gate input field.
+    human_input_buffer: String,
+    /// Channel for sending human gate responses back to the ChannelInterviewer bridge.
+    human_response_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Model for PipelineTui {
@@ -198,6 +213,9 @@ impl Model for PipelineTui {
             total_output_tokens: 0,
             total_cost_usd: 0.0,
             files_touched: std::collections::HashSet::new(),
+            pending_human_question: None,
+            human_input_buffer: String::new(),
+            human_response_tx: flags.human_response_tx,
         };
 
         // Mark nodes that were already completed in a previous run (resume).
@@ -257,6 +275,12 @@ impl Model for PipelineTui {
                 }
             },
 
+            Msg::HumanPromptRequest { question } => {
+                self.pending_human_question = Some(question);
+                self.human_input_buffer.clear();
+                Command::none()
+            }
+
             Msg::PipelineDone => Command::quit(),
 
             Msg::Quit => Command::quit(),
@@ -276,6 +300,11 @@ impl Model for PipelineTui {
         self.render_title_bar(frame, rows[0]);
         self.render_main(frame, rows[1]);
         self.render_status_bar(frame, rows[2]);
+
+        // Render human gate input overlay on top of everything when a prompt is active.
+        if let Some(ref question) = self.pending_human_question {
+            self.render_human_input_overlay(frame, area, question);
+        }
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
@@ -626,6 +655,11 @@ impl PipelineTui {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Command<Msg> {
+        // When a human gate prompt is active, route all input to the text field.
+        if self.pending_human_question.is_some() {
+            return self.handle_human_input_key(key);
+        }
+
         // q or Esc quits
         if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
             return Command::quit();
@@ -706,6 +740,46 @@ impl PipelineTui {
                         .map(Msg::ConsoleViewportMsg)
                 }
             },
+        }
+    }
+
+    /// Handle keyboard input when the human gate text input overlay is active.
+    fn handle_human_input_key(&mut self, key: KeyEvent) -> Command<Msg> {
+        // Ctrl+C force-quits even while the overlay is active.
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            return Command::quit();
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                let response = self.human_input_buffer.clone();
+                self.pending_human_question = None;
+                self.human_input_buffer.clear();
+                if let Some(ref tx) = self.human_response_tx {
+                    let _ = tx.send(response);
+                }
+                Command::none()
+            }
+            KeyCode::Esc => {
+                // Cancel the prompt — send empty string to unblock the interviewer.
+                self.pending_human_question = None;
+                self.human_input_buffer.clear();
+                if let Some(ref tx) = self.human_response_tx {
+                    let _ = tx.send(String::new());
+                }
+                Command::none()
+            }
+            KeyCode::Backspace => {
+                self.human_input_buffer.pop();
+                Command::none()
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT {
+                    self.human_input_buffer.push(c);
+                }
+                Command::none()
+            }
+            _ => Command::none(),
         }
     }
 
@@ -1019,11 +1093,70 @@ impl PipelineTui {
             PipelineStatus::Aborted => " ABORTED ",
         };
 
+        let help_right = if self.pending_human_question.is_some() {
+            " HUMAN GATE: type response, Enter to submit, Esc to skip "
+        } else {
+            " q quit | j/k nav | h nodes | tab cycle | g/G top/bottom "
+        };
+
         StatusBar::new()
             .left(status_text)
-            .right(" q quit | j/k nav | h nodes | tab cycle | g/G top/bottom ")
+            .right(help_right)
             .style(Style::default().bg(Color::DarkGray))
             .render(frame, area);
+    }
+
+    /// Render a centered input overlay for human gate prompts.
+    fn render_human_input_overlay(&self, frame: &mut Frame, area: Rect, question: &str) {
+        use boba::ratatui::widgets::{Clear, Paragraph, Wrap};
+
+        // Size the overlay: 60% wide, up to 8 lines tall.
+        let overlay_width = (area.width * 60 / 100)
+            .max(30)
+            .min(area.width.saturating_sub(4));
+        let overlay_height = 8u16.min(area.height.saturating_sub(4));
+        let x = (area.width.saturating_sub(overlay_width)) / 2;
+        let y = (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+        // Clear the background behind the overlay.
+        frame.render_widget(Clear, overlay_area);
+
+        // Split into question area and input area.
+        let inner_layout = Layout::vertical([
+            Constraint::Min(2),    // question
+            Constraint::Length(3), // input field
+        ])
+        .split(overlay_area);
+
+        let question_block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(" Human Gate ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        let question_para = Paragraph::new(question.to_string())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::White))
+            .block(question_block);
+        frame.render_widget(question_para, inner_layout[0]);
+
+        let input_block = Block::default()
+            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(" > ")
+            .title_style(Style::default().fg(Color::Green));
+
+        // Show the input buffer with a cursor.
+        let input_text = format!("{}█", self.human_input_buffer);
+        let input_para = Paragraph::new(input_text)
+            .style(Style::default().fg(Color::Green))
+            .block(input_block);
+        frame.render_widget(input_para, inner_layout[1]);
     }
 }
 
@@ -1118,6 +1251,7 @@ mod tests {
             run_id: "test-run".into(),
             pipeline_name: pipeline_name.into(),
             completed_node_ids: Vec::new(),
+            human_response_tx: None,
         }
     }
 
@@ -1548,6 +1682,7 @@ mod tests {
             run_id: "test-run".into(),
             pipeline_name: "test".into(),
             completed_node_ids: vec!["a".into(), "b".into()],
+            human_response_tx: None,
         };
         let (model, _) = PipelineTui::init(flags);
         assert_eq!(model.nodes[0].status, NodeStatus::Completed); // a
@@ -1737,5 +1872,159 @@ mod tests {
             rendered.contains(&expected_ts),
             "expected timestamp {expected_ts} in rendered line: {rendered}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Human gate input overlay tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn human_prompt_request_activates_overlay() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+
+        assert!(model.pending_human_question.is_none());
+
+        model.update(Msg::HumanPromptRequest {
+            question: "Continue?".into(),
+        });
+
+        assert_eq!(model.pending_human_question.as_deref(), Some("Continue?"));
+        assert!(model.human_input_buffer.is_empty());
+    }
+
+    #[test]
+    fn human_input_typing_builds_buffer() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Name?".into(),
+        });
+
+        // Type "hi"
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(model.human_input_buffer, "hi");
+        // Overlay still active
+        assert!(model.pending_human_question.is_some());
+    }
+
+    #[test]
+    fn human_input_backspace_removes_char() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Name?".into(),
+        });
+
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(model.human_input_buffer, "a");
+    }
+
+    #[test]
+    fn human_input_enter_submits_and_clears() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let flags = TuiFlags {
+            graph: make_graph(&["gate"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: Vec::new(),
+            human_response_tx: Some(tx),
+        };
+        let (mut model, _) = PipelineTui::init(flags);
+        model.update(Msg::HumanPromptRequest {
+            question: "Answer?".into(),
+        });
+
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        // Overlay cleared
+        assert!(model.pending_human_question.is_none());
+        assert!(model.human_input_buffer.is_empty());
+
+        // Response sent through channel
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response, "yes");
+    }
+
+    #[test]
+    fn human_input_esc_cancels_with_empty_response() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let flags = TuiFlags {
+            graph: make_graph(&["gate"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: Vec::new(),
+            human_response_tx: Some(tx),
+        };
+        let (mut model, _) = PipelineTui::init(flags);
+        model.update(Msg::HumanPromptRequest {
+            question: "Answer?".into(),
+        });
+
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+
+        // Overlay cleared
+        assert!(model.pending_human_question.is_none());
+
+        // Empty response sent
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response, "");
+    }
+
+    #[test]
+    fn keys_routed_to_input_while_overlay_active() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Q?".into(),
+        });
+
+        // 'q' should NOT quit when overlay is active — it types 'q' instead
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(model.human_input_buffer, "q");
+        // Model should NOT be done (would be done if 'q' was handled as quit)
+        assert!(!model.done);
     }
 }

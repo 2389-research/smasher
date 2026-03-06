@@ -22,8 +22,8 @@ use smasher_attractor::handler::{
     CodergenBackend, CodergenHandler, HandlerError, default_registry,
 };
 use smasher_attractor::interviewer::{
-    AutoApproveInterviewer, ConsoleInterviewer, HumanGateHandler, Interviewer, InterviewerHandler,
-    TimeoutInterviewer,
+    AutoApproveInterviewer, ChannelInterviewer, ConsoleInterviewer, HumanGateHandler, Interviewer,
+    InterviewerHandler, TimeoutInterviewer,
 };
 use smasher_attractor::manager_handler::ManagerHandler;
 use smasher_attractor::parallel::ParallelHandler;
@@ -1034,7 +1034,26 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     }
 
     // Build interviewer based on --interviewer flag.
-    let interviewer: Arc<dyn Interviewer> = if args.interviewer.starts_with("timeout:") {
+    // When TUI is active and the mode requires stdin (console/timeout), swap in a
+    // ChannelInterviewer so the TUI can render the prompt and capture input.
+    let mut human_gate_question_rx = None;
+    let interviewer: Arc<dyn Interviewer> = if tui_enabled
+        && (args.interviewer == "console" || args.interviewer.starts_with("timeout:"))
+    {
+        let (channel_interviewer, question_rx) = ChannelInterviewer::new();
+        human_gate_question_rx = Some(question_rx);
+        if args.interviewer.starts_with("timeout:") {
+            let secs: u64 = args.interviewer["timeout:".len()..]
+                .parse()
+                .map_err(|e| CliError::Other(format!("invalid timeout value: {e}")))?;
+            Arc::new(TimeoutInterviewer::new(
+                Arc::new(channel_interviewer),
+                std::time::Duration::from_secs(secs),
+            ))
+        } else {
+            Arc::new(channel_interviewer)
+        }
+    } else if args.interviewer.starts_with("timeout:") {
         let secs: u64 = args.interviewer["timeout:".len()..]
             .parse()
             .map_err(|e| CliError::Other(format!("invalid timeout value: {e}")))?;
@@ -1049,7 +1068,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         Arc::new(AutoApproveInterviewer::new())
     };
 
-    // Register interviewer-dependent handlers.
+    // Register interviewer-dependent handlers. Only register InterviewerHandler since
+    // HumanGateHandler handles the same NodeType and would be shadowed by first-registered.
     registry.register(Arc::new(InterviewerHandler::new(interviewer.clone())));
     registry.register(Arc::new(HumanGateHandler::new(interviewer)));
 
@@ -1114,11 +1134,20 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         let emitter = pipeline_emitter.as_ref().unwrap();
         let event_rx = emitter.subscribe();
 
+        // Set up the human gate response channel when a ChannelInterviewer is in use.
+        let (human_response_tx, human_response_rx) = if human_gate_question_rx.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let flags = TuiFlags {
             graph: tui_graph.unwrap(),
             run_id: run_id.clone(),
             pipeline_name: tui_pipeline_name,
             completed_node_ids: resumed_completed_nodes,
+            human_response_tx,
         };
 
         let program = crate::tui::build_program(flags)
@@ -1129,24 +1158,52 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         // Bridge: forward PipelineEvents from the broadcast channel to the TUI.
         // When the channel closes (engine dropped its emitter), send PipelineDone
         // so the TUI quits cleanly.
+        let event_handle = handle.clone();
         tokio::spawn(async move {
             let mut rx = event_rx;
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        handle.send(TuiMsg::PipelineEvent(event));
+                        event_handle.send(TuiMsg::PipelineEvent(event));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("TUI bridge skipped {n} events (slow consumer)");
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        handle.send(TuiMsg::PipelineDone);
+                        event_handle.send(TuiMsg::PipelineDone);
                         break;
                     }
                 }
             }
         });
+
+        // Bridge: forward human gate questions from ChannelInterviewer to TUI,
+        // and relay the user's response back to the waiting interviewer.
+        if let (Some(mut question_rx), Some(mut response_rx)) =
+            (human_gate_question_rx, human_response_rx)
+        {
+            let gate_handle = handle.clone();
+            tokio::spawn(async move {
+                while let Some(req) = question_rx.recv().await {
+                    gate_handle.send(TuiMsg::HumanPromptRequest {
+                        question: req.question,
+                    });
+                    // Wait for the TUI to send back the user's response.
+                    match response_rx.recv().await {
+                        Some(response) => {
+                            let _ = req.response_tx.send(Ok(response));
+                        }
+                        None => {
+                            let _ = req.response_tx.send(Err(
+                                smasher_attractor::interviewer::InterviewerError::Cancelled,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Run the engine as a background task so the TUI can render concurrently.
         let engine_task = tokio::spawn(async move {
