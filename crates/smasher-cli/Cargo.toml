@@ -28,6 +28,7 @@ tracing-subscriber.workspace = true
 boba.workspace = true
 uuid.workspace = true
 ulid.workspace = true
+sha2.workspace = true
 tar.workspace = true
 flate2.workspace = true
 

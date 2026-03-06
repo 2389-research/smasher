@@ -639,6 +639,10 @@ pub struct RunArgs {
     /// Disable the TUI dashboard.
     #[arg(long)]
     pub no_tui: bool,
+
+    /// Resume the latest incomplete run of this pipeline instead of starting fresh.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 fn should_enable_tui(args: &RunArgs) -> bool {
@@ -759,9 +763,46 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
+    let artifacts_base = std::path::Path::new(&working_dir).join("artifacts");
+    let hash = graph_hash(&dot_source);
+
+    // Check for a previous incomplete run that can be resumed.
+    if let Some(incomplete) = find_latest_incomplete_run(&artifacts_base, &hash) {
+        let should_resume = if args.resume {
+            true
+        } else if std::io::stderr().is_terminal() {
+            eprintln!(
+                "Found incomplete run {} (started {})",
+                incomplete.run_id, incomplete.created_at
+            );
+            eprint!("Resume from checkpoint? [Y/n] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).unwrap_or(0);
+            let answer = answer.trim().to_lowercase();
+            answer.is_empty() || answer == "y" || answer == "yes"
+        } else {
+            false
+        };
+
+        if should_resume {
+            eprintln!("Resuming run {}", incomplete.run_id);
+            let resume_args = crate::resume::ResumeArgs {
+                run_dir: Some(incomplete.run_dir.display().to_string()),
+                checkpoint: None,
+                model: args.model.clone(),
+                max_steps: args.max_steps,
+                skip_preflight: args.skip_preflight,
+            };
+            return crate::resume::run(resume_args).await;
+        }
+    } else if args.resume {
+        return Err(CliError::Other(
+            "no incomplete run found for this pipeline. Starting fresh.".into(),
+        ));
+    }
+
     // Create per-run artifact directory for isolation.
     let run_id = generate_run_id();
-    let artifacts_base = std::path::Path::new(&working_dir).join("artifacts");
     let graph_name =
         smasher_attractor::run_dir::sanitize_graph_name(&resolved.name.clone().unwrap_or_default());
     let run_directory = smasher_attractor::run_dir::RunDirectory::create(
@@ -770,6 +811,10 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         &graph_name,
         &dot_source,
     )?;
+
+    // Write graph.dot to the run directory so `smasher resume` can find it.
+    let graph_dot_path = run_directory.manifest().directories.root.join("graph.dot");
+    std::fs::write(&graph_dot_path, &dot_source)?;
     let run_working_dir = run_directory
         .manifest()
         .directories
@@ -1063,6 +1108,81 @@ fn infer_render_format(path: &str) -> RenderFormat {
         Some(ext) => RenderFormat::from_str_loose(ext).unwrap_or(RenderFormat::Svg),
         None => RenderFormat::Svg,
     }
+}
+
+/// Information about a previous incomplete run that can be resumed.
+struct IncompleteRun {
+    run_dir: std::path::PathBuf,
+    run_id: String,
+    created_at: String,
+}
+
+/// Scan the artifacts directory for incomplete runs of the same pipeline.
+///
+/// A run is "incomplete" if it has a checkpoint.json but no run.tgz (the archive
+/// is only written after the engine finishes successfully).
+/// Matches by `graph_hash` (SHA256 of DOT source) for exact pipeline identity.
+fn find_latest_incomplete_run(
+    artifacts_base: &std::path::Path,
+    graph_hash: &str,
+) -> Option<IncompleteRun> {
+    let entries = std::fs::read_dir(artifacts_base).ok()?;
+
+    let mut candidates: Vec<IncompleteRun> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let manifest_path = path.join("manifest.json");
+        let checkpoint_path = path.join("checkpoints").join("checkpoint.json");
+        let archive_path = path.join("run.tgz");
+
+        // Must have checkpoint (was interrupted) and no archive (didn't finish).
+        if !checkpoint_path.exists() || archive_path.exists() {
+            continue;
+        }
+
+        // Read manifest and match graph_hash.
+        let manifest_json = match std::fs::read_to_string(&manifest_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let manifest: serde_json::Value = match serde_json::from_str(&manifest_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if manifest["graph_hash"].as_str() != Some(graph_hash) {
+            continue;
+        }
+
+        let run_id = manifest["run_id"].as_str().unwrap_or("").to_string();
+        let created_at = manifest["created_at"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+
+        candidates.push(IncompleteRun {
+            run_dir: path,
+            run_id,
+            created_at,
+        });
+    }
+
+    // ULIDs sort lexicographically by creation time — take the latest.
+    candidates.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+    candidates.into_iter().next()
+}
+
+/// Compute the SHA256 hex digest of DOT source (matches run_dir.rs hashing).
+fn graph_hash(dot_source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(dot_source.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -1903,5 +2023,114 @@ mod tests {
             }
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_flag_defaults_to_false() {
+        let cli = TestCli::parse_from(["test", "pipeline.dot"]);
+        assert!(!cli.run.resume);
+    }
+
+    #[test]
+    fn resume_flag_parsed_when_present() {
+        let cli = TestCli::parse_from(["test", "--resume", "pipeline.dot"]);
+        assert!(cli.run.resume);
+    }
+
+    #[test]
+    fn find_incomplete_run_returns_none_when_no_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = find_latest_incomplete_run(tmp.path(), "abc123");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_incomplete_run_returns_none_when_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("01abc");
+        std::fs::create_dir_all(run_dir.join("checkpoints")).unwrap();
+        std::fs::write(run_dir.join("checkpoints").join("checkpoint.json"), "{}").unwrap();
+        // run.tgz exists → completed
+        std::fs::write(run_dir.join("run.tgz"), "archive").unwrap();
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::json!({
+                "run_id": "01abc",
+                "graph_hash": "hash1",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = find_latest_incomplete_run(tmp.path(), "hash1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_incomplete_run_returns_latest_match() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Older incomplete run
+        let run1 = tmp.path().join("01aaa");
+        std::fs::create_dir_all(run1.join("checkpoints")).unwrap();
+        std::fs::write(run1.join("checkpoints/checkpoint.json"), "{}").unwrap();
+        std::fs::write(
+            run1.join("manifest.json"),
+            serde_json::json!({
+                "run_id": "01aaa",
+                "graph_hash": "myhash",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Newer incomplete run
+        let run2 = tmp.path().join("01bbb");
+        std::fs::create_dir_all(run2.join("checkpoints")).unwrap();
+        std::fs::write(run2.join("checkpoints/checkpoint.json"), "{}").unwrap();
+        std::fs::write(
+            run2.join("manifest.json"),
+            serde_json::json!({
+                "run_id": "01bbb",
+                "graph_hash": "myhash",
+                "created_at": "2026-01-02T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Different pipeline (should be ignored)
+        let run3 = tmp.path().join("01ccc");
+        std::fs::create_dir_all(run3.join("checkpoints")).unwrap();
+        std::fs::write(run3.join("checkpoints/checkpoint.json"), "{}").unwrap();
+        std::fs::write(
+            run3.join("manifest.json"),
+            serde_json::json!({
+                "run_id": "01ccc",
+                "graph_hash": "otherhash",
+                "created_at": "2026-01-03T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = find_latest_incomplete_run(tmp.path(), "myhash").unwrap();
+        assert_eq!(result.run_id, "01bbb");
+    }
+
+    #[test]
+    fn graph_hash_is_deterministic() {
+        let source = "digraph { a -> b }";
+        assert_eq!(graph_hash(source), graph_hash(source));
+    }
+
+    #[test]
+    fn graph_hash_differs_for_different_sources() {
+        assert_ne!(
+            graph_hash("digraph { a -> b }"),
+            graph_hash("digraph { x -> y }")
+        );
     }
 }
