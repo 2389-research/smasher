@@ -825,6 +825,13 @@ impl Engine {
                             Outcome::Failure { error, .. } => error.clone(),
                             _ => "unknown failure".to_string(),
                         };
+                        self.emit(PipelineEvent::PipelineAborted {
+                            reason: format!(
+                                "node '{}' failed with no available route: {}",
+                                current_node_id, error_msg
+                            ),
+                            timestamp: Utc::now(),
+                        });
                         return Err(EngineError::UnroutableFailure {
                             node_id: current_node_id.clone(),
                             error: error_msg,
@@ -3362,10 +3369,15 @@ mod tests {
         let result = engine.run(ctx).await;
 
         // Spec 3.7 step 4: node failed with no route — pipeline should fail.
+        // Error should preserve the original failure reason from the handler.
         let err = result.unwrap_err();
         match &err {
-            EngineError::UnroutableFailure { node_id, .. } => {
+            EngineError::UnroutableFailure { node_id, error } => {
                 assert_eq!(node_id, "fail_node");
+                assert!(
+                    error.contains("selective failure"),
+                    "error should preserve handler's failure reason, got: {error}"
+                );
             }
             other => panic!("expected UnroutableFailure, got: {other}"),
         }

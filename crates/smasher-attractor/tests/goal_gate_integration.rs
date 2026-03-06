@@ -429,3 +429,98 @@ async fn failure_routing_terminates_without_retry_target() {
         "error should indicate no route: {err_msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: node-level fallback_retry_target (level 2 of the chain)
+// ---------------------------------------------------------------------------
+// Graph: Start → DoWork(goal_gate=true, fallback_retry_target="Recovery") → Exit
+//        Recovery → DoWork
+// DoWork fails first attempt, succeeds on retry via fallback_retry_target.
+#[tokio::test]
+async fn node_fallback_retry_target_used_for_goal_gate() {
+    let mut goal_attrs = HashMap::new();
+    goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+    // Only fallback_retry_target — no retry_target on the node
+    goal_attrs.insert(
+        "fallback_retry_target".to_string(),
+        NodeAttrValue::String("Recovery".to_string()),
+    );
+
+    let graph = Graph {
+        name: Some("test_pipeline".to_string()),
+        nodes: vec![
+            make_node("Start", NodeType::Start),
+            make_node_with_attrs("DoWork", NodeType::Generic, goal_attrs),
+            make_node("Recovery", NodeType::Generic),
+            make_node("Exit", NodeType::Exit),
+        ],
+        edges: vec![
+            make_edge("Start", "DoWork"),
+            make_edge("DoWork", "Exit"),
+            make_edge("Recovery", "DoWork"),
+        ],
+        default_node_attrs: HashMap::new(),
+        default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
+    };
+
+    let mut registry = HandlerRegistry::new();
+    registry.register(Arc::new(NodeSpecificHandler::fail_once(vec!["DoWork"])));
+
+    let engine = Engine::with_config(graph, registry, config_with_max_steps(20));
+    let result = engine.run(Context::new()).await;
+
+    let result = result.expect("pipeline should succeed after retry via fallback_retry_target");
+    assert!(
+        result.visited_nodes.contains(&"Recovery".to_string()),
+        "Recovery should have been visited via fallback_retry_target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: graph-level fallback_retry_target (level 4 of the chain)
+// ---------------------------------------------------------------------------
+// Graph: Start → DoWork(goal_gate=true) → Exit, Recovery → DoWork
+// graph_attrs has only fallback_retry_target (no retry_target at any level)
+#[tokio::test]
+async fn graph_fallback_retry_target_used_for_goal_gate() {
+    let mut goal_attrs = HashMap::new();
+    goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+
+    let mut graph_attrs = HashMap::new();
+    graph_attrs.insert(
+        "fallback_retry_target".to_string(),
+        NodeAttrValue::String("Recovery".to_string()),
+    );
+
+    let graph = Graph {
+        name: Some("test_pipeline".to_string()),
+        nodes: vec![
+            make_node("Start", NodeType::Start),
+            make_node_with_attrs("DoWork", NodeType::Generic, goal_attrs),
+            make_node("Recovery", NodeType::Generic),
+            make_node("Exit", NodeType::Exit),
+        ],
+        edges: vec![
+            make_edge("Start", "DoWork"),
+            make_edge("DoWork", "Exit"),
+            make_edge("Recovery", "DoWork"),
+        ],
+        default_node_attrs: HashMap::new(),
+        default_edge_attrs: HashMap::new(),
+        graph_attrs,
+    };
+
+    let mut registry = HandlerRegistry::new();
+    registry.register(Arc::new(NodeSpecificHandler::fail_once(vec!["DoWork"])));
+
+    let engine = Engine::with_config(graph, registry, config_with_max_steps(20));
+    let result = engine.run(Context::new()).await;
+
+    let result =
+        result.expect("pipeline should succeed after retry via graph fallback_retry_target");
+    assert!(
+        result.visited_nodes.contains(&"Recovery".to_string()),
+        "Recovery should have been visited via graph fallback_retry_target"
+    );
+}
