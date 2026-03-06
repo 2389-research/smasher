@@ -1033,13 +1033,12 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         }
     }
 
-    // Build interviewer based on --interviewer flag.
-    // When TUI is active and the mode requires stdin (console/timeout), swap in a
-    // ChannelInterviewer so the TUI can render the prompt and capture input.
+    // Build interviewer.
+    // When TUI is active, always use ChannelInterviewer so human gate nodes
+    // render an interactive prompt overlay — no --interviewer flag needed.
+    // When headless/no-tui, fall back to the --interviewer flag behavior.
     let mut human_gate_question_rx = None;
-    let interviewer: Arc<dyn Interviewer> = if tui_enabled
-        && (args.interviewer == "console" || args.interviewer.starts_with("timeout:"))
-    {
+    let interviewer: Arc<dyn Interviewer> = if tui_enabled {
         let (channel_interviewer, question_rx) = ChannelInterviewer::new();
         human_gate_question_rx = Some(question_rx);
         if args.interviewer.starts_with("timeout:") {
@@ -1061,11 +1060,16 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             Arc::new(ConsoleInterviewer::from_stdio()),
             std::time::Duration::from_secs(secs),
         ))
-    } else if args.interviewer == "console" {
+    } else if args.interviewer == "auto" {
+        // "auto" is the default — use console (interactive stdin) so human gates
+        // actually gate. Only auto-approve if explicitly requested.
         Arc::new(ConsoleInterviewer::from_stdio())
-    } else {
-        // "auto" mode: auto-approve (non-interactive)
+    } else if args.interviewer == "none" {
+        // Explicit auto-approve: skip all human gates without prompting.
         Arc::new(AutoApproveInterviewer::new())
+    } else {
+        // "console" or any other value: interactive stdin.
+        Arc::new(ConsoleInterviewer::from_stdio())
     };
 
     // Register interviewer-dependent handlers. Only register InterviewerHandler since
