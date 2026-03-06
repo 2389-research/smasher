@@ -191,6 +191,32 @@ impl GoalGate {
         Ok(())
     }
 
+    /// Check all goal gates and return a `GoalError` describing every
+    /// unsatisfied goal. Use this for terminal error reporting (not retry
+    /// routing, which only needs the first failure from `check_outcomes`).
+    pub fn enforce_outcomes(
+        &self,
+        node_outcomes: &std::collections::HashMap<String, Outcome>,
+    ) -> Result<(), GoalError> {
+        let unsatisfied: Vec<String> = self
+            .goals
+            .iter()
+            .filter_map(|goal_id| match node_outcomes.get(goal_id) {
+                Some(outcome) if outcome.is_success() => None,
+                Some(_) => Some(format!("{goal_id} (non-success outcome)")),
+                None => Some(format!("{goal_id} (not visited)")),
+            })
+            .collect();
+        if unsatisfied.is_empty() {
+            Ok(())
+        } else {
+            Err(GoalError::GoalsNotMet {
+                unmet_count: unsatisfied.len(),
+                unmet_goals: unsatisfied.join(", "),
+            })
+        }
+    }
+
     /// Enforce that all goals have been met. Returns `Ok(())` if all goals
     /// are visited, or a `GoalError::GoalsNotMet` describing the unmet goals.
     pub fn enforce(&self, visited: &[String]) -> Result<(), GoalError> {
@@ -759,5 +785,37 @@ mod tests {
             reason: "not visited".to_string(),
         };
         assert_eq!(format!("{ug}"), "goal 'deploy' unsatisfied: not visited");
+    }
+
+    // ---- Test 37: enforce_outcomes reports all unsatisfied goals ----
+    #[test]
+    fn enforce_outcomes_reports_all_failures() {
+        let graph = make_graph(vec![
+            make_node("g1", true),
+            make_node("g2", true),
+            make_node("g3", true),
+        ]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        // g2 failed, g3 not visited
+        outcomes.insert("g2".to_string(), Outcome::failure("timed out"));
+
+        let err = gate.enforce_outcomes(&outcomes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 goal(s) unsatisfied"), "got: {msg}");
+        assert!(msg.contains("g2"), "should mention g2: {msg}");
+        assert!(msg.contains("g3"), "should mention g3: {msg}");
+    }
+
+    // ---- Test 38: enforce_outcomes passes when all goals succeed ----
+    #[test]
+    fn enforce_outcomes_all_pass() {
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        outcomes.insert("g2".to_string(), Outcome::partial_success());
+        assert!(gate.enforce_outcomes(&outcomes).is_ok());
     }
 }

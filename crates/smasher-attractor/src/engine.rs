@@ -706,6 +706,12 @@ impl Engine {
                     if let Some(failed_node) = self.graph.node(&unsatisfied.node_id)
                         && let Some(target) = resolve_retry_target(failed_node, &self.graph)
                     {
+                        // Validate retry target exists in graph
+                        if self.graph.node(&target).is_none() {
+                            return Err(EngineError::NodeNotFound {
+                                node_id: target,
+                            });
+                        }
                         tracing::info!(
                             goal = %unsatisfied.node_id,
                             reason = %unsatisfied.reason,
@@ -715,11 +721,11 @@ impl Engine {
                         current_node_id = target;
                         continue;
                     }
-                    // No retry target at any level — fail the pipeline
-                    return Err(EngineError::GoalEnforcement(GoalError::GoalsNotMet {
-                        unmet_count: 1,
-                        unmet_goals: format!("{} ({})", unsatisfied.node_id, unsatisfied.reason),
-                    }));
+                    // No retry target at any level — fail with all unsatisfied goals
+                    return Err(EngineError::GoalEnforcement(
+                        self.goal_gate.enforce_outcomes(&node_outcomes)
+                            .unwrap_err()
+                    ));
                 }
                 break;
             }
@@ -799,6 +805,12 @@ impl Engine {
                     // try the node's retry_target fallback chain.
                     if outcome.is_failure() {
                         if let Some(target) = resolve_retry_target(node, &self.graph) {
+                            // Validate retry target exists in graph
+                            if self.graph.node(&target).is_none() {
+                                return Err(EngineError::NodeNotFound {
+                                    node_id: target,
+                                });
+                            }
                             tracing::info!(
                                 node = %current_node_id,
                                 retry_target = %target,
@@ -837,12 +849,7 @@ impl Engine {
 
         // Final goal gate enforcement (outcome-aware, spec section 3.4).
         // Reached when the loop exits without hitting an Exit node (no outgoing edge).
-        if let Err(unsatisfied) = self.goal_gate.check_outcomes(&node_outcomes) {
-            return Err(EngineError::GoalEnforcement(GoalError::GoalsNotMet {
-                unmet_count: 1,
-                unmet_goals: format!("{} ({})", unsatisfied.node_id, unsatisfied.reason),
-            }));
-        }
+        self.goal_gate.enforce_outcomes(&node_outcomes)?;
 
         let pipeline_duration_ms = pipeline_start.elapsed().as_millis() as u64;
 
