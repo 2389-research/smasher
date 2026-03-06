@@ -793,7 +793,20 @@ impl Engine {
                     current_node_id = edge.to.clone();
                 }
                 None => {
-                    // No outgoing edge, end execution
+                    // Spec 3.7: When a node fails and no edge matches,
+                    // try the node's retry_target fallback chain.
+                    if outcome.is_failure()
+                        && let Some(target) = resolve_retry_target(node, &self.graph)
+                    {
+                        tracing::info!(
+                            node = %current_node_id,
+                            retry_target = %target,
+                            "no fail edge found, routing to retry target"
+                        );
+                        current_node_id = target;
+                        continue;
+                    }
+                    // No edge and no retry target (or not a failure) — end execution.
                     break;
                 }
             }
@@ -3232,6 +3245,142 @@ mod tests {
         assert_eq!(
             resolve_retry_target(&node, &graph),
             Some("node_rt".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Failure routing via retry_target fallback (spec 3.7)
+    // ---------------------------------------------------------------
+
+    /// Handler that fails on nodes whose id starts with "fail_" and succeeds otherwise.
+    struct SelectiveFailHandler;
+
+    #[async_trait]
+    impl Handler for SelectiveFailHandler {
+        fn name(&self) -> &str {
+            "selective_fail"
+        }
+        async fn execute(
+            &self,
+            node: &GraphNode,
+            _context: &Context,
+        ) -> Result<Outcome, HandlerError> {
+            if node.id.starts_with("fail_") {
+                Ok(Outcome::failure("selective failure"))
+            } else {
+                Ok(Outcome::success())
+            }
+        }
+        fn handles(&self, _node_type: &NodeType) -> bool {
+            true
+        }
+    }
+
+    fn selective_fail_registry() -> HandlerRegistry {
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(SelectiveFailHandler));
+        registry
+    }
+
+    #[tokio::test]
+    async fn failure_routing_uses_node_retry_target() {
+        // Graph: start -> fail_node (no fail edge, but has retry_target -> recovery -> exit)
+        let mut fail_attrs = HashMap::new();
+        fail_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("fail_node", NodeType::Generic, fail_attrs),
+                make_node("recovery", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                // No edge from fail_node — forces the None branch
+                make_edge("recovery", "exit"),
+            ],
+        );
+        let engine = Engine::with_config(
+            graph,
+            selective_fail_registry(),
+            EngineConfig {
+                max_steps: 20,
+                ..EngineConfig::default()
+            },
+        );
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        // fail_node should fail, then route to recovery via retry_target
+        assert!(result.visited_nodes.contains(&"fail_node".to_string()));
+        assert!(
+            result.visited_nodes.contains(&"recovery".to_string()),
+            "expected engine to route to recovery via retry_target, visited: {:?}",
+            result.visited_nodes
+        );
+        assert!(result.visited_nodes.contains(&"exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn failure_routing_terminates_without_retry_target() {
+        // Graph: start -> fail_node (no fail edge, no retry_target)
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("fail_node", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                // No edge from fail_node — forces the None branch, no retry_target either
+            ],
+        );
+        let engine = Engine::new(graph, selective_fail_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        // Engine should terminate after fail_node with no further routing
+        assert!(result.visited_nodes.contains(&"fail_node".to_string()));
+        assert!(
+            !result.visited_nodes.contains(&"exit".to_string()),
+            "exit should not be visited when fail_node has no edge and no retry_target"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_with_no_outgoing_edge_still_terminates() {
+        // Graph: start -> ok_node (succeeds, but has no outgoing edge)
+        // ok_node has a retry_target attr, but it should NOT be used on success.
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("ok_node", NodeType::Generic, attrs),
+                make_node("recovery", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "ok_node"),
+                // No edge from ok_node — forces the None branch
+                make_edge("recovery", "exit"),
+            ],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        // Engine should terminate after ok_node; retry_target is only for failures
+        assert!(result.visited_nodes.contains(&"ok_node".to_string()));
+        assert!(
+            !result.visited_nodes.contains(&"recovery".to_string()),
+            "recovery should not be visited when ok_node succeeds (retry_target is failure-only)"
         );
     }
 
