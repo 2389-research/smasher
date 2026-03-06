@@ -430,6 +430,108 @@ impl CodergenBackend for ClaudeCliBackend {
     }
 }
 
+/// CodergenBackend that runs the node prompt as a shell command via `sh -c`.
+///
+/// Designed for deterministic pipeline testing without an LLM. The `prompt`
+/// attribute is executed directly as a shell script. Exit code 0 means success
+/// (stdout captured), non-zero means failure (stderr captured).
+///
+/// Pipeline context entries (excluding underscore-prefixed internals) are
+/// exposed as `SMASHER_CTX_<key>` environment variables.
+struct ShellCodergenBackend {
+    working_dir: String,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl CodergenBackend for ShellCodergenBackend {
+    async fn generate(
+        &self,
+        prompt: &str,
+        _model: Option<&str>,
+        context: &Context,
+    ) -> Result<Outcome, HandlerError> {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(prompt)
+            .current_dir(&self.working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Expose pipeline context as environment variables.
+        let context_snapshot = context.to_string_map();
+        for (key, value) in &context_snapshot {
+            if !key.starts_with('_') {
+                cmd.env(format!("SMASHER_CTX_{key}"), value);
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| HandlerError::Other(format!("failed to spawn shell: {e}")))?;
+
+        // Read stdout and stderr concurrently to avoid pipe buffer deadlock.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout_handle {
+                tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_handle {
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
+
+        let (status, stdout_bytes, stderr_bytes) = match tokio::time::timeout(self.timeout, async {
+            let status = child.wait().await?;
+            let stdout = stdout_task.await.map_err(std::io::Error::other)??;
+            let stderr = stderr_task.await.map_err(std::io::Error::other)??;
+            Ok::<_, std::io::Error>((status, stdout, stderr))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                return Err(HandlerError::Other(format!("shell command failed: {e}")));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(HandlerError::Other(format!(
+                    "shell command timed out after {}s",
+                    self.timeout.as_secs()
+                )));
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+        let exit_code = status.code().unwrap_or(-1);
+
+        if status.success() {
+            Ok(Outcome::success_with(serde_json::json!({
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+            })))
+        } else {
+            let error_msg = if stderr.trim().is_empty() {
+                format!("shell command exited with code {exit_code}")
+            } else {
+                format!("exit code {exit_code}: {}", stderr.trim())
+            };
+            Ok(Outcome::failure(error_msg))
+        }
+    }
+}
+
 /// Execute a DOT-based pipeline.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -475,7 +577,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub skip_lint: bool,
 
-    /// Backend for codergen nodes: "claude-cli" (default) or "agent".
+    /// Backend for codergen nodes: "claude-cli" (default), "agent", or "shell".
     #[arg(long, default_value = "claude-cli")]
     pub backend: String,
 
@@ -556,17 +658,26 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         tracing::info!(format = %format, path = %render_path, "graph rendered to file");
     }
 
-    let client = smasher_llm::client::Client::from_env();
-    if client.registered_providers().is_empty() {
-        return Err(CliError::Other(
-            "no API keys found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.".into(),
-        ));
-    }
-    let client = Arc::new(client);
+    // Shell backend does not need an LLM client or preflight checks.
+    let needs_llm = args.backend != "shell";
 
-    // Run preflight health-checks unless explicitly skipped.
-    if !args.skip_preflight {
-        match smasher_attractor::preflight::preflight_check(&resolved, &client).await {
+    let client: Option<Arc<smasher_llm::client::Client>> = if needs_llm {
+        let c = smasher_llm::client::Client::from_env();
+        if c.registered_providers().is_empty() {
+            return Err(CliError::Other(
+                "no API keys found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY."
+                    .into(),
+            ));
+        }
+        Some(Arc::new(c))
+    } else {
+        None
+    };
+
+    // Run preflight health-checks unless explicitly skipped or backend is shell.
+    if needs_llm && !args.skip_preflight {
+        let client_ref = client.as_ref().unwrap();
+        match smasher_attractor::preflight::preflight_check(&resolved, client_ref).await {
             Ok(report) => {
                 for probe in &report.probes {
                     eprintln!(
@@ -675,6 +786,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let mut registry = default_registry();
     match args.backend.as_str() {
         "claude-cli" => {
+            let client = client.as_ref().unwrap();
             let claude_backend: Arc<dyn CodergenBackend> = Arc::new(ClaudeCliBackend {
                 working_dir: effective_working_dir.clone(),
                 timeout: Duration::from_secs(args.agent_timeout),
@@ -684,7 +796,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                 node_id: None,
             });
             let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
-                Arc::clone(&client),
+                Arc::clone(client),
                 args.model.clone(),
                 effective_working_dir.clone(),
             ));
@@ -694,16 +806,24 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             )));
         }
         "agent" => {
+            let client = client.as_ref().unwrap();
             let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
-                Arc::clone(&client),
+                Arc::clone(client),
                 args.model.clone(),
                 effective_working_dir.clone(),
             ));
             registry.register(Arc::new(CodergenHandler::new(agent_backend)));
         }
+        "shell" => {
+            let shell_backend: Arc<dyn CodergenBackend> = Arc::new(ShellCodergenBackend {
+                working_dir: effective_working_dir.clone(),
+                timeout: Duration::from_secs(args.agent_timeout),
+            });
+            registry.register(Arc::new(CodergenHandler::new(shell_backend)));
+        }
         other => {
             return Err(CliError::Other(format!(
-                "unknown --backend value '{}': expected 'claude-cli' or 'agent'",
+                "unknown --backend value '{}': expected 'claude-cli', 'agent', or 'shell'",
                 other
             )));
         }
@@ -729,20 +849,22 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     registry.register(Arc::new(InterviewerHandler::new(interviewer.clone())));
     registry.register(Arc::new(HumanGateHandler::new(interviewer)));
 
-    // Register manager and tool handlers with LLM backends.
-    let manager_backend = Arc::new(crate::llm_backends::LlmManagerBackend::new(
-        Arc::clone(&client),
-        args.model.clone(),
-        effective_working_dir.clone(),
-    ));
-    registry.register(Arc::new(ManagerHandler::new(manager_backend)));
+    // Register manager and tool handlers with LLM backends (skipped for shell backend).
+    if let Some(ref client) = client {
+        let manager_backend = Arc::new(crate::llm_backends::LlmManagerBackend::new(
+            Arc::clone(client),
+            args.model.clone(),
+            effective_working_dir.clone(),
+        ));
+        registry.register(Arc::new(ManagerHandler::new(manager_backend)));
 
-    let tool_backend = Arc::new(crate::llm_backends::LlmToolBackend::new(
-        Arc::clone(&client),
-        args.model.clone(),
-        effective_working_dir.clone(),
-    ));
-    registry.register(Arc::new(ToolHandler::new(tool_backend)));
+        let tool_backend = Arc::new(crate::llm_backends::LlmToolBackend::new(
+            Arc::clone(client),
+            args.model.clone(),
+            effective_working_dir.clone(),
+        ));
+        registry.register(Arc::new(ToolHandler::new(tool_backend)));
+    }
 
     // Register parallel handler. The registry parameter is reserved for future
     // engine-level parallel dispatch; the handler itself uses node attributes only.
@@ -1575,5 +1697,164 @@ mod tests {
     fn should_enable_tui_no_tui_overrides_tui() {
         let cli = TestCli::parse_from(["test", "--tui", "--no-tui", "pipeline.dot"]);
         assert!(!should_enable_tui(&cli.run));
+    }
+
+    // ---- Shell backend flag test ----
+
+    #[test]
+    fn backend_flag_parsed_as_shell() {
+        let cli = TestCli::parse_from(["test", "--backend", "shell", "pipeline.dot"]);
+        assert_eq!(cli.run.backend, "shell");
+    }
+
+    // ---- ShellCodergenBackend tests ----
+
+    #[tokio::test]
+    async fn shell_backend_runs_prompt_as_shell_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend
+            .generate("echo 'hello from shell'", None, &ctx)
+            .await
+            .unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                let response = data["stdout"].as_str().unwrap();
+                assert_eq!(response.trim(), "hello from shell");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_backend_returns_failure_on_nonzero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend
+            .generate("echo 'oops' >&2; exit 1", None, &ctx)
+            .await
+            .unwrap();
+
+        match result {
+            Outcome::Failure { error, .. } => {
+                assert!(
+                    error.contains("oops"),
+                    "failure should include stderr, got: {error}"
+                );
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_backend_sets_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend.generate("pwd", None, &ctx).await.unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                let stdout = data["stdout"].as_str().unwrap().trim();
+                let expected = std::fs::canonicalize(tmp.path()).unwrap();
+                let actual = std::fs::canonicalize(stdout).unwrap();
+                assert_eq!(actual, expected, "working dir should match");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_backend_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_millis(100),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend.generate("sleep 30", None, &ctx).await;
+
+        assert!(result.is_err(), "timeout should produce an error");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
+            "error should mention timeout, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_backend_includes_context_as_env_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        ctx.set("project_name", serde_json::json!("my_project"));
+        ctx.set("_internal", serde_json::json!("hidden"));
+
+        let result = backend
+            .generate("echo $SMASHER_CTX_project_name", None, &ctx)
+            .await
+            .unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                let stdout = data["stdout"].as_str().unwrap().trim();
+                assert_eq!(stdout, "my_project");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_backend_captures_both_stdout_and_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ShellCodergenBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+        let result = backend
+            .generate("echo 'line1'; echo 'line2'", None, &ctx)
+            .await
+            .unwrap();
+
+        match result {
+            Outcome::Success {
+                data: Some(data), ..
+            } => {
+                let stdout = data["stdout"].as_str().unwrap();
+                assert!(stdout.contains("line1"));
+                assert!(stdout.contains("line2"));
+                assert_eq!(data["exit_code"].as_i64().unwrap(), 0);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
     }
 }

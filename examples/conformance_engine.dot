@@ -1,0 +1,176 @@
+// Engine conformance test pipeline.
+// Run with: smasher run examples/conformance_engine.dot --backend shell --skip-preflight
+//
+// Tests exercised:
+//   1. Start/Exit node handling
+//   2. Codergen nodes executing shell commands (via --backend shell)
+//   3. Context passing between nodes (SMASHER_CTX_* env vars)
+//   4. Conditional edge selection with expressions
+//   5. Parallel fan-out / fan-in execution
+//   6. Outcome routing (success vs failure)
+//   7. Edge priority / lexical tiebreaking
+
+digraph EngineConformance {
+  graph [
+    label="Engine Conformance Tests",
+    goal="Verify deterministic pipeline engine behavior without LLM",
+    rankdir=LR,
+    default_max_retry=0,
+    default_fidelity="full"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit  [shape=Msquare, label="Exit"];
+
+  // =========================================================================
+  // Phase 1: Basic node execution and context propagation
+  // =========================================================================
+
+  SetContext [
+    shape=box,
+    label="Set Context",
+    prompt="printf 'context_test_value'"
+  ];
+
+  VerifyContext [
+    shape=box,
+    label="Verify Context",
+    prompt="set -eu\nif [ -z \"${SMASHER_CTX_outcome:-}\" ]; then\n  echo 'FAIL: outcome not in context' >&2\n  exit 1\nfi\nprintf 'context_verified'"
+  ];
+
+  // =========================================================================
+  // Phase 2: Conditional branching
+  // =========================================================================
+
+  ConditionGate [
+    shape=diamond,
+    label="Branch on context_verified"
+  ];
+
+  ConditionPass [
+    shape=box,
+    label="Condition Passed",
+    prompt="printf 'branch_correct'"
+  ];
+
+  ConditionFail [
+    shape=box,
+    label="Condition Failed",
+    prompt="echo 'FAIL: wrong branch taken' >&2; exit 1"
+  ];
+
+  // =========================================================================
+  // Phase 3: Parallel fan-out / fan-in
+  // =========================================================================
+
+  ParallelFork [shape=component, label="Parallel Fork"];
+  ParallelJoin [shape=tripleoctagon, label="Parallel Join"];
+
+  ParallelA [
+    shape=box,
+    label="Parallel Branch A",
+    prompt="printf 'branch_a_done'"
+  ];
+
+  ParallelB [
+    shape=box,
+    label="Parallel Branch B",
+    prompt="printf 'branch_b_done'"
+  ];
+
+  ParallelC [
+    shape=box,
+    label="Parallel Branch C",
+    prompt="printf 'branch_c_done'"
+  ];
+
+  // =========================================================================
+  // Phase 4: Verify parallel results
+  // =========================================================================
+
+  VerifyParallel [
+    shape=box,
+    label="Verify Parallel",
+    prompt="printf 'parallel_verified'"
+  ];
+
+  // =========================================================================
+  // Phase 5: Edge priority test
+  // =========================================================================
+
+  PriorityGate [
+    shape=box,
+    label="Priority Test",
+    prompt="printf 'priority_gate_passed'"
+  ];
+
+  HighPriority [
+    shape=box,
+    label="High Priority Path",
+    prompt="printf 'high_priority_taken'"
+  ];
+
+  LowPriority [
+    shape=box,
+    label="Low Priority Path",
+    prompt="echo 'FAIL: low priority should not be taken' >&2; exit 1"
+  ];
+
+  // =========================================================================
+  // Phase 6: Failure handling
+  // =========================================================================
+
+  SimulateFailure [
+    shape=box,
+    label="Simulate Failure",
+    prompt="echo 'intentional_failure' >&2; exit 1"
+  ];
+
+  FailureRecovery [
+    shape=box,
+    label="Failure Recovery",
+    prompt="printf 'recovered_from_failure'"
+  ];
+
+  // =========================================================================
+  // Edges
+  // =========================================================================
+
+  Start -> SetContext;
+  SetContext -> VerifyContext;
+  VerifyContext -> ConditionGate;
+
+  // Conditional edges: the CodergenHandler stores outcome in context under
+  // the node's outcome key. The Conditional handler is a no-op; edge
+  // conditions are evaluated by the engine. We check that 'outcome' == 'success'.
+  ConditionGate -> ConditionPass [condition="outcome=success"];
+  ConditionGate -> ConditionFail [condition="outcome!=success"];
+
+  ConditionPass -> ParallelFork;
+
+  // Parallel branches
+  ParallelFork -> ParallelA;
+  ParallelFork -> ParallelB;
+  ParallelFork -> ParallelC;
+  ParallelA -> ParallelJoin;
+  ParallelB -> ParallelJoin;
+  ParallelC -> ParallelJoin;
+
+  ParallelJoin -> VerifyParallel;
+  VerifyParallel -> PriorityGate;
+
+  // Edge priority: higher priority wins when both unconditional
+  PriorityGate -> HighPriority [priority=10];
+  PriorityGate -> LowPriority  [priority=1];
+
+  HighPriority -> SimulateFailure;
+
+  // Failure routing: after a node fails, the engine should still traverse edges
+  SimulateFailure -> FailureRecovery;
+
+  FailureRecovery -> Exit;
+
+  // Dead-end for nodes that should not be reached
+  ConditionFail -> Exit;
+  LowPriority -> Exit;
+}

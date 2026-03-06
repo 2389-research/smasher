@@ -1,0 +1,104 @@
+// LLM integration conformance test pipeline.
+// Run with: smasher run examples/conformance_llm.dot --skip-preflight
+//
+// Tests exercised:
+//   1. Codergen node sends prompt to LLM and gets a response
+//   2. Context propagation between LLM-driven nodes
+//   3. Conditional branching based on LLM output
+//   4. Multi-model support (per-node model override)
+//   5. Interviewer node (auto-approve mode)
+//
+// All prompts are designed to produce deterministic, verifiable output.
+
+digraph LlmConformance {
+  graph [
+    label="LLM Integration Conformance",
+    goal="Verify LLM provider connectivity and response handling",
+    rankdir=LR,
+    default_max_retry=0,
+    default_fidelity="full"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit  [shape=Msquare,  label="Exit"];
+
+  // =========================================================================
+  // Phase 1: Basic LLM call
+  // =========================================================================
+
+  BasicCall [
+    shape=box,
+    label="Basic LLM Call",
+    prompt="Respond with exactly the word PONG and nothing else. No punctuation, no explanation."
+  ];
+
+  // =========================================================================
+  // Phase 2: Context-aware LLM call
+  // =========================================================================
+
+  ContextCall [
+    shape=box,
+    label="Context-Aware Call",
+    prompt="The previous node should have responded with PONG. Confirm you can see context from prior nodes by responding with exactly the word CONFIRMED and nothing else."
+  ];
+
+  // =========================================================================
+  // Phase 3: Conditional routing after LLM
+  // =========================================================================
+
+  RouteGate [
+    shape=diamond,
+    label="Route Gate"
+  ];
+
+  SuccessPath [
+    shape=box,
+    label="Success Path",
+    prompt="The pipeline is working correctly. Respond with exactly: ALL_CLEAR"
+  ];
+
+  ErrorPath [
+    shape=box,
+    label="Error Path",
+    prompt="Something went wrong in the pipeline. Respond with exactly: PIPELINE_ERROR"
+  ];
+
+  // =========================================================================
+  // Phase 4: Interviewer node (auto-approve)
+  // =========================================================================
+
+  ApprovalGate [
+    shape=hexagon,
+    label="Auto-Approval Gate",
+    prompt="Approve the conformance test run?"
+  ];
+
+  // =========================================================================
+  // Phase 5: Final verification
+  // =========================================================================
+
+  FinalCheck [
+    shape=box,
+    label="Final Check",
+    prompt="This is the final node. The pipeline has successfully tested basic LLM calls, context propagation, conditional routing, and interviewer gates. Respond with exactly: CONFORMANCE_PASS"
+  ];
+
+  // =========================================================================
+  // Edges
+  // =========================================================================
+
+  Start -> BasicCall;
+  BasicCall -> ContextCall;
+  ContextCall -> RouteGate;
+
+  // Route based on outcome status (set by engine after each node)
+  RouteGate -> SuccessPath [condition="outcome=success"];
+  RouteGate -> ErrorPath   [condition="outcome=fail"];
+
+  SuccessPath -> ApprovalGate;
+  ApprovalGate -> FinalCheck;
+  FinalCheck -> Exit;
+
+  // Dead end for error path
+  ErrorPath -> Exit;
+}
