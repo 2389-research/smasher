@@ -188,10 +188,12 @@ pub fn session_event_to_json(event: &SessionEvent) -> Value {
         SessionEvent::ToolCallStarted {
             tool_name,
             tool_call_id,
+            input_preview,
         } => json!({
             "type": "tool_call_start",
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
+            "input_preview": input_preview,
         }),
         SessionEvent::ToolCallCompleted {
             tool_name,
@@ -313,6 +315,7 @@ mod tests {
             ],
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 

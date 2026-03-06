@@ -30,6 +30,7 @@ pub fn event_name(event: &PipelineEvent) -> &'static str {
         PipelineEvent::AgentToolCallCompleted { .. } => "agent_tool_call_completed",
         PipelineEvent::AgentMessage { .. } => "agent_message",
         PipelineEvent::AgentTurnStarted { .. } => "agent_turn_started",
+        PipelineEvent::AgentTokenUsage { .. } => "agent_token_usage",
     }
 }
 
@@ -260,6 +261,27 @@ pub fn render_event_html(event: &PipelineEvent) -> String {
                 escape_html(node_id)
             )
         }
+        PipelineEvent::AgentTokenUsage {
+            node_id,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            timestamp,
+        } => {
+            let cost_part = if *cost_usd > 0.0 {
+                format!(" ${:.2}", cost_usd)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<div class="event-item event-agent_token_usage"><span class="event-time">{}</span><span class="event-icon">⊛</span><div class="event-body"><span class="event-kind">TOKENS</span><span class="event-detail"><span class="event-node">{}</span> in:{} out:{}{}</span></div></div>"#,
+                format_time(timestamp),
+                escape_html(node_id),
+                input_tokens,
+                output_tokens,
+                cost_part
+            )
+        }
     }
 }
 
@@ -415,6 +437,7 @@ mod tests {
                     node_id: "n".into(),
                     tool_name: "bash".into(),
                     tool_call_id: "c".into(),
+                    input_preview: String::new(),
                     timestamp: ts,
                 },
                 "agent_tool_call_started",
@@ -446,6 +469,16 @@ mod tests {
                     timestamp: ts,
                 },
                 "agent_turn_started",
+            ),
+            (
+                PipelineEvent::AgentTokenUsage {
+                    node_id: "n".into(),
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cost_usd: 0.0,
+                    timestamp: ts,
+                },
+                "agent_token_usage",
             ),
         ];
 

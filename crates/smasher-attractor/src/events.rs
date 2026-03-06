@@ -128,6 +128,7 @@ pub enum PipelineEvent {
         node_id: String,
         tool_name: String,
         tool_call_id: String,
+        input_preview: String,
         timestamp: DateTime<Utc>,
     },
     /// An agent tool call has completed within a codergen node.
@@ -138,6 +139,15 @@ pub enum PipelineEvent {
         duration_ms: u64,
         is_error: bool,
         result_preview: String,
+        timestamp: DateTime<Utc>,
+    },
+    /// Token usage report from an agent node (emitted per-step and on completion).
+    AgentTokenUsage {
+        node_id: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        /// Cumulative cost in USD for this node (set on final result, 0.0 for per-step).
+        cost_usd: f64,
         timestamp: DateTime<Utc>,
     },
     /// An agent produced a text message within a codergen node.
@@ -218,7 +228,8 @@ impl PipelineEvent {
             | Self::AgentToolCallStarted { node_id, .. }
             | Self::AgentToolCallCompleted { node_id, .. }
             | Self::AgentMessage { node_id, .. }
-            | Self::AgentTurnStarted { node_id, .. } => Some(node_id),
+            | Self::AgentTurnStarted { node_id, .. }
+            | Self::AgentTokenUsage { node_id, .. } => Some(node_id),
             Self::EdgeTraversed { .. }
             | Self::ContextUpdated { .. }
             | Self::PipelineStarted { .. }
@@ -246,7 +257,8 @@ impl PipelineEvent {
             | Self::AgentToolCallStarted { timestamp, .. }
             | Self::AgentToolCallCompleted { timestamp, .. }
             | Self::AgentMessage { timestamp, .. }
-            | Self::AgentTurnStarted { timestamp, .. } => *timestamp,
+            | Self::AgentTurnStarted { timestamp, .. }
+            | Self::AgentTokenUsage { timestamp, .. } => *timestamp,
         }
     }
 }
@@ -714,6 +726,7 @@ mod tests {
             node_id: "coder1".into(),
             tool_name: "bash".into(),
             tool_call_id: "call_001".into(),
+            input_preview: "ls -la".into(),
             timestamp: ts,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -860,6 +873,7 @@ mod tests {
                 node_id: "cg".into(),
                 tool_name: "bash".into(),
                 tool_call_id: "tc1".into(),
+                input_preview: String::new(),
                 timestamp: ts,
             },
             PipelineEvent::AgentToolCallCompleted {
@@ -959,6 +973,7 @@ mod tests {
                 node_id: "n7".into(),
                 tool_name: "bash".into(),
                 tool_call_id: "tc1".into(),
+                input_preview: String::new(),
                 timestamp: ts
             }
             .node_id(),
@@ -1820,6 +1835,7 @@ mod tests {
                 node_id: "n".into(),
                 tool_name: "t".into(),
                 tool_call_id: "c".into(),
+                input_preview: String::new(),
                 timestamp: ts,
             }
             .is_node_event()
@@ -1962,6 +1978,7 @@ mod tests {
                 node_id: "n".into(),
                 tool_name: "t".into(),
                 tool_call_id: "c".into(),
+                input_preview: String::new(),
                 timestamp: ts,
             }
             .is_pipeline_event()

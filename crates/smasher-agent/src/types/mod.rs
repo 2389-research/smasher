@@ -40,6 +40,7 @@ pub enum SessionEvent {
     ToolCallStarted {
         tool_name: String,
         tool_call_id: String,
+        input_preview: String,
     },
     /// A tool finished execution.
     ToolCallCompleted {
@@ -632,6 +633,7 @@ mod tests {
         let _event = SessionEvent::ToolCallStarted {
             tool_name: "bash".into(),
             tool_call_id: "call_1".into(),
+            input_preview: "echo hello".into(),
         };
     }
 

@@ -153,6 +153,7 @@ pub fn compose_graphs(
         edges: new_edges,
         default_node_attrs: parent.default_node_attrs.clone(),
         default_edge_attrs: parent.default_edge_attrs.clone(),
+        graph_attrs: parent.graph_attrs.clone(),
     })
 }
 
@@ -325,6 +326,7 @@ mod tests {
             edges,
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 

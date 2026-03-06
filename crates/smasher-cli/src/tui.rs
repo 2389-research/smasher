@@ -1,2129 +1,2031 @@
-// ABOUTME: TUI display models and formatters for pipeline execution visualization.
-// ABOUTME: Provides data structures that translate PipelineEvents into renderable view state.
+// ABOUTME: Boba-based TUI model for interactive pipeline execution visualization.
+// ABOUTME: Implements the Elm Architecture (init/update/view) with boba widgets for nodes and logs.
 
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use std::collections::HashMap;
+use std::time::Duration;
+
+use boba::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use boba::ratatui::Frame;
+use boba::ratatui::layout::{Constraint, Layout, Rect};
+use boba::ratatui::style::{Color, Modifier, Style};
+use boba::ratatui::text::{Line, Span};
+use boba::ratatui::widgets::{Block, Borders, List, ListItem};
+use boba::widgets::spinner::{self, Spinner, frames};
+use boba::widgets::status_bar::StatusBar;
+use boba::widgets::stopwatch::{self, Stopwatch};
+use boba::widgets::viewport::{self, Viewport};
+use boba::{
+    Command, Component, Model, OutputTarget, Program, ProgramError, ProgramOptions, Subscription,
+    TerminalEvent, terminal_events,
+};
 use smasher_attractor::events::PipelineEvent;
+use smasher_attractor::graph::Graph;
 
-/// Status of an individual node in the pipeline view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Initialization flags passed to PipelineTui at construction time.
+pub struct TuiFlags {
+    pub graph: Graph,
+    pub run_id: String,
+    pub pipeline_name: String,
+    /// Node IDs that were already completed before this run (e.g. from a resumed checkpoint).
+    pub completed_node_ids: Vec<String>,
+    /// Channel for sending human gate responses back to the bridge task.
+    /// When `None`, human gate prompts are display-only (no interactive input).
+    pub human_response_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+/// Messages handled by the PipelineTui model.
+#[derive(Debug, Clone)]
+pub enum Msg {
+    PipelineEvent(PipelineEvent),
+    KeyPress(KeyEvent),
+    Resize(u16, u16),
+    SpinnerMsg(spinner::Message),
+    StopwatchMsg(stopwatch::Message),
+    ViewportMsg(viewport::Message),
+    ConsoleViewportMsg(viewport::Message),
+    MouseScroll {
+        up: bool,
+    },
+    /// A human gate question has arrived; show the input overlay.
+    HumanPromptRequest {
+        question: String,
+    },
+    PipelineDone,
+    Quit,
+}
+
+/// Status of an individual pipeline node.
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeStatus {
     Pending,
     Running,
     Completed,
     Failed,
-    Skipped,
 }
 
-impl std::fmt::Display for NodeStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeStatus::Pending => write!(f, "pending"),
-            NodeStatus::Running => write!(f, "running"),
-            NodeStatus::Completed => write!(f, "completed"),
-            NodeStatus::Failed => write!(f, "failed"),
-            NodeStatus::Skipped => write!(f, "skipped"),
-        }
-    }
+/// State for a single node in the pipeline.
+pub struct NodeState {
+    pub id: String,
+    pub label: String,
+    pub status: NodeStatus,
 }
 
-/// Overall status of the pipeline execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A single log entry in the execution log stream.
+#[derive(Clone)]
+pub struct LogEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub node_id: Option<String>,
+    pub kind: LogKind,
+    pub content: String,
+}
+
+/// Semantic category for a log entry, used to determine display styling.
+#[derive(Clone)]
+pub enum LogKind {
+    PipelineStart,
+    PipelineEnd,
+    NodeStart,
+    NodeComplete,
+    NodeFail,
+    EdgeTraversal,
+    AgentTurn,
+    ToolCallStart,
+    ToolCallComplete,
+    AgentText,
+    HumanPrompt,
+    HumanResponse,
+    Info,
+}
+
+/// Which panel currently receives keyboard navigation input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PanelFocus {
+    Nodes,
+    Logs,
+    Console,
+}
+
+/// Overall pipeline execution status.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStatus {
-    NotStarted,
+    Starting,
     Running,
     Completed,
     Failed,
     Aborted,
 }
 
-impl std::fmt::Display for PipelineStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PipelineStatus::NotStarted => write!(f, "not started"),
-            PipelineStatus::Running => write!(f, "running"),
-            PipelineStatus::Completed => write!(f, "completed"),
-            PipelineStatus::Failed => write!(f, "failed"),
-            PipelineStatus::Aborted => write!(f, "aborted"),
-        }
-    }
+/// The main TUI model for pipeline execution.
+#[allow(dead_code)]
+pub struct PipelineTui {
+    nodes: Vec<NodeState>,
+    node_index: HashMap<String, usize>,
+    selected_node: usize,
+    log_entries: Vec<LogEntry>,
+    /// Unified stream of agent events across all nodes, shown in the bottom console panel.
+    console_entries: Vec<LogEntry>,
+    pipeline_name: String,
+    run_id: String,
+    status: PipelineStatus,
+    done: bool,
+    spinner: Spinner,
+    /// Local frame index mirror so we can display the spinner char in the title bar.
+    spinner_frame_idx: usize,
+    stopwatch: Stopwatch,
+    log_viewport: Viewport,
+    /// Scrollable viewport for the unified console panel.
+    console_viewport: Viewport,
+    focus: PanelFocus,
+    /// Scroll offset for the node list panel (first visible node index).
+    node_scroll_offset: usize,
+    /// Last known visible height of the node panel (updated each render).
+    node_panel_height: std::cell::Cell<usize>,
+    finished_node_count: usize,
+    /// Cumulative input tokens across all nodes.
+    total_input_tokens: u64,
+    /// Cumulative output tokens across all nodes.
+    total_output_tokens: u64,
+    /// Cumulative cost in USD across all nodes.
+    total_cost_usd: f64,
+    /// Set of file paths touched by Write/Edit tool calls.
+    files_touched: std::collections::HashSet<String>,
+    /// When a human gate question is pending, holds the question text.
+    pending_human_question: Option<String>,
+    /// Text buffer for the human gate input field.
+    human_input_buffer: String,
+    /// Channel for sending human gate responses back to the ChannelInterviewer bridge.
+    human_response_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
-/// Severity level for log lines displayed in the TUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogLevel {
-    Info,
-    Warning,
-    Error,
-    Debug,
-}
+impl Model for PipelineTui {
+    type Message = Msg;
+    type Flags = TuiFlags;
 
-impl std::fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogLevel::Info => write!(f, "INFO"),
-            LogLevel::Warning => write!(f, "WARN"),
-            LogLevel::Error => write!(f, "ERROR"),
-            LogLevel::Debug => write!(f, "DEBUG"),
-        }
-    }
-}
-
-/// A single timestamped log entry for the TUI log stream.
-#[derive(Debug, Clone)]
-pub struct LogLine {
-    pub timestamp: DateTime<Utc>,
-    pub level: LogLevel,
-    pub message: String,
-}
-
-/// View model for a single node in the pipeline graph.
-#[derive(Debug, Clone)]
-pub struct NodeView {
-    pub id: String,
-    pub node_type: String,
-    pub status: NodeStatus,
-    pub duration_ms: Option<u64>,
-}
-
-/// Top-level view model representing the entire pipeline execution state.
-///
-/// This struct is the bridge between raw `PipelineEvent`s and the TUI rendering
-/// layer. Call `apply_event` to incrementally update the view as events arrive.
-#[derive(Debug)]
-pub struct PipelineView {
-    pub graph_name: String,
-    pub nodes: Vec<NodeView>,
-    pub current_node: Option<String>,
-    pub status: PipelineStatus,
-    pub elapsed_ms: u64,
-    pub log_lines: Vec<LogLine>,
-}
-
-impl PipelineView {
-    /// Create a view initialized with all nodes in Pending status.
-    ///
-    /// `node_ids` is a list of `(id, node_type)` pairs describing the graph topology.
-    pub fn new(graph_name: String, node_ids: Vec<(String, String)>) -> Self {
-        let nodes = node_ids
-            .into_iter()
-            .map(|(id, node_type)| NodeView {
-                id,
-                node_type,
+    fn init(flags: TuiFlags) -> (Self, Command<Msg>) {
+        let nodes: Vec<NodeState> = flags
+            .graph
+            .nodes
+            .iter()
+            .map(|n| NodeState {
+                id: n.id.clone(),
+                label: n.label.clone().unwrap_or_else(|| n.id.clone()),
                 status: NodeStatus::Pending,
-                duration_ms: None,
             })
             .collect();
 
-        Self {
-            graph_name,
+        let node_index: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.clone(), i))
+            .collect();
+
+        let mut spinner = Spinner::new("pipeline-spinner")
+            .with_frames(frames::DOTS)
+            .with_interval(Duration::from_millis(80));
+        spinner.start();
+
+        let mut stopwatch = Stopwatch::new("pipeline-elapsed");
+        stopwatch.start();
+
+        let log_viewport = Viewport::new("").with_mouse_wheel(true);
+        let console_viewport = Viewport::new("").with_mouse_wheel(true);
+
+        let mut model = PipelineTui {
             nodes,
-            current_node: None,
-            status: PipelineStatus::NotStarted,
-            elapsed_ms: 0,
-            log_lines: Vec::new(),
+            node_index,
+            selected_node: 0,
+            log_entries: Vec::new(),
+            console_entries: Vec::new(),
+            pipeline_name: flags.pipeline_name,
+            run_id: flags.run_id,
+            status: PipelineStatus::Starting,
+            done: false,
+            spinner,
+            spinner_frame_idx: 0,
+            stopwatch,
+            log_viewport,
+            console_viewport,
+            focus: PanelFocus::Nodes,
+            node_scroll_offset: 0,
+            node_panel_height: std::cell::Cell::new(20),
+            finished_node_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            files_touched: std::collections::HashSet::new(),
+            pending_human_question: None,
+            human_input_buffer: String::new(),
+            human_response_tx: flags.human_response_tx,
+        };
+
+        // Mark nodes that were already completed in a previous run (resume).
+        for id in &flags.completed_node_ids {
+            if let Some(&idx) = model.node_index.get(id) {
+                model.nodes[idx].status = NodeStatus::Completed;
+                model.finished_node_count += 1;
+            }
+        }
+
+        (model, Command::none())
+    }
+
+    fn update(&mut self, msg: Msg) -> Command<Msg> {
+        match msg {
+            Msg::PipelineEvent(event) => self.handle_pipeline_event(event),
+
+            Msg::KeyPress(key) => self.handle_key(key),
+
+            Msg::Resize(_, _) => Command::none(),
+
+            Msg::SpinnerMsg(m) => {
+                if matches!(m, spinner::Message::Tick) {
+                    self.spinner_frame_idx = (self.spinner_frame_idx + 1) % frames::DOTS.len();
+                }
+                self.spinner.update(m).map(Msg::SpinnerMsg)
+            }
+
+            Msg::StopwatchMsg(m) => self.stopwatch.update(m).map(Msg::StopwatchMsg),
+
+            Msg::ViewportMsg(m) => self.log_viewport.update(m).map(Msg::ViewportMsg),
+
+            Msg::ConsoleViewportMsg(m) => {
+                self.console_viewport.update(m).map(Msg::ConsoleViewportMsg)
+            }
+
+            Msg::MouseScroll { up } => match self.focus {
+                PanelFocus::Nodes => {
+                    if up {
+                        self.selected_node = self.selected_node.saturating_sub(1);
+                    } else if self.selected_node + 1 < self.nodes.len() {
+                        self.selected_node += 1;
+                    }
+                    self.scroll_nodes_to_selected();
+                    self.refresh_viewport();
+                    Command::none()
+                }
+                PanelFocus::Console => {
+                    let wheel = viewport::Message::MouseWheel { up };
+                    self.console_viewport
+                        .update(wheel)
+                        .map(Msg::ConsoleViewportMsg)
+                }
+                PanelFocus::Logs => {
+                    let wheel = viewport::Message::MouseWheel { up };
+                    self.log_viewport.update(wheel).map(Msg::ViewportMsg)
+                }
+            },
+
+            Msg::HumanPromptRequest { question } => {
+                self.pending_human_question = Some(question);
+                self.human_input_buffer.clear();
+                Command::none()
+            }
+
+            Msg::PipelineDone => Command::quit(),
+
+            Msg::Quit => Command::quit(),
         }
     }
 
-    /// Apply a pipeline event to update the view state.
-    ///
-    /// Maps each `PipelineEvent` variant to the corresponding view mutation:
-    /// node status changes, pipeline status transitions, and log line generation.
-    pub fn apply_event(&mut self, event: &PipelineEvent) {
-        match event {
-            PipelineEvent::PipelineStarted { timestamp, .. } => {
-                self.status = PipelineStatus::Running;
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!("Pipeline '{}' started", self.graph_name),
-                });
+    fn view(&self, frame: &mut Frame) {
+        let area = frame.area();
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        self.render_title_bar(frame, rows[0]);
+        self.render_main(frame, rows[1]);
+        self.render_status_bar(frame, rows[2]);
+
+        // Render human gate input overlay on top of everything when a prompt is active.
+        if let Some(ref question) = self.pending_human_question {
+            self.render_human_input_overlay(frame, area, question);
+        }
+    }
+
+    fn subscriptions(&self) -> Vec<Subscription<Msg>> {
+        let mut subs = vec![terminal_events(|event| match event {
+            TerminalEvent::Key(key) => Some(Msg::KeyPress(key)),
+            TerminalEvent::Resize(w, h) => Some(Msg::Resize(w, h)),
+            TerminalEvent::Mouse(m) => {
+                use boba::crossterm::event::MouseEventKind;
+                match m.kind {
+                    MouseEventKind::ScrollUp => Some(Msg::MouseScroll { up: true }),
+                    MouseEventKind::ScrollDown => Some(Msg::MouseScroll { up: false }),
+                    _ => None,
+                }
             }
+            _ => None,
+        })];
+
+        if !self.done {
+            subs.extend(
+                self.spinner
+                    .subscriptions()
+                    .into_iter()
+                    .map(|s| s.map(Msg::SpinnerMsg)),
+            );
+            subs.extend(
+                self.stopwatch
+                    .subscriptions()
+                    .into_iter()
+                    .map(|s| s.map(Msg::StopwatchMsg)),
+            );
+        }
+
+        subs.extend(
+            self.log_viewport
+                .subscriptions()
+                .into_iter()
+                .map(|s| s.map(Msg::ViewportMsg)),
+        );
+
+        subs.extend(
+            self.console_viewport
+                .subscriptions()
+                .into_iter()
+                .map(|s| s.map(Msg::ConsoleViewportMsg)),
+        );
+
+        subs
+    }
+}
+
+impl PipelineTui {
+    fn handle_pipeline_event(&mut self, event: PipelineEvent) -> Command<Msg> {
+        match &event {
+            PipelineEvent::PipelineStarted {
+                graph_name,
+                timestamp,
+            } => {
+                self.status = PipelineStatus::Running;
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: None,
+                    kind: LogKind::PipelineStart,
+                    content: format!("Pipeline started: {graph_name}"),
+                });
+                Command::none()
+            }
+
+            PipelineEvent::PipelineCompleted {
+                duration_ms,
+                timestamp,
+                ..
+            } => {
+                if self.status != PipelineStatus::Failed {
+                    self.status = PipelineStatus::Completed;
+                }
+                self.spinner.stop();
+                self.stopwatch.stop();
+                self.done = true;
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: None,
+                    kind: LogKind::PipelineEnd,
+                    content: format!("Pipeline completed ({duration_ms}ms)"),
+                });
+                // Auto-quit after a brief pause so the user can see the final state.
+                Command::tick(Duration::from_secs(2), |_| Msg::Quit)
+            }
+
+            PipelineEvent::PipelineAborted { reason, timestamp } => {
+                self.status = PipelineStatus::Aborted;
+                self.spinner.stop();
+                self.stopwatch.stop();
+                self.done = true;
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: None,
+                    kind: LogKind::PipelineEnd,
+                    content: format!("Pipeline aborted: {reason}"),
+                });
+                // Auto-quit quickly on abort — something went wrong.
+                Command::tick(Duration::from_secs(1), |_| Msg::Quit)
+            }
+
             PipelineEvent::NodeStarted {
                 node_id, timestamp, ..
             } => {
-                self.current_node = Some(node_id.clone());
-                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *node_id) {
-                    node.status = NodeStatus::Running;
+                if let Some(&idx) = self.node_index.get(node_id) {
+                    self.nodes[idx].status = NodeStatus::Running;
+                    // Auto-select the newly running node and scroll to it
+                    self.selected_node = idx;
+                    self.scroll_nodes_to_selected();
                 }
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!("Node '{}' started", node_id),
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::NodeStart,
+                    content: format!("Node '{node_id}' started"),
                 });
+                Command::none()
             }
+
             PipelineEvent::NodeCompleted {
                 node_id,
                 duration_ms,
                 timestamp,
                 ..
             } => {
-                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *node_id) {
-                    node.status = NodeStatus::Completed;
-                    node.duration_ms = Some(*duration_ms);
+                if let Some(&idx) = self.node_index.get(node_id) {
+                    // Only increment if not already marked completed (e.g. from resume).
+                    if self.nodes[idx].status != NodeStatus::Completed {
+                        self.finished_node_count += 1;
+                    }
+                    self.nodes[idx].status = NodeStatus::Completed;
                 }
-                if self.current_node.as_deref() == Some(node_id) {
-                    self.current_node = None;
-                }
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!("Node '{}' completed in {}ms", node_id, duration_ms),
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::NodeComplete,
+                    content: format!("Node '{node_id}' completed ({duration_ms}ms)"),
                 });
+                // Auto-select next running node if there is one
+                if let Some(next) = self
+                    .nodes
+                    .iter()
+                    .position(|n| n.status == NodeStatus::Running)
+                {
+                    self.selected_node = next;
+                    self.scroll_nodes_to_selected();
+                }
+                Command::none()
             }
+
             PipelineEvent::NodeFailed {
                 node_id,
                 error,
-                duration_ms,
-                timestamp,
-            } => {
-                if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *node_id) {
-                    node.status = NodeStatus::Failed;
-                    node.duration_ms = Some(*duration_ms);
-                }
-                if self.current_node.as_deref() == Some(node_id) {
-                    self.current_node = None;
-                }
-                self.status = PipelineStatus::Failed;
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Error,
-                    message: format!("Node '{}' failed: {}", node_id, error),
-                });
-            }
-            PipelineEvent::PipelineCompleted {
-                duration_ms,
                 timestamp,
                 ..
             } => {
-                // Only transition to Completed if we haven't already marked it Failed.
-                if self.status != PipelineStatus::Failed {
-                    self.status = PipelineStatus::Completed;
+                if let Some(&idx) = self.node_index.get(node_id) {
+                    if self.nodes[idx].status != NodeStatus::Completed
+                        && self.nodes[idx].status != NodeStatus::Failed
+                    {
+                        self.finished_node_count += 1;
+                    }
+                    self.nodes[idx].status = NodeStatus::Failed;
                 }
-                self.elapsed_ms = *duration_ms;
-                self.current_node = None;
-                self.log_lines.push(LogLine {
+                self.status = PipelineStatus::Failed;
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!(
-                        "Pipeline completed in {}ms ({}/{} nodes)",
-                        duration_ms,
-                        self.completed_count(),
-                        self.total_count()
-                    ),
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::NodeFail,
+                    content: format!("Node '{node_id}' failed: {error}"),
                 });
+                Command::none()
             }
-            PipelineEvent::PipelineAborted {
-                reason, timestamp, ..
-            } => {
-                self.status = PipelineStatus::Aborted;
-                self.current_node = None;
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Error,
-                    message: format!("Pipeline aborted: {}", reason),
-                });
-            }
+
             PipelineEvent::EdgeTraversed {
                 from,
                 to,
                 timestamp,
                 ..
             } => {
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("Edge traversed: {} -> {}", from, to),
+                    node_id: None,
+                    kind: LogKind::EdgeTraversal,
+                    content: format!("{from} -> {to}"),
                 });
+                Command::none()
             }
+
+            PipelineEvent::AgentTurnStarted {
+                node_id,
+                turn_number,
+                timestamp,
+            } => {
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::AgentTurn,
+                    content: format!("Turn {turn_number}"),
+                });
+                Command::none()
+            }
+
+            PipelineEvent::AgentToolCallStarted {
+                node_id,
+                tool_name,
+                input_preview,
+                timestamp,
+                ..
+            } => {
+                // Track files touched by write/edit tool calls.
+                let is_file_tool = matches!(
+                    tool_name.as_str(),
+                    "Write" | "write_file" | "Edit" | "edit_file"
+                );
+                if is_file_tool && !input_preview.is_empty() {
+                    self.files_touched.insert(input_preview.clone());
+                }
+
+                let content = if input_preview.is_empty() {
+                    format!("  [tool] {tool_name}...")
+                } else {
+                    format!("  [tool] {tool_name} {input_preview}...")
+                };
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::ToolCallStart,
+                    content,
+                });
+                Command::none()
+            }
+
+            PipelineEvent::AgentToolCallCompleted {
+                node_id,
+                tool_name,
+                duration_ms,
+                is_error,
+                result_preview,
+                timestamp,
+                ..
+            } => {
+                let content = if *is_error && !result_preview.is_empty() {
+                    let preview = if result_preview.chars().count() > 60 {
+                        let t: String = result_preview.chars().take(60).collect();
+                        format!("{t}…")
+                    } else {
+                        result_preview.clone()
+                    };
+                    format!("  [tool] {tool_name} ERR ({duration_ms}ms) \"{preview}\"")
+                } else {
+                    let status_str = if *is_error { "ERR" } else { "ok" };
+                    format!("  [tool] {tool_name} {status_str} ({duration_ms}ms)")
+                };
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::ToolCallComplete,
+                    content,
+                });
+                Command::none()
+            }
+
+            PipelineEvent::AgentTokenUsage {
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                ..
+            } => {
+                self.total_input_tokens += input_tokens;
+                self.total_output_tokens += output_tokens;
+                if *cost_usd > 0.0 {
+                    self.total_cost_usd += cost_usd;
+                }
+                Command::none()
+            }
+
+            PipelineEvent::AgentMessage {
+                node_id,
+                text,
+                timestamp,
+            } => {
+                let truncated = if text.chars().count() > 120 {
+                    let t: String = text.chars().take(120).collect();
+                    format!("{t}…")
+                } else {
+                    text.clone()
+                };
+                self.push_both(LogEntry {
+                    timestamp: *timestamp,
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::AgentText,
+                    content: format!("  [text] {truncated}"),
+                });
+                Command::none()
+            }
+
             PipelineEvent::HumanPromptIssued {
                 node_id,
                 question,
                 timestamp,
             } => {
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Warning,
-                    message: format!("Human gate at '{}': {}", node_id, question),
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::HumanPrompt,
+                    content: format!("  [?] {question}"),
                 });
+                Command::none()
             }
+
             PipelineEvent::HumanResponseReceived {
                 node_id,
                 response,
                 timestamp,
             } => {
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!("Human response at '{}': {}", node_id, response),
+                    node_id: Some(node_id.clone()),
+                    kind: LogKind::HumanResponse,
+                    content: format!("  [>] {response}"),
                 });
+                Command::none()
             }
-            PipelineEvent::ContextUpdated { key, timestamp } => {
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("Context updated: key '{}'", key),
-                });
-            }
-            PipelineEvent::CheckpointCreated {
-                node_id, timestamp, ..
-            } => {
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("Checkpoint created at '{}'", node_id),
-                });
-            }
+
             PipelineEvent::LoopRestarted {
                 from,
                 to,
                 restart_count,
                 timestamp,
             } => {
-                self.log_lines.push(LogLine {
+                self.push_both(LogEntry {
                     timestamp: *timestamp,
-                    level: LogLevel::Info,
-                    message: format!(
-                        "Loop restarted: {} -> {} (attempt {})",
-                        from, to, restart_count
-                    ),
+                    node_id: None,
+                    kind: LogKind::EdgeTraversal,
+                    content: format!("Loop restarted: {from} -> {to} (attempt {restart_count})"),
                 });
+                Command::none()
             }
-            PipelineEvent::AgentToolCallStarted {
-                node_id,
-                tool_name,
-                timestamp,
-                ..
-            } => {
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("[{}] Tool call: {}", node_id, tool_name),
-                });
-            }
-            PipelineEvent::AgentToolCallCompleted {
-                node_id,
-                tool_name,
-                duration_ms,
-                is_error,
-                timestamp,
-                ..
-            } => {
-                let level = if *is_error {
-                    LogLevel::Warning
-                } else {
-                    LogLevel::Debug
-                };
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level,
-                    message: format!(
-                        "[{}] Tool done: {} ({}ms{})",
-                        node_id,
-                        tool_name,
-                        duration_ms,
-                        if *is_error { ", error" } else { "" }
-                    ),
-                });
-            }
-            PipelineEvent::AgentMessage {
-                node_id,
-                text,
-                timestamp,
-            } => {
-                let preview = if text.len() > 80 {
-                    format!("{}...", &text[..80])
-                } else {
-                    text.clone()
-                };
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("[{}] Agent: {}", node_id, preview),
-                });
-            }
-            PipelineEvent::AgentTurnStarted {
-                node_id,
-                turn_number,
-                timestamp,
-            } => {
-                self.log_lines.push(LogLine {
-                    timestamp: *timestamp,
-                    level: LogLevel::Debug,
-                    message: format!("[{}] Turn {} started", node_id, turn_number),
-                });
+
+            // Low-verbosity events: silently ignore
+            PipelineEvent::ContextUpdated { .. } | PipelineEvent::CheckpointCreated { .. } => {
+                Command::none()
             }
         }
     }
 
-    /// Format a one-line status summary suitable for a terminal status bar.
-    ///
-    /// Examples:
-    /// - `"Not started: my_pipeline (0/5 nodes)"`
-    /// - `"Running: node_3 (4/7 nodes, 1.2s)"`
-    /// - `"Completed: 7/7 nodes in 3.4s"`
-    /// - `"Failed at node_5 (4/7 nodes, 2.1s)"`
-    pub fn format_status_line(&self) -> String {
-        let completed = self.completed_count();
-        let total = self.total_count();
+    fn handle_key(&mut self, key: KeyEvent) -> Command<Msg> {
+        // When a human gate prompt is active, route all input to the text field.
+        if self.pending_human_question.is_some() {
+            return self.handle_human_input_key(key);
+        }
 
-        match &self.status {
-            PipelineStatus::NotStarted => {
-                format!("Not started: {} (0/{} nodes)", self.graph_name, total)
-            }
-            PipelineStatus::Running => {
-                let node_info = self.current_node.as_deref().unwrap_or("waiting");
-                let elapsed_secs = self.elapsed_ms as f64 / 1000.0;
-                if self.elapsed_ms > 0 {
-                    format!(
-                        "Running: {} ({}/{} nodes, {:.1}s)",
-                        node_info, completed, total, elapsed_secs
-                    )
-                } else {
-                    format!("Running: {} ({}/{} nodes)", node_info, completed, total)
+        // q or Esc quits
+        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
+            return Command::quit();
+        }
+        if key.code == KeyCode::Esc {
+            return Command::quit();
+        }
+
+        // Tab toggles focus between panels
+        if key.code == KeyCode::Tab {
+            self.toggle_focus();
+            return Command::none();
+        }
+
+        match &self.focus {
+            PanelFocus::Nodes => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.selected_node + 1 < self.nodes.len() {
+                        self.selected_node += 1;
+                        self.scroll_nodes_to_selected();
+                        self.refresh_viewport();
+                    }
+                    Command::none()
                 }
-            }
-            PipelineStatus::Completed => {
-                let elapsed_secs = self.elapsed_ms as f64 / 1000.0;
-                format!(
-                    "Completed: {}/{} nodes in {:.1}s",
-                    completed, total, elapsed_secs
-                )
-            }
-            PipelineStatus::Failed => {
-                let elapsed_secs = self.elapsed_ms as f64 / 1000.0;
-                let failed_node = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.status == NodeStatus::Failed)
-                    .map(|n| n.id.as_str())
-                    .unwrap_or("unknown");
-                if self.elapsed_ms > 0 {
-                    format!(
-                        "Failed at {} ({}/{} nodes, {:.1}s)",
-                        failed_node, completed, total, elapsed_secs
-                    )
-                } else {
-                    format!("Failed at {} ({}/{} nodes)", failed_node, completed, total)
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.selected_node = self.selected_node.saturating_sub(1);
+                    self.scroll_nodes_to_selected();
+                    self.refresh_viewport();
+                    Command::none()
                 }
-            }
-            PipelineStatus::Aborted => {
-                let elapsed_secs = self.elapsed_ms as f64 / 1000.0;
-                if self.elapsed_ms > 0 {
-                    format!(
-                        "Aborted ({}/{} nodes, {:.1}s)",
-                        completed, total, elapsed_secs
-                    )
-                } else {
-                    format!("Aborted ({}/{} nodes)", completed, total)
+                KeyCode::Char('G') => {
+                    // Jump to last node
+                    if !self.nodes.is_empty() {
+                        self.selected_node = self.nodes.len() - 1;
+                        self.scroll_nodes_to_selected();
+                        self.refresh_viewport();
+                    }
+                    Command::none()
                 }
+                KeyCode::Char('g') => {
+                    // Jump to first node
+                    self.selected_node = 0;
+                    self.scroll_nodes_to_selected();
+                    self.refresh_viewport();
+                    Command::none()
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.focus = PanelFocus::Logs;
+                    self.log_viewport.focus();
+                    Command::none()
+                }
+                KeyCode::Char('h') | KeyCode::Left => Command::none(),
+                _ => Command::none(),
+            },
+            PanelFocus::Logs => match key.code {
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.focus = PanelFocus::Nodes;
+                    self.log_viewport.blur();
+                    Command::none()
+                }
+                _ => {
+                    // Forward to viewport for vi-style scrolling (j/k/g/G/etc.)
+                    self.log_viewport
+                        .update(viewport::Message::KeyPress(key))
+                        .map(Msg::ViewportMsg)
+                }
+            },
+            PanelFocus::Console => match key.code {
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.focus = PanelFocus::Nodes;
+                    self.console_viewport.blur();
+                    Command::none()
+                }
+                _ => {
+                    // Forward to console viewport for vi-style scrolling
+                    self.console_viewport
+                        .update(viewport::Message::KeyPress(key))
+                        .map(Msg::ConsoleViewportMsg)
+                }
+            },
+        }
+    }
+
+    /// Handle keyboard input when the human gate text input overlay is active.
+    fn handle_human_input_key(&mut self, key: KeyEvent) -> Command<Msg> {
+        // Ctrl+C force-quits even while the overlay is active.
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            return Command::quit();
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                let response = self.human_input_buffer.clone();
+                self.pending_human_question = None;
+                self.human_input_buffer.clear();
+                if let Some(ref tx) = self.human_response_tx {
+                    let _ = tx.send(response);
+                }
+                Command::none()
+            }
+            KeyCode::Esc => {
+                // Cancel the prompt — send empty string to unblock the interviewer.
+                self.pending_human_question = None;
+                self.human_input_buffer.clear();
+                if let Some(ref tx) = self.human_response_tx {
+                    let _ = tx.send(String::new());
+                }
+                Command::none()
+            }
+            KeyCode::Backspace => {
+                self.human_input_buffer.pop();
+                Command::none()
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT {
+                    self.human_input_buffer.push(c);
+                }
+                Command::none()
+            }
+            _ => Command::none(),
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        match self.focus {
+            PanelFocus::Nodes => {
+                self.focus = PanelFocus::Logs;
+                self.log_viewport.focus();
+            }
+            PanelFocus::Logs => {
+                self.focus = PanelFocus::Console;
+                self.log_viewport.blur();
+                self.console_viewport.focus();
+            }
+            PanelFocus::Console => {
+                self.focus = PanelFocus::Nodes;
+                self.console_viewport.blur();
             }
         }
     }
 
-    /// Count how many nodes have reached Completed status.
-    pub fn completed_count(&self) -> usize {
-        self.nodes
+    /// Adjust `node_scroll_offset` so that `selected_node` is visible.
+    fn scroll_nodes_to_selected(&mut self) {
+        let h = self.node_panel_height.get();
+        if h == 0 {
+            return;
+        }
+        if self.selected_node < self.node_scroll_offset {
+            self.node_scroll_offset = self.selected_node;
+        } else if self.selected_node >= self.node_scroll_offset + h {
+            self.node_scroll_offset = self.selected_node - h + 1;
+        }
+    }
+
+    /// Append a log entry and refresh the per-node viewport content.
+    #[allow(dead_code)] // Used directly in tests; production code uses push_both.
+    fn push_log(&mut self, entry: LogEntry) {
+        self.log_entries.push(entry);
+        self.refresh_viewport();
+    }
+
+    /// Append to both the per-node log and the unified console.
+    fn push_both(&mut self, entry: LogEntry) {
+        self.console_entries.push(entry.clone());
+        self.log_entries.push(entry);
+        self.refresh_viewport();
+        self.refresh_console_viewport();
+    }
+
+    /// Rebuild viewport content from current log entries, preserving scroll position.
+    fn refresh_viewport(&mut self) {
+        let was_at_bottom = self.log_viewport.at_bottom();
+        let old_offset = self.log_viewport.y_offset();
+        let lines = self.render_log_lines();
+        self.log_viewport.set_styled_content(lines);
+        if was_at_bottom {
+            self.log_viewport.goto_bottom();
+        } else {
+            self.log_viewport.set_y_offset(old_offset);
+        }
+    }
+
+    /// Rebuild console viewport content from all console entries, preserving scroll position.
+    fn refresh_console_viewport(&mut self) {
+        let was_at_bottom = self.console_viewport.at_bottom();
+        let old_offset = self.console_viewport.y_offset();
+        let lines = self.render_console_lines();
+        self.console_viewport.set_styled_content(lines);
+        if was_at_bottom {
+            self.console_viewport.goto_bottom();
+        } else {
+            self.console_viewport.set_y_offset(old_offset);
+        }
+    }
+
+    /// Build styled log lines for the selected node (or all global entries when empty).
+    fn render_log_lines(&self) -> Vec<Line<'static>> {
+        let selected_id = self.nodes.get(self.selected_node).map(|n| n.id.as_str());
+
+        self.log_entries
             .iter()
-            .filter(|n| n.status == NodeStatus::Completed)
-            .count()
+            .filter(|entry| match selected_id {
+                Some(id) => {
+                    // Show global entries (no node_id) and entries for the selected node
+                    entry.node_id.is_none() || entry.node_id.as_deref() == Some(id)
+                }
+                None => true,
+            })
+            .map(|entry| {
+                let style = style_for_log_entry(entry);
+                Line::from(vec![Span::styled(entry.content.clone(), style)])
+            })
+            .collect()
     }
 
-    /// Return the total number of nodes in the pipeline.
-    pub fn total_count(&self) -> usize {
-        self.nodes.len()
+    /// Build styled lines for the unified console panel — all agents, prefixed with timestamp and [node_id].
+    fn render_console_lines(&self) -> Vec<Line<'static>> {
+        self.console_entries
+            .iter()
+            .map(|entry| {
+                let ts = entry.timestamp.format("%H:%M:%S");
+                let time_span = Span::styled(
+                    format!("{ts} "),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                );
+                let prefix = match &entry.node_id {
+                    Some(id) => {
+                        Span::styled(format!("[{id}] "), Style::default().fg(Color::DarkGray))
+                    }
+                    None => Span::styled(
+                        "[*] ".to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                };
+                let style = style_for_log_entry(entry);
+                Line::from(vec![
+                    time_span,
+                    prefix,
+                    Span::styled(entry.content.clone(), style),
+                ])
+            })
+            .collect()
+    }
+
+    fn render_title_bar(&self, frame: &mut Frame, area: Rect) {
+        let elapsed = self.stopwatch.elapsed();
+        let total_secs = elapsed.as_secs();
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        let tenths = (elapsed.subsec_millis() / 100) as u64;
+        let elapsed_str = format!("{mins:02}:{secs:02}.{tenths}");
+
+        // Center section: colored status label + frozen elapsed time when done
+        let center_line = match &self.status {
+            PipelineStatus::Completed => Line::from(vec![
+                Span::styled(
+                    "COMPLETED",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {elapsed_str}")),
+            ]),
+            PipelineStatus::Failed => Line::from(vec![
+                Span::styled(
+                    "FAILED",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {elapsed_str}")),
+            ]),
+            PipelineStatus::Aborted => Line::from(vec![
+                Span::styled(
+                    "ABORTED",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {elapsed_str}")),
+            ]),
+            _ => {
+                let frame_char = frames::DOTS[self.spinner_frame_idx % frames::DOTS.len()];
+                Line::from(format!("{frame_char}  {elapsed_str}"))
+            }
+        };
+
+        let left_line = Line::from(Span::styled(
+            format!(" SMASHER: {} ", self.pipeline_name),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let total_tokens = self.total_input_tokens + self.total_output_tokens;
+        let mut parts: Vec<String> = Vec::new();
+        if self.total_cost_usd > 0.0 {
+            parts.push(format_cost(self.total_cost_usd));
+        }
+        if total_tokens > 0 {
+            parts.push(format!("{}tok", format_token_count(total_tokens)));
+        }
+        if !self.files_touched.is_empty() {
+            parts.push(format!("{}f", self.files_touched.len()));
+        }
+        parts.push(format!(
+            "{}/{} nodes",
+            self.finished_node_count,
+            self.nodes.len()
+        ));
+        let right_text = format!("{} ", parts.join("  "));
+
+        StatusBar::new()
+            .left(left_line)
+            .center(center_line)
+            .right(right_text)
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .render(frame, area);
+    }
+
+    fn render_main(&self, frame: &mut Frame, area: Rect) {
+        let rows =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+
+        let cols = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(rows[0]);
+
+        self.render_nodes_panel(frame, cols[0]);
+        self.render_log_panel(frame, cols[1]);
+        self.render_console_panel(frame, rows[1]);
+    }
+
+    fn render_nodes_panel(&self, frame: &mut Frame, area: Rect) {
+        let border_style = if self.focus == PanelFocus::Nodes {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Nodes ")
+            .border_style(border_style);
+
+        let inner = block.inner(area);
+        let visible_height = inner.height as usize;
+        self.node_panel_height.set(visible_height);
+
+        // Build visible items starting from scroll offset.
+        let items: Vec<ListItem> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .skip(self.node_scroll_offset)
+            .take(visible_height)
+            .map(|(i, node)| {
+                // Running nodes show the current spinner frame in green
+                let icon_span = match node.status {
+                    NodeStatus::Pending => Span::styled(
+                        "○ ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    NodeStatus::Running => {
+                        let frame_char = frames::DOTS[self.spinner_frame_idx % frames::DOTS.len()];
+                        Span::styled(format!("{frame_char} "), Style::default().fg(Color::Green))
+                    }
+                    NodeStatus::Completed => Span::styled("✓ ", Style::default().fg(Color::Green)),
+                    NodeStatus::Failed => Span::styled("✗ ", Style::default().fg(Color::Red)),
+                };
+                // Selected row gets a contrasting background highlight
+                let label_style = if i == self.selected_node {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    icon_span,
+                    Span::styled(node.label.clone(), label_style),
+                ]))
+            })
+            .collect();
+
+        let list = List::new(items).block(block);
+        frame.render_widget(list, area);
+    }
+
+    fn render_log_panel(&self, frame: &mut Frame, area: Rect) {
+        let border_style = if self.focus == PanelFocus::Logs {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Output ")
+            .border_style(border_style);
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.log_viewport.view(frame, inner);
+    }
+
+    fn render_console_panel(&self, frame: &mut Frame, area: Rect) {
+        let border_style = if self.focus == PanelFocus::Console {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Console (all agents) ")
+            .border_style(border_style);
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.console_viewport.view(frame, inner);
+    }
+
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let status_text = match &self.status {
+            PipelineStatus::Starting => " starting ",
+            PipelineStatus::Running => " running ",
+            PipelineStatus::Completed => " completed ",
+            PipelineStatus::Failed => " FAILED ",
+            PipelineStatus::Aborted => " ABORTED ",
+        };
+
+        let help_right = if self.pending_human_question.is_some() {
+            " HUMAN GATE: type response, Enter to submit, Esc to skip "
+        } else {
+            " q quit | j/k nav | h nodes | tab cycle | g/G top/bottom "
+        };
+
+        StatusBar::new()
+            .left(status_text)
+            .right(help_right)
+            .style(Style::default().bg(Color::DarkGray))
+            .render(frame, area);
+    }
+
+    /// Render a centered input overlay for human gate prompts.
+    fn render_human_input_overlay(&self, frame: &mut Frame, area: Rect, question: &str) {
+        use boba::ratatui::widgets::{Clear, Paragraph, Wrap};
+
+        // Size the overlay: 60% wide, up to 8 lines tall.
+        let overlay_width = (area.width * 60 / 100)
+            .max(30)
+            .min(area.width.saturating_sub(4));
+        let overlay_height = 8u16.min(area.height.saturating_sub(4));
+        let x = (area.width.saturating_sub(overlay_width)) / 2;
+        let y = (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+        // Clear the background behind the overlay.
+        frame.render_widget(Clear, overlay_area);
+
+        // Split into question area and input area.
+        let inner_layout = Layout::vertical([
+            Constraint::Min(2),    // question
+            Constraint::Length(3), // input field
+        ])
+        .split(overlay_area);
+
+        let question_block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(" Human Gate ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        let question_para = Paragraph::new(question.to_string())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::White))
+            .block(question_block);
+        frame.render_widget(question_para, inner_layout[0]);
+
+        let input_block = Block::default()
+            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(" > ")
+            .title_style(Style::default().fg(Color::Green));
+
+        // Show the input buffer with a cursor.
+        let input_text = format!("{}█", self.human_input_buffer);
+        let input_para = Paragraph::new(input_text)
+            .style(Style::default().fg(Color::Green))
+            .block(input_block);
+        frame.render_widget(input_para, inner_layout[1]);
     }
 }
 
-/// Drives the TUI display by processing pipeline events and tracking execution state.
+/// Format a USD cost for compact display: "$0.02", "$1.23", "$12.3".
+fn format_cost(usd: f64) -> String {
+    if usd >= 10.0 {
+        format!("${:.1}", usd)
+    } else {
+        format!("${:.2}", usd)
+    }
+}
+
+/// Format a token count for compact display: "1.2k", "45.3k", "1.2M".
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Map a log entry's kind to a ratatui Style for consistent coloring.
+fn style_for_log_entry(entry: &LogEntry) -> Style {
+    match entry.kind {
+        LogKind::PipelineStart | LogKind::PipelineEnd => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        LogKind::NodeStart | LogKind::NodeComplete => Style::default().fg(Color::Yellow),
+        LogKind::NodeFail => Style::default().fg(Color::Red),
+        LogKind::EdgeTraversal => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+        LogKind::AgentTurn => Style::default().fg(Color::Cyan),
+        LogKind::ToolCallStart => Style::default().fg(Color::Cyan),
+        LogKind::ToolCallComplete => {
+            if entry.content.contains("ERR") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green)
+            }
+        }
+        LogKind::AgentText => Style::default().fg(Color::White),
+        LogKind::HumanPrompt => Style::default().fg(Color::Magenta),
+        LogKind::HumanResponse => Style::default().fg(Color::Magenta),
+        LogKind::Info => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Build a boba Program for the pipeline TUI, rendering to stderr.
 ///
-/// Wraps a `PipelineView` with event counting and timestamp tracking so that
-/// callers have a single entry point for feeding events and querying display state.
-pub struct TuiRunner {
-    pub view: PipelineView,
-    pub event_count: usize,
-    pub last_update: Option<DateTime<Utc>>,
-}
-
-impl TuiRunner {
-    /// Create a runner with an initialized view containing the given nodes.
-    pub fn new(graph_name: String, node_ids: Vec<(String, String)>) -> Self {
-        Self {
-            view: PipelineView::new(graph_name, node_ids),
-            event_count: 0,
-            last_update: None,
-        }
-    }
-
-    /// Apply a pipeline event to the view, increment the event counter, and record the timestamp.
-    pub fn process_event(&mut self, event: &PipelineEvent) {
-        self.view.apply_event(event);
-        self.event_count += 1;
-        self.last_update = Some(event.timestamp());
-    }
-
-    /// Delegate to the view's compact status-line formatter.
-    pub fn render_line(&self) -> String {
-        self.view.format_status_line()
-    }
-
-    /// Return `true` when the pipeline has reached a terminal state.
-    pub fn is_complete(&self) -> bool {
-        matches!(
-            self.view.status,
-            PipelineStatus::Completed | PipelineStatus::Failed | PipelineStatus::Aborted
-        )
-    }
-
-    /// Return the number of events processed so far.
-    pub fn event_count(&self) -> usize {
-        self.event_count
-    }
-
-    /// Borrow the underlying view for inspection.
-    pub fn view(&self) -> &PipelineView {
-        &self.view
-    }
-}
-
-/// View model for a rendered graph image within the TUI.
-///
-/// Holds the most recently rendered graph output bytes along with metadata
-/// about when it was rendered and what format it is in. The TUI layer can
-/// use this to decide whether to refresh the render or display the cached image.
-#[derive(Debug, Clone)]
-pub struct GraphView {
-    /// The rendered content bytes (DOT text, SVG text, or PNG binary).
-    pub content: Vec<u8>,
-    /// The format of the rendered content.
-    pub format: smasher_attractor::rendering::RenderFormat,
-    /// Timestamp when this render was produced.
-    pub rendered_at: DateTime<Utc>,
-    /// Whether the render is stale because the pipeline state has changed
-    /// since the last render.
-    pub stale: bool,
-}
-
-impl GraphView {
-    /// Create a new graph view from a render output.
-    pub fn from_render_output(
-        output: smasher_attractor::rendering::RenderOutput,
-        rendered_at: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            content: output.content,
-            format: output.format,
-            rendered_at,
-            stale: false,
-        }
-    }
-
-    /// Mark this view as stale, indicating it should be re-rendered.
-    pub fn mark_stale(&mut self) {
-        self.stale = true;
-    }
-
-    /// Mark this view as fresh after a re-render.
-    pub fn mark_fresh(&mut self, content: Vec<u8>, rendered_at: DateTime<Utc>) {
-        self.content = content;
-        self.rendered_at = rendered_at;
-        self.stale = false;
-    }
-
-    /// Return the rendered content as UTF-8 text, if applicable.
-    pub fn as_text(&self) -> Option<&str> {
-        std::str::from_utf8(&self.content).ok()
-    }
-
-    /// Return the content byte length.
-    pub fn content_len(&self) -> usize {
-        self.content.len()
-    }
-}
-
-/// Output format selection for pipeline event display.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayFormat {
-    /// One-line status updates suitable for overwriting the same terminal line.
-    Compact,
-    /// Full event log with timestamps, one line per event.
-    Verbose,
-    /// Raw JSON event stream, one JSON object per line.
-    Json,
-    /// No output at all.
-    Silent,
-}
-
-/// Format a pipeline event according to the chosen display format.
-///
-/// Returns `None` for `Silent` mode and `Some(line)` for all others.
-pub fn format_event(event: &PipelineEvent, format: &DisplayFormat) -> Option<String> {
-    match format {
-        DisplayFormat::Compact => {
-            // Produce a concise description of the event itself
-            let description = match event {
-                PipelineEvent::PipelineStarted { graph_name, .. } => {
-                    format!("Pipeline '{}' started", graph_name)
-                }
-                PipelineEvent::NodeStarted {
-                    node_id, node_type, ..
-                } => {
-                    format!("Node '{}' ({}) started", node_id, node_type)
-                }
-                PipelineEvent::NodeCompleted {
-                    node_id,
-                    duration_ms,
-                    ..
-                } => {
-                    format!("Node '{}' completed in {}ms", node_id, duration_ms)
-                }
-                PipelineEvent::NodeFailed { node_id, error, .. } => {
-                    format!("Node '{}' failed: {}", node_id, error)
-                }
-                PipelineEvent::PipelineCompleted { duration_ms, .. } => {
-                    format!("Pipeline completed in {}ms", duration_ms)
-                }
-                PipelineEvent::PipelineAborted { reason, .. } => {
-                    format!("Pipeline aborted: {}", reason)
-                }
-                PipelineEvent::EdgeTraversed { from, to, .. } => {
-                    format!("Edge: {} -> {}", from, to)
-                }
-                PipelineEvent::HumanPromptIssued {
-                    node_id, question, ..
-                } => {
-                    format!("Human gate at '{}': {}", node_id, question)
-                }
-                PipelineEvent::HumanResponseReceived {
-                    node_id, response, ..
-                } => {
-                    format!("Human response at '{}': {}", node_id, response)
-                }
-                PipelineEvent::ContextUpdated { key, .. } => {
-                    format!("Context updated: '{}'", key)
-                }
-                PipelineEvent::CheckpointCreated { node_id, .. } => {
-                    format!("Checkpoint at '{}'", node_id)
-                }
-                PipelineEvent::LoopRestarted {
-                    from,
-                    to,
-                    restart_count,
-                    ..
-                } => {
-                    format!("Loop: {} -> {} (attempt {})", from, to, restart_count)
-                }
-                PipelineEvent::AgentToolCallStarted {
-                    node_id, tool_name, ..
-                } => {
-                    format!("[{}] Tool: {}", node_id, tool_name)
-                }
-                PipelineEvent::AgentToolCallCompleted {
-                    node_id,
-                    tool_name,
-                    duration_ms,
-                    is_error,
-                    ..
-                } => {
-                    format!(
-                        "[{}] Tool done: {} ({}ms{})",
-                        node_id,
-                        tool_name,
-                        duration_ms,
-                        if *is_error { ", error" } else { "" }
-                    )
-                }
-                PipelineEvent::AgentMessage { node_id, text, .. } => {
-                    let preview = if text.len() > 60 {
-                        format!("{}...", &text[..60])
-                    } else {
-                        text.clone()
-                    };
-                    format!("[{}] Agent: {}", node_id, preview)
-                }
-                PipelineEvent::AgentTurnStarted {
-                    node_id,
-                    turn_number,
-                    ..
-                } => {
-                    format!("[{}] Turn {}", node_id, turn_number)
-                }
-            };
-            Some(description)
-        }
-        DisplayFormat::Verbose => {
-            let ts = event.timestamp().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-            let kind = match event {
-                PipelineEvent::PipelineStarted { .. } => "pipeline_started",
-                PipelineEvent::NodeStarted { .. } => "node_started",
-                PipelineEvent::NodeCompleted { .. } => "node_completed",
-                PipelineEvent::NodeFailed { .. } => "node_failed",
-                PipelineEvent::PipelineCompleted { .. } => "pipeline_completed",
-                PipelineEvent::PipelineAborted { .. } => "pipeline_aborted",
-                PipelineEvent::EdgeTraversed { .. } => "edge_traversed",
-                PipelineEvent::HumanPromptIssued { .. } => "human_prompt_issued",
-                PipelineEvent::HumanResponseReceived { .. } => "human_response_received",
-                PipelineEvent::ContextUpdated { .. } => "context_updated",
-                PipelineEvent::CheckpointCreated { .. } => "checkpoint_created",
-                PipelineEvent::LoopRestarted { .. } => "loop_restarted",
-                PipelineEvent::AgentToolCallStarted { .. } => "agent_tool_call_started",
-                PipelineEvent::AgentToolCallCompleted { .. } => "agent_tool_call_completed",
-                PipelineEvent::AgentMessage { .. } => "agent_message",
-                PipelineEvent::AgentTurnStarted { .. } => "agent_turn_started",
-            };
-            let details = match event {
-                PipelineEvent::PipelineStarted { graph_name, .. } => {
-                    format!("graph={}", graph_name)
-                }
-                PipelineEvent::NodeStarted {
-                    node_id, node_type, ..
-                } => {
-                    format!("node={} type={}", node_id, node_type)
-                }
-                PipelineEvent::NodeCompleted {
-                    node_id,
-                    duration_ms,
-                    ..
-                } => {
-                    format!("node={} duration={}ms", node_id, duration_ms)
-                }
-                PipelineEvent::NodeFailed {
-                    node_id,
-                    error,
-                    duration_ms,
-                    ..
-                } => {
-                    format!(
-                        "node={} error=\"{}\" duration={}ms",
-                        node_id, error, duration_ms
-                    )
-                }
-                PipelineEvent::PipelineCompleted {
-                    total_nodes,
-                    duration_ms,
-                    ..
-                } => {
-                    format!("nodes={} duration={}ms", total_nodes, duration_ms)
-                }
-                PipelineEvent::PipelineAborted { reason, .. } => {
-                    format!("reason=\"{}\"", reason)
-                }
-                PipelineEvent::EdgeTraversed {
-                    from, to, label, ..
-                } => {
-                    let label_str = label.as_deref().unwrap_or("(none)");
-                    format!("from={} to={} label={}", from, to, label_str)
-                }
-                PipelineEvent::HumanPromptIssued {
-                    node_id, question, ..
-                } => {
-                    format!("node={} question=\"{}\"", node_id, question)
-                }
-                PipelineEvent::HumanResponseReceived {
-                    node_id, response, ..
-                } => {
-                    format!("node={} response=\"{}\"", node_id, response)
-                }
-                PipelineEvent::ContextUpdated { key, .. } => {
-                    format!("key={}", key)
-                }
-                PipelineEvent::CheckpointCreated { node_id, .. } => {
-                    format!("node={}", node_id)
-                }
-                PipelineEvent::LoopRestarted {
-                    from,
-                    to,
-                    restart_count,
-                    ..
-                } => {
-                    format!("from={} to={} attempt={}", from, to, restart_count)
-                }
-                PipelineEvent::AgentToolCallStarted {
-                    node_id,
-                    tool_name,
-                    tool_call_id,
-                    ..
-                } => {
-                    format!(
-                        "node={} tool={} call_id={}",
-                        node_id, tool_name, tool_call_id
-                    )
-                }
-                PipelineEvent::AgentToolCallCompleted {
-                    node_id,
-                    tool_name,
-                    tool_call_id,
-                    duration_ms,
-                    is_error,
-                    ..
-                } => {
-                    format!(
-                        "node={} tool={} call_id={} duration={}ms error={}",
-                        node_id, tool_name, tool_call_id, duration_ms, is_error
-                    )
-                }
-                PipelineEvent::AgentMessage { node_id, text, .. } => {
-                    let preview = if text.len() > 80 {
-                        format!("{}...", &text[..80])
-                    } else {
-                        text.clone()
-                    };
-                    format!("node={} text=\"{}\"", node_id, preview)
-                }
-                PipelineEvent::AgentTurnStarted {
-                    node_id,
-                    turn_number,
-                    ..
-                } => {
-                    format!("node={} turn={}", node_id, turn_number)
-                }
-            };
-            Some(format!("[{}] {}: {}", ts, kind, details))
-        }
-        DisplayFormat::Json => {
-            // PipelineEvent derives Serialize, so we can serialize directly
-            let json = serde_json::to_string(event)
-                .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-            Some(json)
-        }
-        DisplayFormat::Silent => None,
-    }
+/// Renders to stderr so that stdout remains clean for pipeline JSON output.
+pub fn build_program(flags: TuiFlags) -> Result<Program<PipelineTui>, ProgramError> {
+    let opts = ProgramOptions {
+        output: OutputTarget::Stderr,
+        alt_screen: true,
+        title: Some(format!("SMASHER: {}", flags.pipeline_name)),
+        ..ProgramOptions::default()
+    };
+    Program::<PipelineTui>::with_options(flags, opts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boba::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use chrono::Utc;
-    use smasher_attractor::state::Outcome;
+    use smasher_attractor::graph::{Graph, GraphNode, NodeType};
 
-    fn now() -> DateTime<Utc> {
-        Utc::now()
+    fn make_graph(node_ids: &[&str]) -> Graph {
+        Graph {
+            name: Some("test".into()),
+            nodes: node_ids
+                .iter()
+                .map(|id| GraphNode {
+                    id: id.to_string(),
+                    node_type: NodeType::Codergen,
+                    label: Some(id.to_string()),
+                    attrs: Default::default(),
+                })
+                .collect(),
+            edges: vec![],
+            default_node_attrs: Default::default(),
+            default_edge_attrs: Default::default(),
+            graph_attrs: Default::default(),
+        }
     }
 
-    fn sample_nodes() -> Vec<(String, String)> {
-        vec![
-            ("fetch".into(), "http".into()),
-            ("summarize".into(), "llm".into()),
-            ("validate".into(), "tool".into()),
-            ("review".into(), "human".into()),
-            ("publish".into(), "http".into()),
-        ]
-    }
-
-    // ---------------------------------------------------------------
-    // PipelineView::new
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn new_initializes_all_nodes_as_pending() {
-        let view = PipelineView::new("test_graph".into(), sample_nodes());
-        assert_eq!(view.graph_name, "test_graph");
-        assert_eq!(view.nodes.len(), 5);
-        assert_eq!(view.status, PipelineStatus::NotStarted);
-        assert!(view.current_node.is_none());
-        assert_eq!(view.elapsed_ms, 0);
-        assert!(view.log_lines.is_empty());
-
-        for node in &view.nodes {
-            assert_eq!(node.status, NodeStatus::Pending);
-            assert!(node.duration_ms.is_none());
+    fn make_flags(pipeline_name: &str, node_ids: &[&str]) -> TuiFlags {
+        TuiFlags {
+            graph: make_graph(node_ids),
+            run_id: "test-run".into(),
+            pipeline_name: pipeline_name.into(),
+            completed_node_ids: Vec::new(),
+            human_response_tx: None,
         }
     }
 
     #[test]
-    fn new_preserves_node_types() {
-        let view = PipelineView::new("g".into(), sample_nodes());
-        assert_eq!(view.nodes[0].id, "fetch");
-        assert_eq!(view.nodes[0].node_type, "http");
-        assert_eq!(view.nodes[1].id, "summarize");
-        assert_eq!(view.nodes[1].node_type, "llm");
+    fn init_creates_pending_nodes() {
+        let (model, _cmd) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        assert_eq!(model.nodes.len(), 3);
+        assert!(model.nodes.iter().all(|n| n.status == NodeStatus::Pending));
+        assert_eq!(model.pipeline_name, "test");
+        assert_eq!(model.finished_node_count, 0);
+        assert_eq!(model.status, PipelineStatus::Starting);
     }
 
     #[test]
-    fn new_with_empty_nodes() {
-        let view = PipelineView::new("empty".into(), vec![]);
-        assert_eq!(view.total_count(), 0);
-        assert_eq!(view.completed_count(), 0);
+    fn node_started_sets_running() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::NodeStarted {
+            node_id: "node_a".into(),
+            node_type: "codergen".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.nodes[0].status, NodeStatus::Running);
+        assert!(!model.log_entries.is_empty());
     }
 
-    // ---------------------------------------------------------------
-    // apply_event: PipelineStarted
-    // ---------------------------------------------------------------
-
     #[test]
-    fn apply_pipeline_started_sets_running() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.status, PipelineStatus::Running);
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Info);
-        assert!(view.log_lines[0].message.contains("started"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: NodeStarted
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_node_started_sets_running_and_current() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.current_node, Some("fetch".to_string()));
-        assert_eq!(view.nodes[0].status, NodeStatus::Running);
-        // Other nodes remain pending
-        assert_eq!(view.nodes[1].status, NodeStatus::Pending);
-        assert_eq!(view.log_lines.len(), 1);
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: NodeCompleted
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_node_completed_updates_status_and_duration() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 250,
-            timestamp: now(),
-        });
-
-        assert_eq!(view.nodes[0].status, NodeStatus::Completed);
-        assert_eq!(view.nodes[0].duration_ms, Some(250));
-        assert!(view.current_node.is_none());
-        assert_eq!(view.completed_count(), 1);
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: NodeFailed
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_node_failed_sets_failed_status() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "validate".into(),
-            node_type: "tool".into(),
-            timestamp: now(),
-        });
-
-        view.apply_event(&PipelineEvent::NodeFailed {
-            node_id: "validate".into(),
-            error: "schema mismatch".into(),
+    fn node_completed_increments_finished_count() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::NodeCompleted {
+            node_id: "node_a".into(),
+            outcome: smasher_attractor::state::Outcome::success(),
             duration_ms: 100,
-            timestamp: now(),
+            timestamp: Utc::now(),
         });
-
-        assert_eq!(view.nodes[2].status, NodeStatus::Failed);
-        assert_eq!(view.nodes[2].duration_ms, Some(100));
-        assert!(view.current_node.is_none());
-        assert_eq!(view.status, PipelineStatus::Failed);
-
-        // The error log line should be present
-        let error_lines: Vec<_> = view
-            .log_lines
-            .iter()
-            .filter(|l| l.level == LogLevel::Error)
-            .collect();
-        assert_eq!(error_lines.len(), 1);
-        assert!(error_lines[0].message.contains("schema mismatch"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: PipelineCompleted
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_pipeline_completed_sets_elapsed_and_status() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-
-        view.apply_event(&PipelineEvent::PipelineCompleted {
-            outcome: Outcome::success(),
-            total_nodes: 5,
-            duration_ms: 3400,
-            timestamp: now(),
-        });
-
-        assert_eq!(view.status, PipelineStatus::Completed);
-        assert_eq!(view.elapsed_ms, 3400);
-        assert!(view.current_node.is_none());
+        assert_eq!(model.nodes[0].status, NodeStatus::Completed);
+        assert_eq!(model.finished_node_count, 1);
     }
 
     #[test]
-    fn pipeline_completed_after_failure_stays_failed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
+    fn node_failed_sets_pipeline_failed() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::NodeFailed {
+            node_id: "node_a".into(),
+            error: "something went wrong".into(),
+            duration_ms: 50,
+            timestamp: Utc::now(),
         });
-
-        // A node fails first
-        view.apply_event(&PipelineEvent::NodeFailed {
-            node_id: "fetch".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-            timestamp: now(),
-        });
-
-        // Pipeline still completes (with failure outcome)
-        view.apply_event(&PipelineEvent::PipelineCompleted {
-            outcome: Outcome::failure("node failed"),
-            total_nodes: 5,
-            duration_ms: 5100,
-            timestamp: now(),
-        });
-
-        // Status should stay Failed, not transition to Completed
-        assert_eq!(view.status, PipelineStatus::Failed);
-        assert_eq!(view.elapsed_ms, 5100);
+        assert_eq!(model.nodes[0].status, NodeStatus::Failed);
+        assert_eq!(model.status, PipelineStatus::Failed);
+        assert_eq!(model.finished_node_count, 1);
     }
 
-    // ---------------------------------------------------------------
-    // apply_event: PipelineAborted
-    // ---------------------------------------------------------------
+    #[test]
+    fn pipeline_completed_stops_spinner_stopwatch_sets_done() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::PipelineCompleted {
+            outcome: smasher_attractor::state::Outcome::success(),
+            total_nodes: 1,
+            duration_ms: 500,
+            timestamp: Utc::now(),
+        });
+        assert!(model.done);
+        assert!(!model.spinner.is_spinning());
+        assert!(!model.stopwatch.running());
+        assert_eq!(model.status, PipelineStatus::Completed);
+    }
 
     #[test]
-    fn apply_pipeline_aborted() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-
-        view.apply_event(&PipelineEvent::PipelineAborted {
+    fn pipeline_aborted_sets_aborted_status() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &[]));
+        model.handle_pipeline_event(PipelineEvent::PipelineAborted {
             reason: "user cancelled".into(),
-            timestamp: now(),
+            timestamp: Utc::now(),
         });
-
-        assert_eq!(view.status, PipelineStatus::Aborted);
-        assert!(view.current_node.is_none());
-
-        let error_lines: Vec<_> = view
-            .log_lines
-            .iter()
-            .filter(|l| l.level == LogLevel::Error)
-            .collect();
-        assert_eq!(error_lines.len(), 1);
-        assert!(error_lines[0].message.contains("user cancelled"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: EdgeTraversed
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_edge_traversed_adds_debug_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::EdgeTraversed {
-            from: "fetch".into(),
-            to: "summarize".into(),
-            label: Some("success".into()),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Debug);
-        assert!(view.log_lines[0].message.contains("fetch"));
-        assert!(view.log_lines[0].message.contains("summarize"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: HumanPromptIssued
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_human_prompt_issued_adds_warning_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::HumanPromptIssued {
-            node_id: "review".into(),
-            question: "Approve deployment?".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Warning);
-        assert!(view.log_lines[0].message.contains("Approve deployment?"));
-        assert!(view.log_lines[0].message.contains("review"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: HumanResponseReceived
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_human_response_received_adds_info_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::HumanResponseReceived {
-            node_id: "review".into(),
-            response: "approved".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Info);
-        assert!(view.log_lines[0].message.contains("approved"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: ContextUpdated
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_context_updated_adds_debug_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::ContextUpdated {
-            key: "output_summary".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Debug);
-        assert!(view.log_lines[0].message.contains("output_summary"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: CheckpointCreated
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_checkpoint_created_adds_debug_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::CheckpointCreated {
-            node_id: "summarize".into(),
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Debug);
-        assert!(view.log_lines[0].message.contains("summarize"));
-    }
-
-    // ---------------------------------------------------------------
-    // apply_event: LoopRestarted
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_loop_restarted_adds_info_log() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::LoopRestarted {
-            from: "validate".into(),
-            to: "summarize".into(),
-            restart_count: 2,
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.log_lines[0].level, LogLevel::Info);
-        assert!(view.log_lines[0].message.contains("attempt 2"));
-        assert!(view.log_lines[0].message.contains("validate"));
-        assert!(view.log_lines[0].message.contains("summarize"));
-    }
-
-    // ---------------------------------------------------------------
-    // completed_count and total_count
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn completed_count_starts_at_zero() {
-        let view = PipelineView::new("g".into(), sample_nodes());
-        assert_eq!(view.completed_count(), 0);
+        assert!(model.done);
+        assert_eq!(model.status, PipelineStatus::Aborted);
     }
 
     #[test]
-    fn completed_count_tracks_completed_nodes() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
+    fn log_entries_appended_for_relevant_events() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        assert_eq!(model.log_entries.len(), 0);
+        model.handle_pipeline_event(PipelineEvent::PipelineStarted {
+            graph_name: "test".into(),
+            timestamp: Utc::now(),
         });
-        assert_eq!(view.completed_count(), 1);
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "summarize".into(),
-            outcome: Outcome::success(),
-            duration_ms: 200,
-            timestamp: now(),
+        assert_eq!(model.log_entries.len(), 1);
+        model.handle_pipeline_event(PipelineEvent::NodeStarted {
+            node_id: "node_a".into(),
+            node_type: "codergen".into(),
+            timestamp: Utc::now(),
         });
-        assert_eq!(view.completed_count(), 2);
+        assert_eq!(model.log_entries.len(), 2);
     }
 
     #[test]
-    fn total_count_matches_initial_nodes() {
-        let view = PipelineView::new("g".into(), sample_nodes());
-        assert_eq!(view.total_count(), 5);
+    fn context_and_checkpoint_events_are_silent() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::ContextUpdated {
+            key: "some_key".into(),
+            timestamp: Utc::now(),
+        });
+        model.handle_pipeline_event(PipelineEvent::CheckpointCreated {
+            node_id: "node_a".into(),
+            timestamp: Utc::now(),
+        });
+        // Neither event adds a log entry
+        assert_eq!(model.log_entries.len(), 0);
     }
 
     #[test]
-    fn failed_nodes_do_not_count_as_completed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-        view.apply_event(&PipelineEvent::NodeFailed {
-            node_id: "summarize".into(),
-            error: "crash".into(),
-            duration_ms: 50,
-            timestamp: now(),
-        });
-
-        assert_eq!(view.completed_count(), 1);
-    }
-
-    // ---------------------------------------------------------------
-    // format_status_line
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn format_status_line_not_started() {
-        let view = PipelineView::new("my_pipeline".into(), sample_nodes());
-        let line = view.format_status_line();
-        assert_eq!(line, "Not started: my_pipeline (0/5 nodes)");
+    fn panel_focus_toggles_via_toggle_focus() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a"]));
+        assert_eq!(model.focus, PanelFocus::Nodes);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Logs);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Console);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Nodes);
     }
 
     #[test]
-    fn format_status_line_running_with_current_node() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "summarize".into(),
-            node_type: "llm".into(),
-            timestamp: now(),
-        });
-
-        let line = view.format_status_line();
-        assert_eq!(line, "Running: summarize (1/5 nodes)");
+    fn node_navigation_stays_in_bounds() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        assert_eq!(model.selected_node, 0);
+        // k at top stays at 0
+        model.selected_node = model.selected_node.saturating_sub(1);
+        assert_eq!(model.selected_node, 0);
+        // j moves to 1
+        model.selected_node += 1;
+        assert_eq!(model.selected_node, 1);
+        // Move to last
+        model.selected_node = 2;
+        // Would-be next beyond end
+        let at_end = model.selected_node + 1 >= model.nodes.len();
+        assert!(at_end);
     }
 
     #[test]
-    fn format_status_line_running_with_elapsed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-        view.status = PipelineStatus::Running;
-        view.current_node = Some("node_3".into());
-        view.elapsed_ms = 1200;
+    fn render_log_lines_filters_by_selected_node() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
 
-        // Manually set a node as completed for count
-        view.nodes[0].status = NodeStatus::Completed;
-        view.nodes[1].status = NodeStatus::Completed;
-        view.nodes[2].status = NodeStatus::Completed;
-        view.nodes[3].status = NodeStatus::Completed;
+        model.push_log(LogEntry {
+            timestamp: Utc::now(),
+            node_id: Some("node_a".into()),
+            kind: LogKind::NodeStart,
+            content: "Node a started".into(),
+        });
+        model.push_log(LogEntry {
+            timestamp: Utc::now(),
+            node_id: Some("node_b".into()),
+            kind: LogKind::NodeStart,
+            content: "Node b started".into(),
+        });
+        model.push_log(LogEntry {
+            timestamp: Utc::now(),
+            node_id: None,
+            kind: LogKind::PipelineStart,
+            content: "Global entry".into(),
+        });
 
-        let line = view.format_status_line();
-        assert_eq!(line, "Running: node_3 (4/5 nodes, 1.2s)");
+        model.selected_node = 0; // selecting node_a
+        let lines = model.render_log_lines();
+        // Should show node_a entries + global entries, not node_b
+        assert_eq!(lines.len(), 2); // node_a + global
     }
 
     #[test]
-    fn format_status_line_completed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        // Complete all nodes
-        for node in &mut view.nodes {
-            node.status = NodeStatus::Completed;
-        }
-        view.status = PipelineStatus::Completed;
-        view.elapsed_ms = 3400;
-
-        let line = view.format_status_line();
-        assert_eq!(line, "Completed: 5/5 nodes in 3.4s");
+    fn key_j_moves_selection_down() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        assert_eq!(model.selected_node, 0);
+        model.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 1);
+        model.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 2);
+        // At last node — j should not go past end
+        model.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 2);
     }
 
     #[test]
-    fn format_status_line_failed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.nodes[0].status = NodeStatus::Completed;
-        view.nodes[1].status = NodeStatus::Completed;
-        view.nodes[2].status = NodeStatus::Failed;
-        view.status = PipelineStatus::Failed;
-        view.elapsed_ms = 2100;
-
-        let line = view.format_status_line();
-        assert_eq!(line, "Failed at validate (2/5 nodes, 2.1s)");
+    fn key_k_moves_selection_up() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        model.selected_node = 2;
+        model.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 1);
+        model.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 0);
+        // At first node — k should stay at 0
+        model.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(model.selected_node, 0);
     }
 
     #[test]
-    fn format_status_line_aborted() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.nodes[0].status = NodeStatus::Completed;
-        view.status = PipelineStatus::Aborted;
-        view.elapsed_ms = 500;
-
-        let line = view.format_status_line();
-        assert_eq!(line, "Aborted (1/5 nodes, 0.5s)");
-    }
-
-    #[test]
-    fn format_status_line_aborted_no_elapsed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-        view.status = PipelineStatus::Aborted;
-
-        let line = view.format_status_line();
-        assert_eq!(line, "Aborted (0/5 nodes)");
-    }
-
-    // ---------------------------------------------------------------
-    // NodeStatus transitions through events
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn node_transitions_pending_to_running_to_completed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        assert_eq!(view.nodes[0].status, NodeStatus::Pending);
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-        assert_eq!(view.nodes[0].status, NodeStatus::Running);
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-        assert_eq!(view.nodes[0].status, NodeStatus::Completed);
-    }
-
-    #[test]
-    fn node_transitions_pending_to_running_to_failed() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-        assert_eq!(view.nodes[0].status, NodeStatus::Running);
-
-        view.apply_event(&PipelineEvent::NodeFailed {
-            node_id: "fetch".into(),
-            error: "connection refused".into(),
-            duration_ms: 50,
-            timestamp: now(),
-        });
-        assert_eq!(view.nodes[0].status, NodeStatus::Failed);
-    }
-
-    // ---------------------------------------------------------------
-    // LogLine from events
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn log_lines_accumulate_in_order() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-
-        assert_eq!(view.log_lines.len(), 3);
-        assert_eq!(view.log_lines[0].level, LogLevel::Info);
-        assert_eq!(view.log_lines[1].level, LogLevel::Info);
-        assert_eq!(view.log_lines[2].level, LogLevel::Info);
-    }
-
-    #[test]
-    fn log_lines_have_timestamps() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-        let ts = now();
-
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: ts,
-        });
-
-        assert_eq!(view.log_lines[0].timestamp, ts);
-    }
-
-    #[test]
-    fn log_levels_correct_for_different_events() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-        let ts = now();
-
-        // Info: PipelineStarted
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: ts,
-        });
-
-        // Debug: EdgeTraversed
-        view.apply_event(&PipelineEvent::EdgeTraversed {
-            from: "a".into(),
-            to: "b".into(),
-            label: None,
-            timestamp: ts,
-        });
-
-        // Warning: HumanPromptIssued
-        view.apply_event(&PipelineEvent::HumanPromptIssued {
-            node_id: "review".into(),
-            question: "ok?".into(),
-            timestamp: ts,
-        });
-
-        // Error: NodeFailed
-        view.apply_event(&PipelineEvent::NodeFailed {
-            node_id: "fetch".into(),
-            error: "boom".into(),
-            duration_ms: 10,
-            timestamp: ts,
-        });
-
-        assert_eq!(view.log_lines[0].level, LogLevel::Info);
-        assert_eq!(view.log_lines[1].level, LogLevel::Debug);
-        assert_eq!(view.log_lines[2].level, LogLevel::Warning);
-        assert_eq!(view.log_lines[3].level, LogLevel::Error);
-    }
-
-    // ---------------------------------------------------------------
-    // Full pipeline lifecycle
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn full_successful_pipeline_lifecycle() {
-        let nodes = vec![
-            ("step1".into(), "llm".into()),
-            ("step2".into(), "tool".into()),
-            ("step3".into(), "llm".into()),
-        ];
-        let mut view = PipelineView::new("workflow".into(), nodes);
-        let ts = now();
-
-        // Start pipeline
-        view.apply_event(&PipelineEvent::PipelineStarted {
-            graph_name: "workflow".into(),
-            timestamp: ts,
-        });
-        assert_eq!(view.status, PipelineStatus::Running);
-
-        // Execute step1
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "step1".into(),
-            node_type: "llm".into(),
-            timestamp: ts,
-        });
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "step1".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: ts,
-        });
-        view.apply_event(&PipelineEvent::EdgeTraversed {
-            from: "step1".into(),
-            to: "step2".into(),
-            label: None,
-            timestamp: ts,
-        });
-
-        // Execute step2
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "step2".into(),
-            node_type: "tool".into(),
-            timestamp: ts,
-        });
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "step2".into(),
-            outcome: Outcome::success(),
-            duration_ms: 200,
-            timestamp: ts,
-        });
-        view.apply_event(&PipelineEvent::EdgeTraversed {
-            from: "step2".into(),
-            to: "step3".into(),
-            label: None,
-            timestamp: ts,
-        });
-
-        // Execute step3
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "step3".into(),
-            node_type: "llm".into(),
-            timestamp: ts,
-        });
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "step3".into(),
-            outcome: Outcome::success(),
-            duration_ms: 300,
-            timestamp: ts,
-        });
-
-        // Pipeline completed
-        view.apply_event(&PipelineEvent::PipelineCompleted {
-            outcome: Outcome::success(),
-            total_nodes: 3,
-            duration_ms: 650,
-            timestamp: ts,
-        });
-
-        assert_eq!(view.status, PipelineStatus::Completed);
-        assert_eq!(view.completed_count(), 3);
-        assert_eq!(view.total_count(), 3);
-        assert_eq!(view.elapsed_ms, 650);
-        assert!(view.current_node.is_none());
-        assert_eq!(view.format_status_line(), "Completed: 3/3 nodes in 0.7s");
-    }
-
-    // ---------------------------------------------------------------
-    // Display impls
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn node_status_display() {
-        assert_eq!(NodeStatus::Pending.to_string(), "pending");
-        assert_eq!(NodeStatus::Running.to_string(), "running");
-        assert_eq!(NodeStatus::Completed.to_string(), "completed");
-        assert_eq!(NodeStatus::Failed.to_string(), "failed");
-        assert_eq!(NodeStatus::Skipped.to_string(), "skipped");
-    }
-
-    #[test]
-    fn pipeline_status_display() {
-        assert_eq!(PipelineStatus::NotStarted.to_string(), "not started");
-        assert_eq!(PipelineStatus::Running.to_string(), "running");
-        assert_eq!(PipelineStatus::Completed.to_string(), "completed");
-        assert_eq!(PipelineStatus::Failed.to_string(), "failed");
-        assert_eq!(PipelineStatus::Aborted.to_string(), "aborted");
-    }
-
-    #[test]
-    fn log_level_display() {
-        assert_eq!(LogLevel::Info.to_string(), "INFO");
-        assert_eq!(LogLevel::Warning.to_string(), "WARN");
-        assert_eq!(LogLevel::Error.to_string(), "ERROR");
-        assert_eq!(LogLevel::Debug.to_string(), "DEBUG");
-    }
-
-    // ---------------------------------------------------------------
-    // Event for unknown node id (no crash)
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_event_for_unknown_node_does_not_crash() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeStarted {
-            node_id: "nonexistent".into(),
-            node_type: "mystery".into(),
-            timestamp: now(),
-        });
-
-        // current_node is set even though it doesn't exist in the nodes list
-        assert_eq!(view.current_node, Some("nonexistent".to_string()));
-        // No node in the list changed status
-        for node in &view.nodes {
-            assert_eq!(node.status, NodeStatus::Pending);
-        }
-    }
-
-    #[test]
-    fn apply_node_completed_for_unknown_node_does_not_crash() {
-        let mut view = PipelineView::new("g".into(), sample_nodes());
-
-        view.apply_event(&PipelineEvent::NodeCompleted {
-            node_id: "ghost".into(),
-            outcome: Outcome::success(),
-            duration_ms: 42,
-            timestamp: now(),
-        });
-
-        // Nothing breaks, log line is still added
-        assert_eq!(view.log_lines.len(), 1);
-        assert_eq!(view.completed_count(), 0);
-    }
-
-    // ---------------------------------------------------------------
-    // TuiRunner::new
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn tui_runner_new_initializes_correctly() {
-        let runner = TuiRunner::new("test_graph".into(), sample_nodes());
-
-        assert_eq!(runner.view().graph_name, "test_graph");
-        assert_eq!(runner.view().nodes.len(), 5);
-        assert_eq!(runner.view().status, PipelineStatus::NotStarted);
-        assert_eq!(runner.event_count(), 0);
-        assert!(runner.last_update.is_none());
-    }
-
-    #[test]
-    fn tui_runner_new_with_empty_nodes() {
-        let runner = TuiRunner::new("empty".into(), vec![]);
-
-        assert_eq!(runner.view().total_count(), 0);
-        assert_eq!(runner.event_count(), 0);
-        assert!(!runner.is_complete());
-    }
-
-    // ---------------------------------------------------------------
-    // TuiRunner::process_event
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn tui_runner_process_event_updates_count_and_view() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-
-        let ts = now();
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: ts,
-        });
-
-        assert_eq!(runner.event_count(), 1);
-        assert_eq!(runner.last_update, Some(ts));
-        assert_eq!(runner.view().status, PipelineStatus::Running);
-    }
-
-    #[test]
-    fn tui_runner_process_event_increments_counter_per_event() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-
-        assert_eq!(runner.event_count(), 3);
-        assert_eq!(runner.view().completed_count(), 1);
-    }
-
-    #[test]
-    fn tui_runner_last_update_tracks_latest_event_timestamp() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-
-        let ts1 = now();
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: ts1,
-        });
-        assert_eq!(runner.last_update, Some(ts1));
-
-        let ts2 = now();
-        runner.process_event(&PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: ts2,
-        });
-        assert_eq!(runner.last_update, Some(ts2));
-    }
-
-    // ---------------------------------------------------------------
-    // TuiRunner::render_line
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn tui_runner_render_line_delegates_to_view() {
-        let runner = TuiRunner::new("my_pipeline".into(), sample_nodes());
-        assert_eq!(runner.render_line(), "Not started: my_pipeline (0/5 nodes)");
-    }
-
-    // ---------------------------------------------------------------
-    // TuiRunner::is_complete
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn tui_runner_is_complete_false_for_not_started() {
-        let runner = TuiRunner::new("g".into(), sample_nodes());
-        assert!(!runner.is_complete());
-    }
-
-    #[test]
-    fn tui_runner_is_complete_false_for_running() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-        assert!(!runner.is_complete());
-    }
-
-    #[test]
-    fn tui_runner_is_complete_true_for_completed() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::PipelineCompleted {
-            outcome: Outcome::success(),
-            total_nodes: 5,
-            duration_ms: 1000,
-            timestamp: now(),
-        });
-        assert!(runner.is_complete());
-    }
-
-    #[test]
-    fn tui_runner_is_complete_true_for_failed() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-        runner.process_event(&PipelineEvent::NodeFailed {
-            node_id: "fetch".into(),
-            error: "boom".into(),
-            duration_ms: 50,
-            timestamp: now(),
-        });
-        assert!(runner.is_complete());
-    }
-
-    #[test]
-    fn tui_runner_is_complete_true_for_aborted() {
-        let mut runner = TuiRunner::new("g".into(), sample_nodes());
-        runner.process_event(&PipelineEvent::PipelineAborted {
-            reason: "user cancelled".into(),
-            timestamp: now(),
-        });
-        assert!(runner.is_complete());
-    }
-
-    // ---------------------------------------------------------------
-    // TuiRunner event processing sequence
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn tui_runner_full_event_sequence() {
-        let nodes = vec![
-            ("step1".into(), "llm".into()),
-            ("step2".into(), "tool".into()),
-        ];
-        let mut runner = TuiRunner::new("workflow".into(), nodes);
-
-        // Pipeline starts
-        runner.process_event(&PipelineEvent::PipelineStarted {
-            graph_name: "workflow".into(),
-            timestamp: now(),
-        });
-        assert!(!runner.is_complete());
-        assert_eq!(runner.event_count(), 1);
-
-        // Node executes
-        runner.process_event(&PipelineEvent::NodeStarted {
-            node_id: "step1".into(),
-            node_type: "llm".into(),
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::NodeCompleted {
-            node_id: "step1".into(),
-            outcome: Outcome::success(),
-            duration_ms: 100,
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::NodeStarted {
-            node_id: "step2".into(),
-            node_type: "tool".into(),
-            timestamp: now(),
-        });
-        runner.process_event(&PipelineEvent::NodeCompleted {
-            node_id: "step2".into(),
-            outcome: Outcome::success(),
-            duration_ms: 200,
-            timestamp: now(),
-        });
-
-        // Pipeline completes
-        runner.process_event(&PipelineEvent::PipelineCompleted {
-            outcome: Outcome::success(),
-            total_nodes: 2,
-            duration_ms: 400,
-            timestamp: now(),
-        });
-
-        assert!(runner.is_complete());
-        assert_eq!(runner.event_count(), 6);
-        assert_eq!(runner.view().completed_count(), 2);
-        assert_eq!(runner.render_line(), "Completed: 2/2 nodes in 0.4s");
-    }
-
-    // ---------------------------------------------------------------
-    // DisplayFormat basics
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn display_format_variants_are_distinct() {
-        assert_ne!(DisplayFormat::Compact, DisplayFormat::Verbose);
-        assert_ne!(DisplayFormat::Json, DisplayFormat::Silent);
-        assert_eq!(DisplayFormat::Compact, DisplayFormat::Compact);
-    }
-
-    // ---------------------------------------------------------------
-    // format_event: Compact
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn format_event_compact_pipeline_started() {
-        let event = PipelineEvent::PipelineStarted {
-            graph_name: "my_graph".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Pipeline 'my_graph' started".to_string()));
-    }
-
-    #[test]
-    fn format_event_compact_node_started() {
-        let event = PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Node 'fetch' (http) started".to_string()));
-    }
-
-    #[test]
-    fn format_event_compact_node_completed() {
-        let event = PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 250,
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Node 'fetch' completed in 250ms".to_string()));
-    }
-
-    #[test]
-    fn format_event_compact_node_failed() {
-        let event = PipelineEvent::NodeFailed {
-            node_id: "validate".into(),
-            error: "schema mismatch".into(),
-            duration_ms: 100,
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(
-            result,
-            Some("Node 'validate' failed: schema mismatch".to_string())
+    fn key_q_returns_non_none_command() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a"]));
+        let cmd = model.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(
+            !cmd.is_none(),
+            "q key should return a quit command, not Command::none()"
         );
     }
 
     #[test]
-    fn format_event_compact_pipeline_completed() {
-        let event = PipelineEvent::PipelineCompleted {
-            outcome: Outcome::success(),
-            total_nodes: 5,
-            duration_ms: 3400,
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Pipeline completed in 3400ms".to_string()));
+    fn key_tab_cycles_three_panel_focus() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a"]));
+        assert_eq!(model.focus, PanelFocus::Nodes);
+        model.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(model.focus, PanelFocus::Logs);
+        model.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(model.focus, PanelFocus::Console);
+        model.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(model.focus, PanelFocus::Nodes);
     }
 
     #[test]
-    fn format_event_compact_pipeline_aborted() {
-        let event = PipelineEvent::PipelineAborted {
-            reason: "user cancelled".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Pipeline aborted: user cancelled".to_string()));
+    fn agent_tool_call_started_adds_log_entry() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        let before = model.log_entries.len();
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: "cargo test".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.log_entries.len(), before + 1);
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.node_id.as_deref(), Some("node_a"));
+        assert!(entry.content.contains("bash"));
+        assert!(entry.content.contains("cargo test"));
     }
 
     #[test]
-    fn format_event_compact_edge_traversed() {
-        let event = PipelineEvent::EdgeTraversed {
-            from: "a".into(),
-            to: "b".into(),
-            label: Some("success".into()),
-            timestamp: now(),
+    fn agent_message_adds_log_entry() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        let before = model.log_entries.len();
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "I'll implement this now".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.log_entries.len(), before + 1);
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.node_id.as_deref(), Some("node_a"));
+        assert!(entry.content.contains("implement"));
+    }
+
+    #[test]
+    fn log_entries_scoped_to_selected_node() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "alpha".into(),
+            timestamp: Utc::now(),
+        });
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_b".into(),
+            text: "beta".into(),
+            timestamp: Utc::now(),
+        });
+
+        model.selected_node = 0;
+        let lines_a = model.render_log_lines();
+        assert_eq!(lines_a.len(), 1);
+        assert!(lines_a[0].to_string().contains("alpha"));
+
+        model.selected_node = 1;
+        let lines_b = model.render_log_lines();
+        assert_eq!(lines_b.len(), 1);
+        assert!(lines_b[0].to_string().contains("beta"));
+    }
+
+    #[test]
+    fn console_entries_populated_by_pipeline_events() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
+        assert_eq!(model.console_entries.len(), 0);
+
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "working on alpha".into(),
+            timestamp: Utc::now(),
+        });
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_b".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: String::new(),
+            timestamp: Utc::now(),
+        });
+
+        // Both events should appear in console (unified stream)
+        assert_eq!(model.console_entries.len(), 2);
+        assert_eq!(model.console_entries[0].node_id.as_deref(), Some("node_a"));
+        assert_eq!(model.console_entries[1].node_id.as_deref(), Some("node_b"));
+    }
+
+    #[test]
+    fn console_lines_show_all_nodes_with_prefix() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
+
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "alpha work".into(),
+            timestamp: Utc::now(),
+        });
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_b".into(),
+            text: "beta work".into(),
+            timestamp: Utc::now(),
+        });
+
+        let lines = model.render_console_lines();
+        assert_eq!(lines.len(), 2);
+        // Console lines should contain both node_a and node_b entries (unified)
+        let text_0 = lines[0].to_string();
+        let text_1 = lines[1].to_string();
+        assert!(
+            text_0.contains("node_a"),
+            "expected node_a prefix, got: {text_0}"
+        );
+        assert!(
+            text_1.contains("node_b"),
+            "expected node_b prefix, got: {text_1}"
+        );
+    }
+
+    #[test]
+    fn tool_call_started_shows_empty_preview_without_extra_space() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: String::new(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.content, "  [tool] bash...");
+    }
+
+    #[test]
+    fn tool_call_completed_shows_error_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallCompleted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            duration_ms: 500,
+            is_error: true,
+            result_preview: "command not found: ffmpeg".into(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert!(entry.content.contains("ERR"));
+        assert!(entry.content.contains("command not found: ffmpeg"));
+    }
+
+    #[test]
+    fn tool_call_completed_ok_does_not_show_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallCompleted {
+            node_id: "node_a".into(),
+            tool_name: "Read".into(),
+            tool_call_id: "call_001".into(),
+            duration_ms: 12,
+            is_error: false,
+            result_preview: "file contents here".into(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.content, "  [tool] Read ok (12ms)");
+    }
+
+    #[test]
+    fn token_usage_accumulates() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
+        assert_eq!(model.total_input_tokens, 0);
+        assert_eq!(model.total_output_tokens, 0);
+
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cost_usd: 0.03,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.total_input_tokens, 1000);
+        assert_eq!(model.total_output_tokens, 500);
+        assert!((model.total_cost_usd - 0.03).abs() < f64::EPSILON);
+
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_b".into(),
+            input_tokens: 2000,
+            output_tokens: 800,
+            cost_usd: 0.05,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.total_input_tokens, 3000);
+        assert_eq!(model.total_output_tokens, 1300);
+    }
+
+    #[test]
+    fn format_token_count_formats_correctly() {
+        assert_eq!(format_token_count(500), "500");
+        assert_eq!(format_token_count(1500), "1.5k");
+        assert_eq!(format_token_count(45300), "45.3k");
+        assert_eq!(format_token_count(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn focus_toggle_cycles_nodes_logs_console() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a"]));
+        assert_eq!(model.focus, PanelFocus::Nodes);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Logs);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Console);
+        model.toggle_focus();
+        assert_eq!(model.focus, PanelFocus::Nodes);
+    }
+
+    #[test]
+    fn resumed_nodes_marked_completed_on_init() {
+        let flags = TuiFlags {
+            graph: make_graph(&["a", "b", "c", "d"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: vec!["a".into(), "b".into()],
+            human_response_tx: None,
         };
-        let result = format_event(&event, &DisplayFormat::Compact);
-        assert_eq!(result, Some("Edge: a -> b".to_string()));
+        let (model, _) = PipelineTui::init(flags);
+        assert_eq!(model.nodes[0].status, NodeStatus::Completed); // a
+        assert_eq!(model.nodes[1].status, NodeStatus::Completed); // b
+        assert_eq!(model.nodes[2].status, NodeStatus::Pending); // c
+        assert_eq!(model.nodes[3].status, NodeStatus::Pending); // d
+        assert_eq!(model.finished_node_count, 2);
+    }
+
+    #[test]
+    fn node_scroll_follows_selection() {
+        let (mut model, _) = PipelineTui::init(make_flags(
+            "test",
+            &["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"],
+        ));
+        // Simulate a small panel (3 rows visible)
+        model.node_panel_height.set(3);
+
+        assert_eq!(model.node_scroll_offset, 0);
+        assert_eq!(model.selected_node, 0);
+
+        // Move down past visible area
+        model.selected_node = 4;
+        model.scroll_nodes_to_selected();
+        // Offset should adjust so node 4 is visible: 4 - 3 + 1 = 2
+        assert_eq!(model.node_scroll_offset, 2);
+
+        // Move back up past visible area
+        model.selected_node = 1;
+        model.scroll_nodes_to_selected();
+        assert_eq!(model.node_scroll_offset, 1);
+
+        // Jump to top
+        model.selected_node = 0;
+        model.scroll_nodes_to_selected();
+        assert_eq!(model.node_scroll_offset, 0);
+    }
+
+    #[test]
+    fn node_started_auto_selects_and_scrolls() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c", "d", "e"]));
+        model.node_panel_height.set(2);
+
+        // Start node at index 4 (beyond visible)
+        model.handle_pipeline_event(PipelineEvent::NodeStarted {
+            node_id: "e".into(),
+            node_type: "codergen".into(),
+            timestamp: Utc::now(),
+        });
+
+        assert_eq!(model.selected_node, 4);
+        // Should have scrolled so node 4 is visible
+        assert!(model.node_scroll_offset > 0);
+    }
+
+    #[test]
+    fn format_cost_formats_correctly() {
+        assert_eq!(format_cost(0.01), "$0.01");
+        assert_eq!(format_cost(0.123), "$0.12");
+        assert_eq!(format_cost(1.5), "$1.50");
+        assert_eq!(format_cost(9.99), "$9.99");
+        assert_eq!(format_cost(10.0), "$10.0");
+        assert_eq!(format_cost(42.567), "$42.6");
+    }
+
+    #[test]
+    fn file_tracking_from_write_tool_calls() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        assert!(model.files_touched.is_empty());
+
+        // Write tool should track file
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: "src/lib.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 1);
+        assert!(model.files_touched.contains("src/lib.rs"));
+
+        // Edit tool should also track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "edit_file".into(),
+            tool_call_id: "call_002".into(),
+            input_preview: "src/main.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+
+        // Same file again should not increase count (HashSet)
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_003".into(),
+            input_preview: "src/lib.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+
+        // Non-file tools should not track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_004".into(),
+            input_preview: "cargo test".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+    }
+
+    #[test]
+    fn file_tracking_ignores_empty_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+
+        // Write with empty preview should not track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: String::new(),
+            timestamp: Utc::now(),
+        });
+        assert!(model.files_touched.is_empty());
+    }
+
+    #[test]
+    fn cost_accumulates_from_token_usage_events() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        assert!((model.total_cost_usd).abs() < f64::EPSILON);
+
+        // Cost-only event (from result line: 0 tokens, nonzero cost)
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.05,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.05).abs() < f64::EPSILON);
+        // Zero tokens should not change token totals
+        assert_eq!(model.total_input_tokens, 0);
+        assert_eq!(model.total_output_tokens, 0);
+
+        // Mixed event with both tokens and cost
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 500,
+            output_tokens: 200,
+            cost_usd: 0.10,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.15).abs() < f64::EPSILON);
+        assert_eq!(model.total_input_tokens, 500);
+        assert_eq!(model.total_output_tokens, 200);
+
+        // Zero cost should not change cost total
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cost_usd: 0.0,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.15).abs() < f64::EPSILON);
+        assert_eq!(model.total_input_tokens, 600);
+    }
+
+    #[test]
+    fn console_lines_include_timestamps() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+
+        let ts = Utc::now();
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "hello".into(),
+            timestamp: ts,
+        });
+
+        let lines = model.render_console_lines();
+        assert_eq!(lines.len(), 1);
+        let rendered = lines[0].to_string();
+        // Should contain HH:MM:SS timestamp format
+        let expected_ts = ts.format("%H:%M:%S").to_string();
+        assert!(
+            rendered.contains(&expected_ts),
+            "expected timestamp {expected_ts} in rendered line: {rendered}"
+        );
     }
 
     // ---------------------------------------------------------------
-    // format_event: Verbose
+    // Human gate input overlay tests
     // ---------------------------------------------------------------
 
     #[test]
-    fn format_event_verbose_contains_timestamp_and_kind() {
-        let event = PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Verbose).unwrap();
-        assert!(result.starts_with('['));
-        assert!(result.contains("pipeline_started"));
-        assert!(result.contains("graph=g"));
+    fn human_prompt_request_activates_overlay() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+
+        assert!(model.pending_human_question.is_none());
+
+        model.update(Msg::HumanPromptRequest {
+            question: "Continue?".into(),
+        });
+
+        assert_eq!(model.pending_human_question.as_deref(), Some("Continue?"));
+        assert!(model.human_input_buffer.is_empty());
     }
 
     #[test]
-    fn format_event_verbose_node_started() {
-        let event = PipelineEvent::NodeStarted {
-            node_id: "fetch".into(),
-            node_type: "http".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Verbose).unwrap();
-        assert!(result.contains("node_started"));
-        assert!(result.contains("node=fetch"));
-        assert!(result.contains("type=http"));
+    fn human_input_typing_builds_buffer() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Name?".into(),
+        });
+
+        // Type "hi"
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(model.human_input_buffer, "hi");
+        // Overlay still active
+        assert!(model.pending_human_question.is_some());
     }
 
     #[test]
-    fn format_event_verbose_node_failed() {
-        let event = PipelineEvent::NodeFailed {
-            node_id: "step1".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Verbose).unwrap();
-        assert!(result.contains("node_failed"));
-        assert!(result.contains("node=step1"));
-        assert!(result.contains("error=\"timeout\""));
-        assert!(result.contains("duration=5000ms"));
-    }
+    fn human_input_backspace_removes_char() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["gate"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Name?".into(),
+        });
 
-    // ---------------------------------------------------------------
-    // format_event: Json
-    // ---------------------------------------------------------------
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
 
-    #[test]
-    fn format_event_json_produces_valid_json() {
-        let event = PipelineEvent::PipelineStarted {
-            graph_name: "my_graph".into(),
-            timestamp: now(),
-        };
-        let result = format_event(&event, &DisplayFormat::Json).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["kind"], "pipeline_started");
-        assert_eq!(parsed["graph_name"], "my_graph");
+        assert_eq!(model.human_input_buffer, "a");
     }
 
     #[test]
-    fn format_event_json_node_completed() {
-        let event = PipelineEvent::NodeCompleted {
-            node_id: "fetch".into(),
-            outcome: Outcome::success(),
-            duration_ms: 250,
-            timestamp: now(),
+    fn human_input_enter_submits_and_clears() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let flags = TuiFlags {
+            graph: make_graph(&["gate"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: Vec::new(),
+            human_response_tx: Some(tx),
         };
-        let result = format_event(&event, &DisplayFormat::Json).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["kind"], "node_completed");
-        assert_eq!(parsed["node_id"], "fetch");
-        assert_eq!(parsed["duration_ms"], 250);
-    }
+        let (mut model, _) = PipelineTui::init(flags);
+        model.update(Msg::HumanPromptRequest {
+            question: "Answer?".into(),
+        });
 
-    // ---------------------------------------------------------------
-    // format_event: Silent
-    // ---------------------------------------------------------------
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
 
-    #[test]
-    fn format_event_silent_returns_none() {
-        let event = PipelineEvent::PipelineStarted {
-            graph_name: "g".into(),
-            timestamp: now(),
-        };
-        assert!(format_event(&event, &DisplayFormat::Silent).is_none());
-    }
+        // Overlay cleared
+        assert!(model.pending_human_question.is_none());
+        assert!(model.human_input_buffer.is_empty());
 
-    #[test]
-    fn format_event_silent_returns_none_for_all_event_types() {
-        let ts = now();
-        let events = vec![
-            PipelineEvent::PipelineStarted {
-                graph_name: "g".into(),
-                timestamp: ts,
-            },
-            PipelineEvent::NodeStarted {
-                node_id: "n".into(),
-                node_type: "t".into(),
-                timestamp: ts,
-            },
-            PipelineEvent::NodeCompleted {
-                node_id: "n".into(),
-                outcome: Outcome::success(),
-                duration_ms: 100,
-                timestamp: ts,
-            },
-            PipelineEvent::NodeFailed {
-                node_id: "n".into(),
-                error: "e".into(),
-                duration_ms: 10,
-                timestamp: ts,
-            },
-            PipelineEvent::PipelineCompleted {
-                outcome: Outcome::success(),
-                total_nodes: 1,
-                duration_ms: 200,
-                timestamp: ts,
-            },
-            PipelineEvent::PipelineAborted {
-                reason: "r".into(),
-                timestamp: ts,
-            },
-        ];
-
-        for event in &events {
-            assert!(
-                format_event(event, &DisplayFormat::Silent).is_none(),
-                "Silent should return None for all events"
-            );
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // GraphView tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn graph_view_from_render_output() {
-        use smasher_attractor::rendering::{RenderFormat, RenderOutput};
-
-        let output = RenderOutput {
-            format: RenderFormat::Dot,
-            content: "digraph { a -> b }".as_bytes().to_vec(),
-        };
-        let ts = now();
-        let view = GraphView::from_render_output(output, ts);
-
-        assert_eq!(view.format, RenderFormat::Dot);
-        assert_eq!(view.as_text(), Some("digraph { a -> b }"));
-        assert_eq!(view.rendered_at, ts);
-        assert!(!view.stale);
+        // Response sent through channel
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response, "yes");
     }
 
     #[test]
-    fn graph_view_mark_stale() {
-        use smasher_attractor::rendering::{RenderFormat, RenderOutput};
-
-        let output = RenderOutput {
-            format: RenderFormat::Svg,
-            content: "<svg></svg>".as_bytes().to_vec(),
+    fn human_input_esc_cancels_with_empty_response() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let flags = TuiFlags {
+            graph: make_graph(&["gate"]),
+            run_id: "test-run".into(),
+            pipeline_name: "test".into(),
+            completed_node_ids: Vec::new(),
+            human_response_tx: Some(tx),
         };
-        let mut view = GraphView::from_render_output(output, now());
+        let (mut model, _) = PipelineTui::init(flags);
+        model.update(Msg::HumanPromptRequest {
+            question: "Answer?".into(),
+        });
 
-        assert!(!view.stale);
-        view.mark_stale();
-        assert!(view.stale);
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+
+        // Overlay cleared
+        assert!(model.pending_human_question.is_none());
+
+        // Empty response sent
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response, "");
     }
 
     #[test]
-    fn graph_view_mark_fresh() {
-        use smasher_attractor::rendering::{RenderFormat, RenderOutput};
+    fn keys_routed_to_input_while_overlay_active() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["a", "b", "c"]));
+        model.update(Msg::HumanPromptRequest {
+            question: "Q?".into(),
+        });
 
-        let output = RenderOutput {
-            format: RenderFormat::Svg,
-            content: "<svg>old</svg>".as_bytes().to_vec(),
-        };
-        let mut view = GraphView::from_render_output(output, now());
-        view.mark_stale();
-        assert!(view.stale);
+        // 'q' should NOT quit when overlay is active — it types 'q' instead
+        model.update(Msg::KeyPress(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
 
-        let ts2 = now();
-        view.mark_fresh("<svg>updated</svg>".as_bytes().to_vec(), ts2);
-
-        assert!(!view.stale);
-        assert_eq!(view.as_text(), Some("<svg>updated</svg>"));
-        assert_eq!(view.rendered_at, ts2);
-    }
-
-    #[test]
-    fn graph_view_as_text_returns_none_for_binary() {
-        use smasher_attractor::rendering::{RenderFormat, RenderOutput};
-
-        let output = RenderOutput {
-            format: RenderFormat::Png,
-            content: vec![0xFF, 0xFE, 0x00],
-        };
-        let view = GraphView::from_render_output(output, now());
-
-        assert!(view.as_text().is_none());
-    }
-
-    #[test]
-    fn graph_view_content_len() {
-        use smasher_attractor::rendering::{RenderFormat, RenderOutput};
-
-        let output = RenderOutput {
-            format: RenderFormat::Dot,
-            content: "digraph {}".as_bytes().to_vec(),
-        };
-        let view = GraphView::from_render_output(output, now());
-
-        assert_eq!(view.content_len(), 10);
+        assert_eq!(model.human_input_buffer, "q");
+        // Model should NOT be done (would be done if 'q' was handled as quit)
+        assert!(!model.done);
     }
 }

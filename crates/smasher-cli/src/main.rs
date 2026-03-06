@@ -8,6 +8,7 @@ mod cli_spec;
 mod complete;
 mod error;
 mod gitutil;
+mod headless;
 mod ingest;
 #[cfg(test)]
 mod layout_check;

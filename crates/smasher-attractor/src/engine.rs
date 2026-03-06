@@ -40,7 +40,7 @@ use crate::edge::{EdgeSelectionError, select_edge};
 use crate::events::{PipelineEvent, PipelineEventEmitter};
 use crate::fidelity::{FidelityConfig, FidelityProcessor};
 use crate::goals::{GoalError, GoalGate};
-use crate::graph::{Graph, NodeAttrValue, NodeType};
+use crate::graph::{Graph, GraphNode, NodeAttrValue, NodeType};
 use crate::handler::{HandlerError, HandlerRegistry};
 use crate::retry::{RetryPolicy, RetryState, compute_delay};
 use crate::state::{Checkpoint, Context, Outcome};
@@ -163,6 +163,8 @@ pub enum EngineError {
         error: String,
         count: u32,
     },
+    #[error("node '{node_id}' failed with no available route: {error}")]
+    UnroutableFailure { node_id: String, error: String },
     #[error("composition error: {0}")]
     Composition(#[from] crate::composition::CompositionError),
 }
@@ -222,6 +224,43 @@ pub struct ExecutionResult {
     pub loop_restarts: LoopCounter,
     /// Aggregate timing and outcome statistics for this run.
     pub stats: PipelineStats,
+}
+
+/// Resolve a retry target for a node using the spec's 4-level fallback chain.
+///
+/// Checks in order (spec section 3.4):
+/// 1. node.retry_target
+/// 2. node.fallback_retry_target
+/// 3. graph.retry_target (graph-level attribute)
+/// 4. graph.fallback_retry_target (graph-level attribute)
+///
+/// Returns None if no retry target is found at any level.
+pub(crate) fn resolve_retry_target(node: &GraphNode, graph: &Graph) -> Option<String> {
+    // 1. Node-level retry_target
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 2. Node-level fallback_retry_target
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("fallback_retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 3. Graph-level retry_target
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    // 4. Graph-level fallback_retry_target
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("fallback_retry_target") {
+        if !t.is_empty() {
+            return Some(t.clone());
+        }
+    }
+    None
 }
 
 /// The core pipeline execution engine.
@@ -336,6 +375,7 @@ impl Engine {
     ///     ],
     ///     default_node_attrs: HashMap::new(),
     ///     default_edge_attrs: HashMap::new(),
+    ///     graph_attrs: HashMap::new(),
     /// };
     ///
     /// let mut registry = HandlerRegistry::new();
@@ -658,16 +698,34 @@ impl Engine {
                 }
             }
 
-            // If exit node, check goal gates before exiting.
-            // When goals are unsatisfied and the exit node has a `retry_target`
-            // attribute, route back to that node instead of exiting.
+            // If exit node, check goal gates before exiting (spec section 3.4).
+            // Outcome-aware: goals must have SUCCESS or PARTIAL_SUCCESS, not just visited.
+            // Retry target comes from the failed goal node's 4-level fallback chain.
             if node.node_type == NodeType::Exit {
-                if !self.goal_gate.all_met(&visited_nodes)
-                    && let Some(NodeAttrValue::String(target)) =
-                        node.attrs.get("retry_target")
-                {
-                    current_node_id = target.clone();
-                    continue;
+                if let Err(unsatisfied) = self.goal_gate.check_outcomes(&node_outcomes) {
+                    if let Some(failed_node) = self.graph.node(&unsatisfied.node_id)
+                        && let Some(target) = resolve_retry_target(failed_node, &self.graph)
+                    {
+                        // Validate retry target exists in graph
+                        if self.graph.node(&target).is_none() {
+                            return Err(EngineError::NodeNotFound {
+                                node_id: target,
+                            });
+                        }
+                        tracing::info!(
+                            goal = %unsatisfied.node_id,
+                            reason = %unsatisfied.reason,
+                            retry_target = %target,
+                            "goal gate unsatisfied, routing to retry target"
+                        );
+                        current_node_id = target;
+                        continue;
+                    }
+                    // No retry target at any level — fail with all unsatisfied goals
+                    return Err(EngineError::GoalEnforcement(
+                        self.goal_gate.enforce_outcomes(&node_outcomes)
+                            .unwrap_err()
+                    ));
                 }
                 break;
             }
@@ -743,7 +801,43 @@ impl Engine {
                     current_node_id = edge.to.clone();
                 }
                 None => {
-                    // No outgoing edge, end execution
+                    // Spec 3.7: When a node fails and no edge matches,
+                    // try the node's retry_target fallback chain.
+                    if outcome.is_failure() {
+                        if let Some(target) = resolve_retry_target(node, &self.graph) {
+                            // Validate retry target exists in graph
+                            if self.graph.node(&target).is_none() {
+                                return Err(EngineError::NodeNotFound {
+                                    node_id: target,
+                                });
+                            }
+                            tracing::info!(
+                                node = %current_node_id,
+                                retry_target = %target,
+                                "no fail edge found, routing to retry target"
+                            );
+                            current_node_id = target;
+                            continue;
+                        }
+                        // Spec 3.7 step 4: no failure route found — pipeline fails
+                        // with the stage's failure reason.
+                        let error_msg = match &outcome {
+                            Outcome::Failure { error, .. } => error.clone(),
+                            _ => "unknown failure".to_string(),
+                        };
+                        self.emit(PipelineEvent::PipelineAborted {
+                            reason: format!(
+                                "node '{}' failed with no available route: {}",
+                                current_node_id, error_msg
+                            ),
+                            timestamp: Utc::now(),
+                        });
+                        return Err(EngineError::UnroutableFailure {
+                            node_id: current_node_id.clone(),
+                            error: error_msg,
+                        });
+                    }
+                    // Success/skip with no outgoing edge — end execution.
                     break;
                 }
             }
@@ -760,8 +854,9 @@ impl Engine {
         // Propagate any error from the loop.
         loop_result?;
 
-        // Enforce goal gates
-        self.goal_gate.enforce(&visited_nodes)?;
+        // Final goal gate enforcement (outcome-aware, spec section 3.4).
+        // Reached when the loop exits without hitting an Exit node (no outgoing edge).
+        self.goal_gate.enforce_outcomes(&node_outcomes)?;
 
         let pipeline_duration_ms = pipeline_start.elapsed().as_millis() as u64;
 
@@ -901,6 +996,7 @@ mod tests {
             edges,
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 
@@ -1621,6 +1717,7 @@ mod tests {
             edges: vec![make_edge("start", "exit")],
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         };
         let config = EngineConfig {
             max_steps: 1000,
@@ -2900,21 +2997,18 @@ mod tests {
     async fn unsatisfied_goals_retry_target_routes_back() {
         let mut goal_attrs = HashMap::new();
         goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
-
-        // Exit node has a retry_target pointing back to "middle"
-        let mut exit_attrs = HashMap::new();
-        exit_attrs.insert(
+        goal_attrs.insert(
             "retry_target".to_string(),
             NodeAttrValue::String("middle".to_string()),
         );
 
         // Build a graph where:
-        // start -> exit (first time, goal unmet, so retry_target sends to middle)
+        // start -> exit (first time, goal unmet, so retry_target on goal_node sends to middle)
         // middle -> goal_node -> exit (second time, goal met, so complete)
         let graph = make_graph(
             vec![
                 make_node("start", NodeType::Start),
-                make_node_with_attrs("exit", NodeType::Exit, exit_attrs),
+                make_node("exit", NodeType::Exit),
                 make_node("middle", NodeType::Generic),
                 make_node_with_attrs("goal_node", NodeType::Generic, goal_attrs),
             ],
@@ -2936,7 +3030,7 @@ mod tests {
         let ctx = Context::new();
         let result = engine.run(ctx).await;
 
-        // Should succeed because retry_target routed to "middle" which leads through goal_node
+        // Should succeed because retry_target on goal_node routed to "middle"
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
         let result = result.unwrap();
         assert!(result.visited_nodes.contains(&"goal_node".to_string()));
@@ -3006,5 +3100,395 @@ mod tests {
 
         // total_duration_ms is always set (may be 0 in fast tests, never panics).
         let _ = result.stats.total_duration_ms;
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_retry_target tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_retry_target_from_node_attr() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("recovery".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_node_fallback() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("fb_target".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("fb_target".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_graph_level() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("graph_rt".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("graph_rt".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_fallback_to_graph_fallback() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("graph_fb".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("graph_fb".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_none_when_empty() {
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs: HashMap::new(),
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(resolve_retry_target(&node, &graph), None);
+    }
+
+    #[test]
+    fn resolve_retry_target_priority_order() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("node_rt".to_string()),
+        );
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("node_fb".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let mut graph_attrs = HashMap::new();
+        graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("graph_rt".to_string()),
+        );
+        graph_attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("graph_fb".to_string()),
+        );
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs,
+        };
+        // Node-level retry_target should win
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("node_rt".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Failure routing via retry_target fallback (spec 3.7)
+    // ---------------------------------------------------------------
+
+    /// Handler that fails on nodes whose id starts with "fail_" and succeeds otherwise.
+    struct SelectiveFailHandler;
+
+    #[async_trait]
+    impl Handler for SelectiveFailHandler {
+        fn name(&self) -> &str {
+            "selective_fail"
+        }
+        async fn execute(
+            &self,
+            node: &GraphNode,
+            _context: &Context,
+        ) -> Result<Outcome, HandlerError> {
+            if node.id.starts_with("fail_") {
+                Ok(Outcome::failure("selective failure"))
+            } else {
+                Ok(Outcome::success())
+            }
+        }
+        fn handles(&self, _node_type: &NodeType) -> bool {
+            true
+        }
+    }
+
+    fn selective_fail_registry() -> HandlerRegistry {
+        let mut registry = HandlerRegistry::new();
+        registry.register(Arc::new(SelectiveFailHandler));
+        registry
+    }
+
+    #[tokio::test]
+    async fn failure_routing_uses_node_retry_target() {
+        // Graph: start -> fail_node (no fail edge, but has retry_target -> recovery -> exit)
+        let mut fail_attrs = HashMap::new();
+        fail_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("fail_node", NodeType::Generic, fail_attrs),
+                make_node("recovery", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                // No edge from fail_node — forces the None branch
+                make_edge("recovery", "exit"),
+            ],
+        );
+        let engine = Engine::with_config(
+            graph,
+            selective_fail_registry(),
+            EngineConfig {
+                max_steps: 20,
+                ..EngineConfig::default()
+            },
+        );
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        // fail_node should fail, then route to recovery via retry_target
+        assert!(result.visited_nodes.contains(&"fail_node".to_string()));
+        assert!(
+            result.visited_nodes.contains(&"recovery".to_string()),
+            "expected engine to route to recovery via retry_target, visited: {:?}",
+            result.visited_nodes
+        );
+        assert!(result.visited_nodes.contains(&"exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn failure_routing_terminates_without_retry_target() {
+        // Graph: start -> fail_node (no fail edge, no retry_target)
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("fail_node", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "fail_node"),
+                // No edge from fail_node — forces the None branch, no retry_target either
+            ],
+        );
+        let engine = Engine::new(graph, selective_fail_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        // Spec 3.7 step 4: node failed with no route — pipeline should fail.
+        // Error should preserve the original failure reason from the handler.
+        let err = result.unwrap_err();
+        match &err {
+            EngineError::UnroutableFailure { node_id, error } => {
+                assert_eq!(node_id, "fail_node");
+                assert!(
+                    error.contains("selective failure"),
+                    "error should preserve handler's failure reason, got: {error}"
+                );
+            }
+            other => panic!("expected UnroutableFailure, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn success_with_no_outgoing_edge_still_terminates() {
+        // Graph: start -> ok_node (succeeds, but has no outgoing edge)
+        // ok_node has a retry_target attr, but it should NOT be used on success.
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+        let graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node_with_attrs("ok_node", NodeType::Generic, attrs),
+                make_node("recovery", NodeType::Generic),
+                make_node("exit", NodeType::Exit),
+            ],
+            vec![
+                make_edge("start", "ok_node"),
+                // No edge from ok_node — forces the None branch
+                make_edge("recovery", "exit"),
+            ],
+        );
+        let engine = Engine::new(graph, success_registry());
+        let ctx = Context::new();
+        let result = engine.run(ctx).await.unwrap();
+
+        // Engine should terminate after ok_node; retry_target is only for failures
+        assert!(result.visited_nodes.contains(&"ok_node".to_string()));
+        assert!(
+            !result.visited_nodes.contains(&"recovery".to_string()),
+            "recovery should not be visited when ok_node succeeds (retry_target is failure-only)"
+        );
+    }
+
+    #[test]
+    fn resolve_retry_target_skips_empty_strings() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("".to_string()),
+        );
+        attrs.insert(
+            "fallback_retry_target".to_string(),
+            NodeAttrValue::String("actual_target".to_string()),
+        );
+        let node = GraphNode {
+            id: "g1".to_string(),
+            node_type: NodeType::Codergen,
+            label: None,
+            attrs,
+        };
+        let graph = Graph {
+            name: None,
+            nodes: vec![],
+            edges: vec![],
+            default_node_attrs: HashMap::new(),
+            default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_retry_target(&node, &graph),
+            Some("actual_target".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test: graph-level retry_target used when goal node has no retry_target
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn graph_level_retry_target_used_for_unsatisfied_goal() {
+        let mut goal_attrs = HashMap::new();
+        goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+        // No retry_target on the goal node itself
+
+        let mut graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+                make_node("recovery", NodeType::Generic),
+                make_node_with_attrs("goal_node", NodeType::Generic, goal_attrs),
+            ],
+            vec![
+                make_edge("start", "exit"),
+                make_edge("recovery", "goal_node"),
+                make_edge("goal_node", "exit"),
+            ],
+        );
+        // Set graph-level retry_target
+        graph.graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+
+        let engine = Engine::with_config(
+            graph,
+            success_registry(),
+            EngineConfig {
+                max_steps: 20,
+                ..EngineConfig::default()
+            },
+        );
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let result = result.unwrap();
+        assert!(result.visited_nodes.contains(&"goal_node".to_string()));
     }
 }

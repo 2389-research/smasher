@@ -14,12 +14,12 @@ Five crates, bottom to top:
 | `smasher-llm` | Talks to OpenAI, Anthropic, and Gemini through one client. Handles streaming, retries, the usual. |
 | `smasher-agent` | Agent loop with tools (read, write, edit, shell, grep, glob). Steering rules, subagents, sandboxed execution. |
 | `smasher-attractor` | The graph engine. Parses DOT, resolves node types from shapes, dispatches handlers, runs the pipeline. |
-| `smasher-cli` | `smasher complete`, `smasher chat`, `smasher run`, `smasher serve`. |
+| `smasher-cli` | `smasher complete`, `smasher chat`, `smasher run`, `smasher serve`, `smasher resume`, `smasher render`, `smasher ingest`, `smasher archive`, `smasher lint`. |
 | `smasher-web` | HTMX dashboard on port 21541. Live event stream, graph visualization, human Q&A. |
 
 ## Setup
 
-You need Rust 1.92+ and at least one API key.
+You need Rust 1.85+ and at least one API key.
 
 ```bash
 git clone https://github.com/2389-ai/smasher.git
@@ -57,20 +57,22 @@ The chat REPL gives the agent all six tools (read, write, edit, shell, grep, glo
 ### Run a pipeline
 
 ```bash
-smasher run examples/hello-world.dot
-smasher run examples/conditional.dot --var route=yes
-smasher run examples/multi-step.dot --var model=claude-sonnet-4-20250514
+smasher run examples/old-examples/hello-world.dot
+smasher run examples/old-examples/conditional.dot --var route=yes
+smasher run examples/old-examples/multi-step.dot --var model=claude-sonnet-4-20250514
 ```
 
 Pipelines are standard DOT digraphs. Node shapes tell the engine what each node does:
 
-- `circle` = start
+- `circle` / `point` = start
 - `doublecircle` = exit
-- `box` = codergen (runs an LLM agent)
+- `box` / `rectangle` = codergen (runs an LLM agent)
 - `diamond` = conditional (branches on variables)
-- `house` = manager (asks a human, routes on the answer)
+- `oval` / `ellipse` = interviewer (asks a human, captures response)
+- `house` = manager (human approval gate)
 - `parallelogram` = parallel fan-out
 - `hexagon` = tool
+- `component` = sub-pipeline (nested DOT file)
 
 See [`examples/`](examples/) for working pipelines and [`docs/dot-reference.md`](docs/dot-reference.md) for the full spec.
 
@@ -87,7 +89,7 @@ Submit pipelines from the browser, watch events arrive over SSE, answer human ga
 
 ```bash
 cargo check --workspace
-cargo test --workspace       # ~2,400 tests
+cargo test --workspace       # ~2,700 tests
 cargo clippy --workspace
 ```
 

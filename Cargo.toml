@@ -73,3 +73,6 @@ smasher-llm = { path = "crates/smasher-llm" }
 smasher-agent = { path = "crates/smasher-agent" }
 smasher-attractor = { path = "crates/smasher-attractor" }
 smasher-web = { path = "crates/smasher-web" }
+
+# TUI framework
+boba = { path = "/Users/harper/Public/src/2389/boba/crates/boba" }

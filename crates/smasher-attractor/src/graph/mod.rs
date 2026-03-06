@@ -75,6 +75,7 @@ pub struct Graph {
     pub edges: Vec<GraphEdge>,
     pub default_node_attrs: HashMap<String, NodeAttrValue>,
     pub default_edge_attrs: HashMap<String, NodeAttrValue>,
+    pub graph_attrs: HashMap<String, NodeAttrValue>,
 }
 
 /// Errors that can occur during DOT AST to Graph resolution.
@@ -257,11 +258,12 @@ fn extract_loop_restart(attrs: &HashMap<String, NodeAttrValue>) -> bool {
 pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
     let mut default_node_attrs: HashMap<String, NodeAttrValue> = HashMap::new();
     let mut default_edge_attrs: HashMap<String, NodeAttrValue> = HashMap::new();
+    let mut graph_attrs: HashMap<String, NodeAttrValue> = HashMap::new();
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut seen_node_ids: HashMap<String, usize> = HashMap::new();
 
-    // First pass: collect defaults.
+    // First pass: collect defaults and graph-level attributes.
     for stmt in &dot_graph.statements {
         match stmt {
             DotStatement::DefaultNode(attrs) => {
@@ -273,6 +275,9 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
                 for attr in attrs {
                     default_edge_attrs.insert(attr.key.clone(), convert_value(&attr.value));
                 }
+            }
+            DotStatement::Attr(attr) => {
+                graph_attrs.insert(attr.key.clone(), convert_value(&attr.value));
             }
             _ => {}
         }
@@ -371,6 +376,7 @@ pub fn resolve(dot_graph: &DotGraph) -> Result<Graph, ResolutionError> {
         edges,
         default_node_attrs,
         default_edge_attrs,
+        graph_attrs,
     })
 }
 
@@ -1053,5 +1059,62 @@ mod tests {
         let dot = make_graph(vec![node_with_shape("n", "tripleoctagon")]);
         let g = resolve(&dot).unwrap();
         assert_eq!(g.nodes[0].node_type, NodeType::FanIn);
+    }
+
+    // ---- Graph-level attributes ----
+
+    #[test]
+    fn graph_level_attrs_stored() {
+        let dot = r#"
+            digraph G {
+                graph [retry_target="start", fallback_retry_target="fallback"]
+                Start [shape=Mdiamond]
+                Exit [shape=Msquare]
+                Start -> Exit
+            }
+        "#;
+        let ast = crate::dot::parse(dot).unwrap();
+        let g = resolve(&ast).unwrap();
+        assert_eq!(
+            g.graph_attrs.get("retry_target"),
+            Some(&NodeAttrValue::String("start".to_string()))
+        );
+        assert_eq!(
+            g.graph_attrs.get("fallback_retry_target"),
+            Some(&NodeAttrValue::String("fallback".to_string()))
+        );
+    }
+
+    #[test]
+    fn graph_level_attrs_empty_when_not_set() {
+        let dot = r#"
+            digraph G {
+                Start [shape=Mdiamond]
+                Exit [shape=Msquare]
+                Start -> Exit
+            }
+        "#;
+        let ast = crate::dot::parse(dot).unwrap();
+        let g = resolve(&ast).unwrap();
+        assert!(g.graph_attrs.is_empty());
+    }
+
+    #[test]
+    fn graph_level_attr_inline_syntax() {
+        let dot = r#"
+            digraph G {
+                goal="Build a thing"
+                rankdir=LR
+                Start [shape=Mdiamond]
+                Exit [shape=Msquare]
+                Start -> Exit
+            }
+        "#;
+        let ast = crate::dot::parse(dot).unwrap();
+        let g = resolve(&ast).unwrap();
+        assert_eq!(
+            g.graph_attrs.get("goal"),
+            Some(&NodeAttrValue::String("Build a thing".to_string()))
+        );
     }
 }

@@ -88,8 +88,16 @@ impl CodergenBackend for AgentCodergenBackend {
             use smasher_agent::types::SessionEvent;
             loop {
                 match rx.recv().await {
-                    Ok(SessionEvent::ToolCallStarted { tool_name, .. }) => {
-                        eprintln!("  [tool] {tool_name}...");
+                    Ok(SessionEvent::ToolCallStarted {
+                        tool_name,
+                        input_preview,
+                        ..
+                    }) => {
+                        if input_preview.is_empty() {
+                            eprintln!("  [tool] {tool_name}...");
+                        } else {
+                            eprintln!("  [tool] {tool_name} {input_preview}...");
+                        }
                     }
                     Ok(SessionEvent::ToolCallCompleted {
                         tool_name,

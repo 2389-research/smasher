@@ -234,9 +234,9 @@ impl ConsoleInterviewer {
         }
     }
 
-    /// Create a ConsoleInterviewer that reads from stdin and writes to stdout.
+    /// Create a ConsoleInterviewer that reads from stdin and writes to stderr.
     pub fn from_stdio() -> Self {
-        Self::new(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
+        Self::new(std::io::BufReader::new(std::io::stdin()), std::io::stderr())
     }
 
     /// Write a string to the output and flush it.
@@ -492,6 +492,86 @@ impl Interviewer for TimeoutInterviewer {
 }
 
 // ---------------------------------------------------------------------------
+// ChannelInterviewer
+// ---------------------------------------------------------------------------
+
+/// A request sent from the `ChannelInterviewer` to an external consumer (e.g. a TUI).
+///
+/// Contains the question text and a oneshot sender for the response. The consumer
+/// should display the question, collect user input, and send it back through `response_tx`.
+pub struct HumanGateRequest {
+    /// The question to present to the human operator.
+    pub question: String,
+    /// Oneshot channel to send the response (or error) back to the waiting interviewer.
+    pub response_tx: tokio::sync::oneshot::Sender<Result<String, InterviewerError>>,
+}
+
+impl std::fmt::Debug for HumanGateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HumanGateRequest")
+            .field("question", &self.question)
+            .finish()
+    }
+}
+
+/// An interviewer that communicates via async channels, suitable for TUI integration.
+///
+/// Instead of reading from stdin, it sends questions through an `mpsc` channel and waits
+/// for responses via oneshot channels bundled with each request. This allows a TUI (or any
+/// other async consumer) to intercept human-in-the-loop prompts and gather responses.
+pub struct ChannelInterviewer {
+    tx: tokio::sync::mpsc::UnboundedSender<HumanGateRequest>,
+}
+
+impl ChannelInterviewer {
+    /// Create a new `ChannelInterviewer` and return the receiver for consuming requests.
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<HumanGateRequest>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx }, rx)
+    }
+
+    /// Send a question through the channel and wait for a response.
+    async fn send_and_wait(&self, question: &str) -> Result<String, InterviewerError> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(HumanGateRequest {
+                question: question.to_string(),
+                response_tx,
+            })
+            .map_err(|_| InterviewerError::Other("channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| InterviewerError::Other("response channel dropped".into()))?
+    }
+}
+
+#[async_trait::async_trait]
+impl Interviewer for ChannelInterviewer {
+    async fn ask(&self, question: &str, _context: &Context) -> Result<String, InterviewerError> {
+        self.send_and_wait(question).await
+    }
+
+    async fn ask_with_options(
+        &self,
+        question: &str,
+        options: &[String],
+        _context: &Context,
+    ) -> Result<String, InterviewerError> {
+        let formatted = format!("{question}\nOptions: {}", options.join(", "));
+        self.send_and_wait(&formatted).await
+    }
+
+    async fn approve(&self, message: &str, _context: &Context) -> Result<bool, InterviewerError> {
+        let formatted = format!("{message} [y/n]");
+        let response = self.send_and_wait(&formatted).await?;
+        Ok(matches!(
+            response.trim().to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InterviewerHandler
 // ---------------------------------------------------------------------------
 
@@ -529,13 +609,16 @@ impl Handler for InterviewerHandler {
         };
 
         // Determine the interaction mode and execute.
+        // All modes set `preferred_label` on the outcome to the user's response,
+        // enabling edge routing to match the response against outgoing edge labels.
         if let Some(NodeAttrValue::Bool(true)) = node.attrs.get("approve") {
             // Approval mode: yes/no question.
             match self.interviewer.approve(&question, context).await {
                 Ok(approved) => {
                     let response = if approved { "yes" } else { "no" };
                     context.set(format!("_interview_{}", node.id), json!(response));
-                    Ok(Outcome::success_with(json!({"response": response})))
+                    Ok(Outcome::success_with(json!({"response": response}))
+                        .with_preferred_label(response))
                 }
                 Err(InterviewerError::Cancelled) => Ok(Outcome::skip("interview cancelled")),
                 Err(e) => Ok(Outcome::failure(e.to_string())),
@@ -550,7 +633,8 @@ impl Handler for InterviewerHandler {
             {
                 Ok(response) => {
                     context.set(format!("_interview_{}", node.id), json!(&response));
-                    Ok(Outcome::success_with(json!({"response": response})))
+                    Ok(Outcome::success_with(json!({"response": &response}))
+                        .with_preferred_label(&response))
                 }
                 Err(InterviewerError::Cancelled) => Ok(Outcome::skip("interview cancelled")),
                 Err(e) => Ok(Outcome::failure(e.to_string())),
@@ -560,7 +644,8 @@ impl Handler for InterviewerHandler {
             match self.interviewer.ask(&question, context).await {
                 Ok(response) => {
                     context.set(format!("_interview_{}", node.id), json!(&response));
-                    Ok(Outcome::success_with(json!({"response": response})))
+                    Ok(Outcome::success_with(json!({"response": &response}))
+                        .with_preferred_label(&response))
                 }
                 Err(InterviewerError::Cancelled) => Ok(Outcome::skip("interview cancelled")),
                 Err(e) => Ok(Outcome::failure(e.to_string())),
@@ -703,16 +788,18 @@ impl Handler for HumanGateHandler {
         match ask_result {
             Ok(response) => {
                 context.set(&node.id, json!(&response));
-                Ok(Outcome::success_with(json!({"response": response})))
+                Ok(Outcome::success_with(json!({"response": &response}))
+                    .with_preferred_label(&response))
             }
             Err(InterviewerError::Cancelled) => Ok(Outcome::skip("human gate cancelled")),
             Err(InterviewerError::Timeout) => {
                 if let Some(default) = effective_default {
                     let response = default.to_string();
                     context.set(&node.id, json!(&response));
-                    Ok(Outcome::success_with(
-                        json!({"response": response, "defaulted": true}),
-                    ))
+                    Ok(
+                        Outcome::success_with(json!({"response": &response, "defaulted": true}))
+                            .with_preferred_label(&response),
+                    )
                 } else {
                     Ok(Outcome::failure("interview timed out"))
                 }
@@ -1021,12 +1108,30 @@ mod tests {
         assert!(result.is_success());
         match result {
             Outcome::Success {
-                data: Some(data), ..
+                data: Some(data),
+                preferred_label,
+                ..
             } => {
                 assert_eq!(data["response"], "approved");
+                // preferred_label is set to the response for edge routing
+                assert_eq!(preferred_label.as_deref(), Some("approved"));
             }
             other => panic!("expected success with data, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handler_sets_preferred_label_for_edge_routing() {
+        let queue = Arc::new(QueueInterviewer::new());
+        queue.push_response("Yes");
+        let handler = InterviewerHandler::new(queue);
+
+        let node = make_node_with_label("gate", NodeType::Interviewer, "Continue?");
+
+        let ctx = Context::new();
+        let result = handler.execute(&node, &ctx).await.unwrap();
+        assert!(result.is_success());
+        assert_eq!(result.preferred_label(), Some("Yes"));
     }
 
     #[tokio::test]
@@ -2265,5 +2370,126 @@ mod tests {
         let ctx = Context::new();
         let result = handler.execute(&node, &ctx).await.unwrap();
         assert!(result.is_success());
+    }
+
+    // ---------------------------------------------------------------
+    // ChannelInterviewer tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn channel_interviewer_ask_succeeds() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        let ask_handle =
+            tokio::spawn(async move { interviewer.ask("What do you think?", &ctx).await });
+
+        let req = rx.recv().await.unwrap();
+        assert_eq!(req.question, "What do you think?");
+        req.response_tx.send(Ok("Looks good!".into())).unwrap();
+
+        let result = ask_handle.await.unwrap();
+        assert_eq!(result.unwrap(), "Looks good!");
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_ask_propagates_error() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        let ask_handle = tokio::spawn(async move { interviewer.ask("Proceed?", &ctx).await });
+
+        let req = rx.recv().await.unwrap();
+        req.response_tx
+            .send(Err(InterviewerError::Cancelled))
+            .unwrap();
+
+        let result = ask_handle.await.unwrap();
+        assert!(matches!(result, Err(InterviewerError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_ask_with_options_formats_question() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+        let options = vec!["red".to_string(), "blue".to_string()];
+
+        let ask_handle = tokio::spawn(async move {
+            interviewer
+                .ask_with_options("Pick a color", &options, &ctx)
+                .await
+        });
+
+        let req = rx.recv().await.unwrap();
+        assert!(req.question.contains("Pick a color"));
+        assert!(req.question.contains("red, blue"));
+        req.response_tx.send(Ok("red".into())).unwrap();
+
+        let result = ask_handle.await.unwrap();
+        assert_eq!(result.unwrap(), "red");
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_approve_yes() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        let ask_handle = tokio::spawn(async move { interviewer.approve("Deploy?", &ctx).await });
+
+        let req = rx.recv().await.unwrap();
+        assert!(req.question.contains("Deploy?"));
+        assert!(req.question.contains("[y/n]"));
+        req.response_tx.send(Ok("yes".into())).unwrap();
+
+        let result = ask_handle.await.unwrap();
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_approve_no() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        let ask_handle = tokio::spawn(async move { interviewer.approve("Deploy?", &ctx).await });
+
+        let req = rx.recv().await.unwrap();
+        req.response_tx.send(Ok("no".into())).unwrap();
+
+        let result = ask_handle.await.unwrap();
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_closed_channel_returns_error() {
+        let (interviewer, rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        // Drop the receiver — channel is closed.
+        drop(rx);
+
+        let result = interviewer.ask("Hello?", &ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn channel_interviewer_dropped_response_returns_error() {
+        let (interviewer, mut rx) = ChannelInterviewer::new();
+        let ctx = Context::new();
+
+        let ask_handle = tokio::spawn(async move { interviewer.ask("Hello?", &ctx).await });
+
+        let req = rx.recv().await.unwrap();
+        // Drop the response sender without sending a response.
+        drop(req.response_tx);
+
+        let result = ask_handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("response channel dropped")
+        );
     }
 }

@@ -96,6 +96,7 @@ pub fn linear_pipeline(n: usize) -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -128,6 +129,7 @@ pub fn branching_pipeline() -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -164,6 +166,7 @@ pub fn looping_pipeline(max_loops: usize) -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -201,6 +204,7 @@ pub fn parallel_pipeline(branches: usize) -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -233,6 +237,7 @@ pub fn human_gate_pipeline() -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -267,6 +272,7 @@ pub fn codergen_pipeline() -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -290,6 +296,7 @@ pub fn sub_pipeline_parent() -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -335,6 +342,7 @@ pub fn complex_pipeline() -> Graph {
         edges,
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 

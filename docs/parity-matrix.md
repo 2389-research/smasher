@@ -3,7 +3,7 @@
 Cross-feature parity assessment for the smasher workspace. Each feature is marked as
 **Implemented**, **Partial**, or **Not Started** based on code review of the actual source.
 
-Last verified: 2026-02-07 against the `main` branch.
+Last verified: 2026-03-06 against the `tui-attractor` branch (commit 94c23df).
 
 ---
 
@@ -202,7 +202,7 @@ Last verified: 2026-02-07 against the `main` branch.
 | `--verbose` flag | Implemented | Tracing to stderr at debug level |
 | `--env-file` flag | Implemented | Custom .env file loading |
 | Error exit codes | Implemented | `CliError::exit_code()` |
-| Interactive TUI rendering (ratatui) | Not Started | View models exist but no terminal rendering loop |
+| Interactive TUI rendering (ratatui) | Implemented | Full Elm-architecture TUI via boba + ratatui (`tui/mod.rs`) with node panel, log view, status bar, and spinner |
 
 **Test coverage:** ~80 TUI tests (tui.rs), CLI spec tests (cli_spec.rs), layout check tests (layout_check.rs).
 
@@ -222,7 +222,7 @@ Last verified: 2026-02-07 against the `main` branch.
 | `render_to_dot()` | Implemented | Full DOT output with node styling per NodeType |
 | `GraphRenderer` trait | Implemented | Async trait for pluggable renderers |
 | Render API types | Implemented | `RenderGraphQuery`, `RenderGraphResponse` |
-| Actual HTTP server (axum/actix/etc.) | Not Started | Types and routes defined but no HTTP listener implementation |
+| Actual HTTP server (axum/actix/etc.) | Implemented | `smasher-web` crate implements axum + askama + HTMX dashboard on port 21541 (`smasher serve`) |
 | WebSocket event streaming | Not Started | No WebSocket support |
 | Authentication / API keys | Not Started | No auth layer |
 
@@ -313,7 +313,7 @@ Last verified: 2026-02-07 against the `main` branch.
 
 | Category | Count | Status |
 |----------|-------|--------|
-| Total test functions (workspace) | 2,267 | Implemented |
+| Total test functions (workspace) | 2,704 | Implemented |
 | Integration tests (example_lint.rs) | 57 total (56 pass, 1 fail) | Partial |
 | Unit tests per module | See per-section notes above | Implemented |
 | Pre-existing failure | `all_examples_pass_lint` fails on `cli-messageboard.dot` HTML lexer edge case | Known Issue |

@@ -47,6 +47,7 @@ pub fn minimal_graph() -> Graph {
         }],
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 
@@ -115,6 +116,7 @@ pub fn conditional_graph() -> Graph {
         ],
         default_node_attrs: HashMap::new(),
         default_edge_attrs: HashMap::new(),
+        graph_attrs: HashMap::new(),
     }
 }
 

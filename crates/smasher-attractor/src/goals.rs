@@ -4,12 +4,12 @@
 use std::fmt;
 
 use crate::graph::{Graph, NodeAttrValue};
-use crate::state::Checkpoint;
+use crate::state::{Checkpoint, Outcome};
 
 /// Errors related to goal enforcement.
 #[derive(Debug, thiserror::Error)]
 pub enum GoalError {
-    #[error("pipeline completion blocked: {unmet_count} goal(s) not yet visited: {unmet_goals}")]
+    #[error("pipeline completion blocked: {unmet_count} goal(s) unsatisfied: {unmet_goals}")]
     GoalsNotMet {
         unmet_count: usize,
         unmet_goals: String,
@@ -43,6 +43,19 @@ impl GoalStatus {
 impl fmt::Display for GoalStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{} goals met", self.met.len(), self.total)
+    }
+}
+
+/// Describes which goal gate node is unsatisfied and why.
+#[derive(Debug, Clone)]
+pub struct UnsatisfiedGoal {
+    pub node_id: String,
+    pub reason: String,
+}
+
+impl fmt::Display for UnsatisfiedGoal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "goal '{}' unsatisfied: {}", self.node_id, self.reason)
     }
 }
 
@@ -147,6 +160,63 @@ impl GoalGate {
             .collect()
     }
 
+    /// Check goal gates per spec section 3.4.
+    ///
+    /// All nodes with `goal_gate=true` must have an outcome of SUCCESS or
+    /// PARTIAL_SUCCESS. Unvisited goals (missing from outcomes map) and goals
+    /// with any other outcome status are considered unsatisfied.
+    ///
+    /// Returns the first unsatisfied goal found, or Ok(()) if all gates pass.
+    pub fn check_outcomes(
+        &self,
+        node_outcomes: &std::collections::HashMap<String, Outcome>,
+    ) -> Result<(), UnsatisfiedGoal> {
+        for goal_id in &self.goals {
+            match node_outcomes.get(goal_id) {
+                Some(outcome) if outcome.is_success() => continue,
+                Some(_) => {
+                    return Err(UnsatisfiedGoal {
+                        node_id: goal_id.clone(),
+                        reason: "non-success outcome".to_string(),
+                    });
+                }
+                None => {
+                    return Err(UnsatisfiedGoal {
+                        node_id: goal_id.clone(),
+                        reason: "not visited".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check all goal gates and return a `GoalError` describing every
+    /// unsatisfied goal. Use this for terminal error reporting (not retry
+    /// routing, which only needs the first failure from `check_outcomes`).
+    pub fn enforce_outcomes(
+        &self,
+        node_outcomes: &std::collections::HashMap<String, Outcome>,
+    ) -> Result<(), GoalError> {
+        let unsatisfied: Vec<String> = self
+            .goals
+            .iter()
+            .filter_map(|goal_id| match node_outcomes.get(goal_id) {
+                Some(outcome) if outcome.is_success() => None,
+                Some(_) => Some(format!("{goal_id} (non-success outcome)")),
+                None => Some(format!("{goal_id} (not visited)")),
+            })
+            .collect();
+        if unsatisfied.is_empty() {
+            Ok(())
+        } else {
+            Err(GoalError::GoalsNotMet {
+                unmet_count: unsatisfied.len(),
+                unmet_goals: unsatisfied.join(", "),
+            })
+        }
+    }
+
     /// Enforce that all goals have been met. Returns `Ok(())` if all goals
     /// are visited, or a `GoalError::GoalsNotMet` describing the unmet goals.
     pub fn enforce(&self, visited: &[String]) -> Result<(), GoalError> {
@@ -166,7 +236,7 @@ impl GoalGate {
 mod tests {
     use super::*;
     use crate::graph::{GraphNode, NodeType};
-    use crate::state::Context;
+    use crate::state::{Context, Outcome};
     use std::collections::HashMap;
 
     /// Helper: build a GraphNode with optional goal attribute.
@@ -218,6 +288,7 @@ mod tests {
             edges: vec![],
             default_node_attrs: HashMap::new(),
             default_edge_attrs: HashMap::new(),
+            graph_attrs: HashMap::new(),
         }
     }
 
@@ -396,7 +467,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("2 goal(s) not yet visited"));
+        assert!(msg.contains("2 goal(s) unsatisfied"));
         assert!(msg.contains("g2"));
         assert!(msg.contains("g3"));
     }
@@ -577,7 +648,7 @@ mod tests {
         let msg = err.to_string();
         assert_eq!(
             msg,
-            "pipeline completion blocked: 2 goal(s) not yet visited: deploy, validate"
+            "pipeline completion blocked: 2 goal(s) unsatisfied: deploy, validate"
         );
     }
 
@@ -638,5 +709,113 @@ mod tests {
         }]);
         let gate = GoalGate::from_graph(&graph);
         assert!(gate.is_empty());
+    }
+
+    // ---- Test 30: check_outcomes all succeeded ----
+    #[test]
+    fn check_outcomes_all_succeeded() {
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        outcomes.insert("g2".to_string(), Outcome::success());
+        assert!(gate.check_outcomes(&outcomes).is_ok());
+    }
+
+    // ---- Test 31: check_outcomes partial success counts as met ----
+    #[test]
+    fn check_outcomes_partial_success_counts_as_met() {
+        let graph = make_graph(vec![make_node("g1", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::partial_success());
+        assert!(gate.check_outcomes(&outcomes).is_ok());
+    }
+
+    // ---- Test 32: check_outcomes failed goal returns unsatisfied ----
+    #[test]
+    fn check_outcomes_failed_goal_returns_unsatisfied() {
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        outcomes.insert("g2".to_string(), Outcome::failure("timed out"));
+        let err = gate.check_outcomes(&outcomes).unwrap_err();
+        assert_eq!(err.node_id, "g2");
+    }
+
+    // ---- Test 33: check_outcomes unvisited goal returns unsatisfied ----
+    #[test]
+    fn check_outcomes_unvisited_goal_returns_unsatisfied() {
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        // g2 not in outcomes — unvisited
+        let err = gate.check_outcomes(&outcomes).unwrap_err();
+        assert_eq!(err.node_id, "g2");
+        assert!(err.reason.contains("not visited"));
+    }
+
+    // ---- Test 34: check_outcomes skipped goal returns unsatisfied ----
+    #[test]
+    fn check_outcomes_skipped_goal_returns_unsatisfied() {
+        let graph = make_graph(vec![make_node("g1", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::skip("branch not taken"));
+        let err = gate.check_outcomes(&outcomes).unwrap_err();
+        assert_eq!(err.node_id, "g1");
+    }
+
+    // ---- Test 35: check_outcomes no goals always ok ----
+    #[test]
+    fn check_outcomes_no_goals_always_ok() {
+        let graph = make_graph(vec![make_node("a", false)]);
+        let gate = GoalGate::from_graph(&graph);
+        let outcomes = HashMap::new();
+        assert!(gate.check_outcomes(&outcomes).is_ok());
+    }
+
+    // ---- Test 36: UnsatisfiedGoal Display output ----
+    #[test]
+    fn unsatisfied_goal_display() {
+        let ug = UnsatisfiedGoal {
+            node_id: "deploy".to_string(),
+            reason: "not visited".to_string(),
+        };
+        assert_eq!(format!("{ug}"), "goal 'deploy' unsatisfied: not visited");
+    }
+
+    // ---- Test 37: enforce_outcomes reports all unsatisfied goals ----
+    #[test]
+    fn enforce_outcomes_reports_all_failures() {
+        let graph = make_graph(vec![
+            make_node("g1", true),
+            make_node("g2", true),
+            make_node("g3", true),
+        ]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        // g2 failed, g3 not visited
+        outcomes.insert("g2".to_string(), Outcome::failure("timed out"));
+
+        let err = gate.enforce_outcomes(&outcomes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 goal(s) unsatisfied"), "got: {msg}");
+        assert!(msg.contains("g2"), "should mention g2: {msg}");
+        assert!(msg.contains("g3"), "should mention g3: {msg}");
+    }
+
+    // ---- Test 38: enforce_outcomes passes when all goals succeed ----
+    #[test]
+    fn enforce_outcomes_all_pass() {
+        let graph = make_graph(vec![make_node("g1", true), make_node("g2", true)]);
+        let gate = GoalGate::from_graph(&graph);
+        let mut outcomes = HashMap::new();
+        outcomes.insert("g1".to_string(), Outcome::success());
+        outcomes.insert("g2".to_string(), Outcome::partial_success());
+        assert!(gate.enforce_outcomes(&outcomes).is_ok());
     }
 }

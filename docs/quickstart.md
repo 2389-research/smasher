@@ -177,7 +177,7 @@ stdout as JSON.
 Run the simplest possible pipeline (start node to exit node):
 
 ```bash
-smasher run examples/hello-world.dot
+smasher run examples/old-examples/hello-world.dot
 ```
 
 The `hello-world.dot` file looks like this:
@@ -225,10 +225,10 @@ the `--var` flag (repeatable):
 
 ```bash
 # Single variable
-smasher run examples/conditional.dot --var route=yes
+smasher run examples/old-examples/conditional.dot --var route=yes
 
 # Multiple variables
-smasher run examples/multi-step.dot --var auth=valid --var quota=ok
+smasher run examples/old-examples/multi-step.dot --var auth=valid --var quota=ok
 ```
 
 Variables must use `KEY=VALUE` format. If the `=` is missing, smasher exits with an error.
@@ -255,10 +255,10 @@ Running this pipeline with different variable values changes the execution path:
 
 ```bash
 # Takes the "success" edge (route equals "yes")
-smasher run examples/conditional.dot --var route=yes
+smasher run examples/old-examples/conditional.dot --var route=yes
 
 # Takes the "failure" edge (route does not equal "yes")
-smasher run examples/conditional.dot --var route=no
+smasher run examples/old-examples/conditional.dot --var route=no
 ```
 
 Supported condition operators:
@@ -278,7 +278,7 @@ The `--model` flag is automatically injected as a `model` variable in the pipeli
 codergen nodes can reference it:
 
 ```bash
-smasher run examples/codergen.dot --var task="implement fibonacci" --model claude-sonnet-4-20250514
+smasher run examples/old-examples/codergen.dot --var task="implement fibonacci" --model claude-sonnet-4-20250514
 ```
 
 ## Human Input
@@ -351,7 +351,7 @@ The response is stored in context as `_interview_{node_id}`.
 Chain multiple Manager nodes for workflows requiring sign-off from different stakeholders:
 
 ```bash
-smasher run examples/multi-gate.dot
+smasher run examples/old-examples/multi-gate.dot
 ```
 
 This pipeline presents a security review gate followed by a compliance check gate. Both must
@@ -389,13 +389,13 @@ implementations:
 Enable debug-level logging to stderr with `-v`:
 
 ```bash
-smasher -v run examples/hello-world.dot
+smasher -v run examples/old-examples/hello-world.dot
 ```
 
 Or use the `RUST_LOG` environment variable for fine-grained control:
 
 ```bash
-RUST_LOG=debug smasher run examples/hello-world.dot
+RUST_LOG=debug smasher run examples/old-examples/hello-world.dot
 ```
 
 Without `-v`, only `warn`-level messages are shown on stderr.
@@ -416,7 +416,7 @@ Without `-v`, only `warn`-level messages are shown on stderr.
 
 - [DOT Format Reference](dot-reference.md) -- node shapes, attributes, edge conditions, stylesheets
 - [API Reference](api-reference.md) -- programmatic Rust API for all three crate layers
-- [Example Pipelines](../examples/README.md) -- annotated examples covering conditional, parallel, retry, and human gate patterns
+- [Example Pipelines](../examples/old-examples/README.md) -- annotated examples covering conditional, parallel, retry, and human gate patterns
 - [smasher-llm](../smasher-llm/) -- unified LLM client library (OpenAI, Anthropic, Gemini)
 - [smasher-agent](../smasher-agent/) -- programmable coding agent loop with tools and subagents
 - [smasher-attractor](../smasher-attractor/) -- DOT-based directed graph pipeline orchestrator
