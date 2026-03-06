@@ -266,6 +266,7 @@ pub fn render_event_html(event: &PipelineEvent) -> String {
             input_tokens,
             output_tokens,
             timestamp,
+            ..
         } => {
             format!(
                 r#"<div class="event-item event-agent_token_usage"><span class="event-time">{}</span><span class="event-icon">⊛</span><div class="event-body"><span class="event-kind">TOKENS</span><span class="event-detail"><span class="event-node">{}</span> in:{} out:{}</span></div></div>"#,
@@ -468,6 +469,7 @@ mod tests {
                     node_id: "n".into(),
                     input_tokens: 100,
                     output_tokens: 50,
+                    cost_usd: 0.0,
                     timestamp: ts,
                 },
                 "agent_token_usage",

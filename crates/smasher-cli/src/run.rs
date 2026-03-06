@@ -267,6 +267,10 @@ impl CodergenBackend for ClaudeCliBackend {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
                 let mut result_text: Option<String> = None;
+                // Deduplicate per-step token emissions by message ID (parallel tool
+                // calls share the same ID with identical usage data).
+                let mut seen_msg_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
 
                 while let Some(line) = lines.next_line().await? {
                     let line = line.trim().to_string();
@@ -278,6 +282,29 @@ impl CodergenBackend for ClaudeCliBackend {
                     };
                     match obj.get("type").and_then(|v| v.as_str()) {
                         Some("assistant") => {
+                            // Emit per-step token usage from the assistant message (deduped).
+                            if let Some(ref emitter) = emitter {
+                                let msg_id =
+                                    obj["message"]["id"].as_str().unwrap_or("").to_string();
+                                if !msg_id.is_empty() && seen_msg_ids.insert(msg_id) {
+                                    let input_tokens = obj["message"]["usage"]["input_tokens"]
+                                        .as_u64()
+                                        .unwrap_or(0);
+                                    let output_tokens = obj["message"]["usage"]["output_tokens"]
+                                        .as_u64()
+                                        .unwrap_or(0);
+                                    if input_tokens > 0 || output_tokens > 0 {
+                                        emitter.emit(PipelineEvent::AgentTokenUsage {
+                                            node_id: node_id.clone(),
+                                            input_tokens,
+                                            output_tokens,
+                                            cost_usd: 0.0,
+                                            timestamp: chrono::Utc::now(),
+                                        });
+                                    }
+                                }
+                            }
+
                             let Some(content) = obj["message"]["content"].as_array() else {
                                 continue;
                             };
@@ -319,17 +346,15 @@ impl CodergenBackend for ClaudeCliBackend {
                         }
                         Some("result") => {
                             result_text = Some(obj["result"].as_str().unwrap_or("").to_string());
-                            // Emit token usage if available
+                            // Emit final cost from the result line.
                             if let Some(ref emitter) = emitter {
-                                let input_tokens =
-                                    obj["usage"]["input_tokens"].as_u64().unwrap_or(0);
-                                let output_tokens =
-                                    obj["usage"]["output_tokens"].as_u64().unwrap_or(0);
-                                if input_tokens > 0 || output_tokens > 0 {
+                                let cost_usd = obj["total_cost_usd"].as_f64().unwrap_or(0.0);
+                                if cost_usd > 0.0 {
                                     emitter.emit(PipelineEvent::AgentTokenUsage {
                                         node_id: node_id.clone(),
-                                        input_tokens,
-                                        output_tokens,
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        cost_usd,
                                         timestamp: chrono::Utc::now(),
                                     });
                                 }

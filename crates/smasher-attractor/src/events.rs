@@ -141,11 +141,13 @@ pub enum PipelineEvent {
         result_preview: String,
         timestamp: DateTime<Utc>,
     },
-    /// Token usage report from an agent node (emitted on node completion).
+    /// Token usage report from an agent node (emitted per-step and on completion).
     AgentTokenUsage {
         node_id: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// Cumulative cost in USD for this node (set on final result, 0.0 for per-step).
+        cost_usd: f64,
         timestamp: DateTime<Utc>,
     },
     /// An agent produced a text message within a codergen node.

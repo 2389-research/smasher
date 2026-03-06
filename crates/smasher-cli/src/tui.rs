@@ -130,6 +130,10 @@ pub struct PipelineTui {
     total_input_tokens: u64,
     /// Cumulative output tokens across all nodes.
     total_output_tokens: u64,
+    /// Cumulative cost in USD across all nodes.
+    total_cost_usd: f64,
+    /// Set of file paths touched by Write/Edit tool calls.
+    files_touched: std::collections::HashSet<String>,
 }
 
 impl Model for PipelineTui {
@@ -184,6 +188,8 @@ impl Model for PipelineTui {
             finished_node_count: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            files_touched: std::collections::HashSet::new(),
         };
 
         (model, Command::none())
@@ -443,6 +449,15 @@ impl PipelineTui {
                 timestamp,
                 ..
             } => {
+                // Track files touched by write/edit tool calls.
+                let is_file_tool = matches!(
+                    tool_name.as_str(),
+                    "Write" | "write_file" | "Edit" | "edit_file"
+                );
+                if is_file_tool && !input_preview.is_empty() {
+                    self.files_touched.insert(input_preview.clone());
+                }
+
                 let content = if input_preview.is_empty() {
                     format!("  [tool] {tool_name}...")
                 } else {
@@ -490,10 +505,14 @@ impl PipelineTui {
             PipelineEvent::AgentTokenUsage {
                 input_tokens,
                 output_tokens,
+                cost_usd,
                 ..
             } => {
                 self.total_input_tokens += input_tokens;
                 self.total_output_tokens += output_tokens;
+                if *cost_usd > 0.0 {
+                    self.total_cost_usd += cost_usd;
+                }
                 Command::none()
             }
 
@@ -739,11 +758,18 @@ impl PipelineTui {
             .collect()
     }
 
-    /// Build styled lines for the unified console panel — all agents, prefixed with [node_id].
+    /// Build styled lines for the unified console panel — all agents, prefixed with timestamp and [node_id].
     fn render_console_lines(&self) -> Vec<Line<'static>> {
         self.console_entries
             .iter()
             .map(|entry| {
+                let ts = entry.timestamp.format("%H:%M:%S");
+                let time_span = Span::styled(
+                    format!("{ts} "),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                );
                 let prefix = match &entry.node_id {
                     Some(id) => {
                         Span::styled(format!("[{id}] "), Style::default().fg(Color::DarkGray))
@@ -779,7 +805,11 @@ impl PipelineTui {
                     LogKind::HumanResponse => Style::default().fg(Color::Magenta),
                     LogKind::Info => Style::default().fg(Color::Gray),
                 };
-                Line::from(vec![prefix, Span::styled(entry.content.clone(), style)])
+                Line::from(vec![
+                    time_span,
+                    prefix,
+                    Span::styled(entry.content.clone(), style),
+                ])
             })
             .collect()
     }
@@ -830,16 +860,22 @@ impl PipelineTui {
                 .add_modifier(Modifier::BOLD),
         ));
         let total_tokens = self.total_input_tokens + self.total_output_tokens;
-        let right_text = if total_tokens > 0 {
-            format!(
-                "{}tok  {}/{} nodes ",
-                format_token_count(total_tokens),
-                self.finished_node_count,
-                self.nodes.len()
-            )
-        } else {
-            format!("{}/{} nodes ", self.finished_node_count, self.nodes.len())
-        };
+        let mut parts: Vec<String> = Vec::new();
+        if self.total_cost_usd > 0.0 {
+            parts.push(format_cost(self.total_cost_usd));
+        }
+        if total_tokens > 0 {
+            parts.push(format!("{}tok", format_token_count(total_tokens)));
+        }
+        if !self.files_touched.is_empty() {
+            parts.push(format!("{}f", self.files_touched.len()));
+        }
+        parts.push(format!(
+            "{}/{} nodes",
+            self.finished_node_count,
+            self.nodes.len()
+        ));
+        let right_text = format!("{} ", parts.join("  "));
 
         StatusBar::new()
             .left(left_line)
@@ -961,6 +997,15 @@ impl PipelineTui {
             .right(" q quit | j/k nav | h nodes | tab cycle | g/G top/bottom ")
             .style(Style::default().bg(Color::DarkGray))
             .render(frame, area);
+    }
+}
+
+/// Format a USD cost for compact display: "$0.02", "$1.23", "$12.3".
+fn format_cost(usd: f64) -> String {
+    if usd >= 10.0 {
+        format!("${:.1}", usd)
+    } else {
+        format!("${:.2}", usd)
     }
 }
 
@@ -1403,15 +1448,18 @@ mod tests {
             node_id: "node_a".into(),
             input_tokens: 1000,
             output_tokens: 500,
+            cost_usd: 0.03,
             timestamp: Utc::now(),
         });
         assert_eq!(model.total_input_tokens, 1000);
         assert_eq!(model.total_output_tokens, 500);
+        assert!((model.total_cost_usd - 0.03).abs() < f64::EPSILON);
 
         model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
             node_id: "node_b".into(),
             input_tokens: 2000,
             output_tokens: 800,
+            cost_usd: 0.05,
             timestamp: Utc::now(),
         });
         assert_eq!(model.total_input_tokens, 3000);
@@ -1436,5 +1484,141 @@ mod tests {
         assert_eq!(model.focus, PanelFocus::Console);
         model.toggle_focus();
         assert_eq!(model.focus, PanelFocus::Nodes);
+    }
+
+    #[test]
+    fn format_cost_formats_correctly() {
+        assert_eq!(format_cost(0.01), "$0.01");
+        assert_eq!(format_cost(0.123), "$0.12");
+        assert_eq!(format_cost(1.5), "$1.50");
+        assert_eq!(format_cost(9.99), "$9.99");
+        assert_eq!(format_cost(10.0), "$10.0");
+        assert_eq!(format_cost(42.567), "$42.6");
+    }
+
+    #[test]
+    fn file_tracking_from_write_tool_calls() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        assert!(model.files_touched.is_empty());
+
+        // Write tool should track file
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: "src/lib.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 1);
+        assert!(model.files_touched.contains("src/lib.rs"));
+
+        // Edit tool should also track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "edit_file".into(),
+            tool_call_id: "call_002".into(),
+            input_preview: "src/main.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+
+        // Same file again should not increase count (HashSet)
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_003".into(),
+            input_preview: "src/lib.rs".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+
+        // Non-file tools should not track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_004".into(),
+            input_preview: "cargo test".into(),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.files_touched.len(), 2);
+    }
+
+    #[test]
+    fn file_tracking_ignores_empty_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+
+        // Write with empty preview should not track
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "Write".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: String::new(),
+            timestamp: Utc::now(),
+        });
+        assert!(model.files_touched.is_empty());
+    }
+
+    #[test]
+    fn cost_accumulates_from_token_usage_events() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        assert!((model.total_cost_usd).abs() < f64::EPSILON);
+
+        // Cost-only event (from result line: 0 tokens, nonzero cost)
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.05,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.05).abs() < f64::EPSILON);
+        // Zero tokens should not change token totals
+        assert_eq!(model.total_input_tokens, 0);
+        assert_eq!(model.total_output_tokens, 0);
+
+        // Mixed event with both tokens and cost
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 500,
+            output_tokens: 200,
+            cost_usd: 0.10,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.15).abs() < f64::EPSILON);
+        assert_eq!(model.total_input_tokens, 500);
+        assert_eq!(model.total_output_tokens, 200);
+
+        // Zero cost should not change cost total
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cost_usd: 0.0,
+            timestamp: Utc::now(),
+        });
+        assert!((model.total_cost_usd - 0.15).abs() < f64::EPSILON);
+        assert_eq!(model.total_input_tokens, 600);
+    }
+
+    #[test]
+    fn console_lines_include_timestamps() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+
+        let ts = Utc::now();
+        model.handle_pipeline_event(PipelineEvent::AgentMessage {
+            node_id: "node_a".into(),
+            text: "hello".into(),
+            timestamp: ts,
+        });
+
+        let lines = model.render_console_lines();
+        assert_eq!(lines.len(), 1);
+        let rendered = lines[0].to_string();
+        // Should contain HH:MM:SS timestamp format
+        let expected_ts = ts.format("%H:%M:%S").to_string();
+        assert!(
+            rendered.contains(&expected_ts),
+            "expected timestamp {expected_ts} in rendered line: {rendered}"
+        );
     }
 }
