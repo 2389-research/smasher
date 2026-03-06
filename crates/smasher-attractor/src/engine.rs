@@ -696,16 +696,28 @@ impl Engine {
                 }
             }
 
-            // If exit node, check goal gates before exiting.
-            // When goals are unsatisfied and the exit node has a `retry_target`
-            // attribute, route back to that node instead of exiting.
+            // If exit node, check goal gates before exiting (spec section 3.4).
+            // Outcome-aware: goals must have SUCCESS or PARTIAL_SUCCESS, not just visited.
+            // Retry target comes from the failed goal node's 4-level fallback chain.
             if node.node_type == NodeType::Exit {
-                if !self.goal_gate.all_met(&visited_nodes)
-                    && let Some(NodeAttrValue::String(target)) =
-                        node.attrs.get("retry_target")
-                {
-                    current_node_id = target.clone();
-                    continue;
+                if let Err(unsatisfied) = self.goal_gate.check_outcomes(&node_outcomes) {
+                    if let Some(failed_node) = self.graph.node(&unsatisfied.node_id)
+                        && let Some(target) = resolve_retry_target(failed_node, &self.graph)
+                    {
+                        tracing::info!(
+                            goal = %unsatisfied.node_id,
+                            reason = %unsatisfied.reason,
+                            retry_target = %target,
+                            "goal gate unsatisfied, routing to retry target"
+                        );
+                        current_node_id = target;
+                        continue;
+                    }
+                    // No retry target at any level — fail the pipeline
+                    return Err(EngineError::GoalEnforcement(GoalError::GoalsNotMet {
+                        unmet_count: 1,
+                        unmet_goals: format!("{} ({})", unsatisfied.node_id, unsatisfied.reason),
+                    }));
                 }
                 break;
             }
@@ -798,8 +810,14 @@ impl Engine {
         // Propagate any error from the loop.
         loop_result?;
 
-        // Enforce goal gates
-        self.goal_gate.enforce(&visited_nodes)?;
+        // Final goal gate enforcement (outcome-aware, spec section 3.4).
+        // Reached when the loop exits without hitting an Exit node (no outgoing edge).
+        if let Err(unsatisfied) = self.goal_gate.check_outcomes(&node_outcomes) {
+            return Err(EngineError::GoalEnforcement(GoalError::GoalsNotMet {
+                unmet_count: 1,
+                unmet_goals: format!("{} ({})", unsatisfied.node_id, unsatisfied.reason),
+            }));
+        }
 
         let pipeline_duration_ms = pipeline_start.elapsed().as_millis() as u64;
 
@@ -2940,21 +2958,18 @@ mod tests {
     async fn unsatisfied_goals_retry_target_routes_back() {
         let mut goal_attrs = HashMap::new();
         goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
-
-        // Exit node has a retry_target pointing back to "middle"
-        let mut exit_attrs = HashMap::new();
-        exit_attrs.insert(
+        goal_attrs.insert(
             "retry_target".to_string(),
             NodeAttrValue::String("middle".to_string()),
         );
 
         // Build a graph where:
-        // start -> exit (first time, goal unmet, so retry_target sends to middle)
+        // start -> exit (first time, goal unmet, so retry_target on goal_node sends to middle)
         // middle -> goal_node -> exit (second time, goal met, so complete)
         let graph = make_graph(
             vec![
                 make_node("start", NodeType::Start),
-                make_node_with_attrs("exit", NodeType::Exit, exit_attrs),
+                make_node("exit", NodeType::Exit),
                 make_node("middle", NodeType::Generic),
                 make_node_with_attrs("goal_node", NodeType::Generic, goal_attrs),
             ],
@@ -2976,7 +2991,7 @@ mod tests {
         let ctx = Context::new();
         let result = engine.run(ctx).await;
 
-        // Should succeed because retry_target routed to "middle" which leads through goal_node
+        // Should succeed because retry_target on goal_node routed to "middle"
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
         let result = result.unwrap();
         assert!(result.visited_nodes.contains(&"goal_node".to_string()));
@@ -3249,5 +3264,49 @@ mod tests {
             resolve_retry_target(&node, &graph),
             Some("actual_target".to_string())
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Test: graph-level retry_target used when goal node has no retry_target
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn graph_level_retry_target_used_for_unsatisfied_goal() {
+        let mut goal_attrs = HashMap::new();
+        goal_attrs.insert("goal_gate".to_string(), NodeAttrValue::Bool(true));
+        // No retry_target on the goal node itself
+
+        let mut graph = make_graph(
+            vec![
+                make_node("start", NodeType::Start),
+                make_node("exit", NodeType::Exit),
+                make_node("recovery", NodeType::Generic),
+                make_node_with_attrs("goal_node", NodeType::Generic, goal_attrs),
+            ],
+            vec![
+                make_edge("start", "exit"),
+                make_edge("recovery", "goal_node"),
+                make_edge("goal_node", "exit"),
+            ],
+        );
+        // Set graph-level retry_target
+        graph.graph_attrs.insert(
+            "retry_target".to_string(),
+            NodeAttrValue::String("recovery".to_string()),
+        );
+
+        let engine = Engine::with_config(
+            graph,
+            success_registry(),
+            EngineConfig {
+                max_steps: 20,
+                ..EngineConfig::default()
+            },
+        );
+        let ctx = Context::new();
+        let result = engine.run(ctx).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let result = result.unwrap();
+        assert!(result.visited_nodes.contains(&"goal_node".to_string()));
     }
 }
