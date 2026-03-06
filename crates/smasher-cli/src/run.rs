@@ -168,8 +168,6 @@ struct ClaudeCliBackend {
     streaming: bool,
     /// Optional emitter for forwarding parsed NDJSON events to the TUI pipeline bridge.
     emitter: Option<Arc<PipelineEventEmitter>>,
-    /// Node ID to attach to emitted events (only meaningful when streaming is true).
-    node_id: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -239,7 +237,7 @@ impl CodergenBackend for ClaudeCliBackend {
             // Streaming path: read stdout line-by-line as NDJSON and emit PipelineEvents.
             // stderr is consumed in the background to prevent pipe buffer deadlock.
             let emitter = self.emitter.clone();
-            let node_id = self.node_id.clone().unwrap_or_default();
+            let node_id = context.get_string("_current_node_id").unwrap_or_default();
 
             let stdout = child
                 .stdout
@@ -282,11 +280,17 @@ impl CodergenBackend for ClaudeCliBackend {
                                             block["name"].as_str().unwrap_or("").to_string();
                                         let tool_call_id =
                                             block["id"].as_str().unwrap_or("").to_string();
+                                        let input_preview =
+                                            smasher_agent::session::tool_input_preview_from_value(
+                                                &tool_name,
+                                                &block["input"],
+                                            );
                                         if let Some(ref emitter) = emitter {
                                             emitter.emit(PipelineEvent::AgentToolCallStarted {
                                                 node_id: node_id.clone(),
                                                 tool_name,
                                                 tool_call_id,
+                                                input_preview,
                                                 timestamp: chrono::Utc::now(),
                                             });
                                         }
@@ -307,6 +311,21 @@ impl CodergenBackend for ClaudeCliBackend {
                         }
                         Some("result") => {
                             result_text = Some(obj["result"].as_str().unwrap_or("").to_string());
+                            // Emit token usage if available
+                            if let Some(ref emitter) = emitter {
+                                let input_tokens =
+                                    obj["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                                let output_tokens =
+                                    obj["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                                if input_tokens > 0 || output_tokens > 0 {
+                                    emitter.emit(PipelineEvent::AgentTokenUsage {
+                                        node_id: node_id.clone(),
+                                        input_tokens,
+                                        output_tokens,
+                                        timestamp: chrono::Utc::now(),
+                                    });
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -458,7 +477,23 @@ impl CodergenBackend for ShellCodergenBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Expose pipeline context as environment variables.
+        // Run in its own process group so timeout can kill the entire subtree.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+
+        // Clear inherited env and whitelist only essentials for determinism.
+        // Pipeline context is exposed as SMASHER_CTX_* variables.
+        cmd.env_clear();
+        for var in ["PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR", "SHELL"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
         let context_snapshot = context.to_string_map();
         for (key, value) in &context_snapshot {
             if !key.starts_with('_') {
@@ -503,6 +538,13 @@ impl CodergenBackend for ShellCodergenBackend {
                 return Err(HandlerError::Other(format!("shell command failed: {e}")));
             }
             Err(_) => {
+                // Kill the entire process group so child/grandchild processes are reaped.
+                #[cfg(unix)]
+                if let Some(id) = child.id() {
+                    unsafe {
+                        libc::killpg(id as libc::pid_t, libc::SIGKILL);
+                    }
+                }
                 let _ = child.kill().await;
                 return Err(HandlerError::Other(format!(
                     "shell command timed out after {}s",
@@ -581,7 +623,7 @@ pub struct RunArgs {
     #[arg(long, default_value = "claude-cli")]
     pub backend: String,
 
-    /// Wall-clock timeout in seconds for the claude-cli backend (default: 600).
+    /// Wall-clock timeout in seconds for codergen backends (claude-cli, shell). Default: 600.
     #[arg(long, default_value = "600")]
     pub agent_timeout: u64,
 
@@ -793,7 +835,6 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                 claude_path: None,
                 streaming: tui_enabled,
                 emitter: pipeline_emitter.clone(),
-                node_id: None,
             });
             let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
                 Arc::clone(client),
@@ -931,7 +972,11 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                     Ok(event) => {
                         handle.send(TuiMsg::PipelineEvent(event));
                     }
-                    Err(_) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("TUI bridge skipped {n} events (slow consumer)");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         handle.send(TuiMsg::PipelineDone);
                         break;
                     }
@@ -1213,7 +1258,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1261,7 +1305,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1308,10 +1351,10 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: Some(Arc::clone(&emitter)),
-            node_id: Some("node1".to_string()),
         };
 
         let ctx = smasher_attractor::state::Context::new();
+        ctx.set("_current_node_id", serde_json::json!("node1"));
         backend.generate("test", None, &ctx).await.unwrap();
         drop(emitter);
 
@@ -1360,10 +1403,10 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: Some(Arc::clone(&emitter)),
-            node_id: Some("coder_node".to_string()),
         };
 
         let ctx = smasher_attractor::state::Context::new();
+        ctx.set("_current_node_id", serde_json::json!("coder_node"));
         backend.generate("test", None, &ctx).await.unwrap();
         drop(emitter);
 
@@ -1443,7 +1486,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1483,7 +1525,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1524,7 +1565,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1557,7 +1597,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1596,7 +1635,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1644,7 +1682,6 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
-            node_id: None,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1815,8 +1852,13 @@ mod tests {
         ctx.set("project_name", serde_json::json!("my_project"));
         ctx.set("_internal", serde_json::json!("hidden"));
 
+        // Verify public context is exported and underscore-prefixed internals are excluded.
         let result = backend
-            .generate("echo $SMASHER_CTX_project_name", None, &ctx)
+            .generate(
+                "echo $SMASHER_CTX_project_name; echo \"internal=${SMASHER_CTX__internal:-unset}\"",
+                None,
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -1824,8 +1866,13 @@ mod tests {
             Outcome::Success {
                 data: Some(data), ..
             } => {
-                let stdout = data["stdout"].as_str().unwrap().trim();
-                assert_eq!(stdout, "my_project");
+                let stdout = data["stdout"].as_str().unwrap();
+                let lines: Vec<&str> = stdout.trim().lines().collect();
+                assert_eq!(lines[0], "my_project");
+                assert_eq!(
+                    lines[1], "internal=unset",
+                    "_internal should not be exported"
+                );
             }
             other => panic!("expected success, got {other:?}"),
         }

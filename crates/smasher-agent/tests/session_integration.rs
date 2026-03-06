@@ -627,6 +627,7 @@ async fn events_emitted_for_tool_use_flow() {
     if let Some(SessionEvent::ToolCallStarted {
         tool_name,
         tool_call_id,
+        ..
     }) = tool_started
     {
         assert_eq!(tool_name, "shell");

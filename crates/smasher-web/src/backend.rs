@@ -117,10 +117,12 @@ impl CodergenBackend for AgentCodergenBackend {
                             SessionEvent::ToolCallStarted {
                                 tool_name,
                                 tool_call_id,
+                                input_preview,
                             } => Some(PipelineEvent::AgentToolCallStarted {
                                 node_id: bridge_node_id.clone(),
                                 tool_name,
                                 tool_call_id,
+                                input_preview,
                                 timestamp: chrono::Utc::now(),
                             }),
                             SessionEvent::ToolCallCompleted {

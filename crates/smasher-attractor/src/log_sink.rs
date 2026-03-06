@@ -235,6 +235,7 @@ fn event_kind_str(event: &PipelineEvent) -> &'static str {
         PipelineEvent::AgentToolCallCompleted { .. } => "agent_tool_call_completed",
         PipelineEvent::AgentMessage { .. } => "agent_message",
         PipelineEvent::AgentTurnStarted { .. } => "agent_turn_started",
+        PipelineEvent::AgentTokenUsage { .. } => "agent_token_usage",
     }
 }
 

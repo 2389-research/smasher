@@ -1,4 +1,4 @@
-.PHONY: all check build test clippy lint fmt clean doc test-cli watch run-complete run-chat scenarios stats test-verbose test-single coverage bench pre-commit
+.PHONY: all check build test clippy lint fmt clean doc test-cli watch run-complete run-chat scenarios stats test-verbose test-single coverage bench pre-commit install uninstall
 
 all: fmt-check lint check test
 
@@ -15,6 +15,16 @@ release:
 	cargo build --workspace --release
 	mkdir -p bin
 	cp target/release/conformance bin/conformance
+
+# ── Install ─────────────────────────────────────────────────────────
+PREFIX ?= /usr/local
+
+install: release
+	install -d $(PREFIX)/bin
+	install -m 755 target/release/smasher $(PREFIX)/bin/smasher
+
+uninstall:
+	rm -f $(PREFIX)/bin/smasher
 
 # ── Quality ──────────────────────────────────────────────────────────
 test:

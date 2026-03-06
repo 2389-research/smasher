@@ -2497,6 +2497,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "smasher-agent",

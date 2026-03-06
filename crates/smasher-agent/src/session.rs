@@ -21,6 +21,64 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// Extract a short, human-readable preview from a tool call's input arguments.
+///
+/// Returns tool-specific one-liners: the command for bash, the file path for
+/// read/write/edit, the pattern for grep/glob, etc. Falls back to the first
+/// string value in the input JSON, truncated.
+pub fn tool_input_preview(tool_name: &str, arguments_json: &str) -> String {
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(arguments_json) else {
+        return String::new();
+    };
+    tool_input_preview_from_value(tool_name, &input)
+}
+
+/// Same as [`tool_input_preview`] but takes a pre-parsed `serde_json::Value`.
+pub fn tool_input_preview_from_value(tool_name: &str, input: &serde_json::Value) -> String {
+    let s = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+
+    let preview = match tool_name.to_lowercase().as_str() {
+        "bash" | "shell" | "execute_command" => s("command").to_string(),
+        "read" | "read_file" => s("file_path").to_string(),
+        "write" | "write_file" | "create_file" => s("file_path").to_string(),
+        "edit" | "edit_file" => s("file_path").to_string(),
+        "grep" | "search" | "ripgrep" => {
+            let pattern = s("pattern");
+            let path = s("path");
+            if path.is_empty() {
+                format!("/{pattern}/")
+            } else {
+                format!("/{pattern}/ {path}")
+            }
+        }
+        "glob" | "find_files" => s("pattern").to_string(),
+        "web_search" | "websearch" => s("query").to_string(),
+        "web_fetch" | "webfetch" | "fetch" => s("url").to_string(),
+        _ => {
+            // Fall back to first string value in the input object
+            if let Some(obj) = input.as_object() {
+                for (_, v) in obj {
+                    if let Some(val) = v.as_str() {
+                        return truncate_preview(val, 80);
+                    }
+                }
+            }
+            String::new()
+        }
+    };
+
+    truncate_preview(&preview, 80)
+}
+
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Tracks approximate context window usage across an agent session.
 ///
 /// Callers feed token counts in via `add_tokens`, then check `is_warning()`
@@ -329,6 +387,7 @@ impl Session {
                 self.event_emitter.emit(SessionEvent::ToolCallStarted {
                     tool_name: tc.name.clone(),
                     tool_call_id: tc.id.clone(),
+                    input_preview: tool_input_preview(&tc.name, &tc.arguments),
                 });
             }
 
@@ -680,6 +739,77 @@ mod tests {
     }
 
     // ── Tests ────────────────────────────────────────────────────────
+
+    // ── tool_input_preview ────────────────────────────────────────────
+
+    #[test]
+    fn tool_input_preview_bash_extracts_command() {
+        let preview = tool_input_preview("bash", r#"{"command":"cargo test --workspace"}"#);
+        assert_eq!(preview, "cargo test --workspace");
+    }
+
+    #[test]
+    fn tool_input_preview_read_extracts_file_path() {
+        let preview = tool_input_preview("Read", r#"{"file_path":"/src/main.rs"}"#);
+        assert_eq!(preview, "/src/main.rs");
+    }
+
+    #[test]
+    fn tool_input_preview_edit_extracts_file_path() {
+        let preview = tool_input_preview(
+            "edit_file",
+            r#"{"file_path":"/src/lib.rs","old_string":"foo","new_string":"bar"}"#,
+        );
+        assert_eq!(preview, "/src/lib.rs");
+    }
+
+    #[test]
+    fn tool_input_preview_grep_extracts_pattern_and_path() {
+        let preview = tool_input_preview("Grep", r#"{"pattern":"fn main","path":"src/"}"#);
+        assert_eq!(preview, "/fn main/ src/");
+    }
+
+    #[test]
+    fn tool_input_preview_grep_pattern_only() {
+        let preview = tool_input_preview("grep", r#"{"pattern":"TODO"}"#);
+        assert_eq!(preview, "/TODO/");
+    }
+
+    #[test]
+    fn tool_input_preview_glob_extracts_pattern() {
+        let preview = tool_input_preview("Glob", r#"{"pattern":"**/*.rs"}"#);
+        assert_eq!(preview, "**/*.rs");
+    }
+
+    #[test]
+    fn tool_input_preview_unknown_tool_uses_first_string_value() {
+        let preview = tool_input_preview("custom_tool", r#"{"query":"find me stuff"}"#);
+        assert_eq!(preview, "find me stuff");
+    }
+
+    #[test]
+    fn tool_input_preview_truncates_long_values() {
+        let long_cmd = "x".repeat(100);
+        let json = format!(r#"{{"command":"{long_cmd}"}}"#);
+        let preview = tool_input_preview("bash", &json);
+        assert_eq!(preview.chars().count(), 81); // 80 chars + "…"
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_input_preview_handles_invalid_json() {
+        let preview = tool_input_preview("bash", "not json");
+        assert_eq!(preview, "");
+    }
+
+    #[test]
+    fn tool_input_preview_handles_multibyte_chars_without_panic() {
+        // CJK and emoji are multi-byte in UTF-8; slicing by byte offset would panic
+        let cmd = "echo 🎉日本語テスト".repeat(10);
+        let json = format!(r#"{{"command":"{cmd}"}}"#);
+        let preview = tool_input_preview("bash", &json);
+        assert!(preview.chars().count() <= 81); // 80 + ellipsis
+    }
 
     // ── SessionOutput ────────────────────────────────────────────────
 
@@ -1413,6 +1543,7 @@ mod tests {
         if let Some(SessionEvent::ToolCallStarted {
             tool_name,
             tool_call_id,
+            ..
         }) = started
         {
             assert_eq!(tool_name, "echo");

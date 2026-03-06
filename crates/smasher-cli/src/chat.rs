@@ -74,9 +74,14 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             match rx.recv().await {
                 Ok(SessionEvent::ToolCallStarted {
                     tool_name,
-                    tool_call_id: _,
+                    input_preview,
+                    ..
                 }) => {
-                    eprintln!("[tool] {tool_name}...");
+                    if input_preview.is_empty() {
+                        eprintln!("[tool] {tool_name}...");
+                    } else {
+                        eprintln!("[tool] {tool_name} {input_preview}...");
+                    }
                 }
                 Ok(SessionEvent::ToolCallCompleted {
                     tool_name,

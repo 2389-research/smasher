@@ -243,15 +243,18 @@ mod tests {
         emitter.emit(SessionEvent::ToolCallStarted {
             tool_name: "bash".into(),
             tool_call_id: "call_001".into(),
+            input_preview: "ls -la".into(),
         });
 
         match rx.recv().await.unwrap() {
             SessionEvent::ToolCallStarted {
                 tool_name,
                 tool_call_id,
+                input_preview,
             } => {
                 assert_eq!(tool_name, "bash");
                 assert_eq!(tool_call_id, "call_001");
+                assert_eq!(input_preview, "ls -la");
             }
             other => panic!("unexpected: {:?}", other),
         }

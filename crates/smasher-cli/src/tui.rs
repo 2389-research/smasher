@@ -125,6 +125,10 @@ pub struct PipelineTui {
     console_viewport: Viewport,
     focus: PanelFocus,
     finished_node_count: usize,
+    /// Cumulative input tokens across all nodes.
+    total_input_tokens: u64,
+    /// Cumulative output tokens across all nodes.
+    total_output_tokens: u64,
 }
 
 impl Model for PipelineTui {
@@ -177,6 +181,8 @@ impl Model for PipelineTui {
             console_viewport,
             focus: PanelFocus::Nodes,
             finished_node_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         };
 
         (model, Command::none())
@@ -427,14 +433,20 @@ impl PipelineTui {
             PipelineEvent::AgentToolCallStarted {
                 node_id,
                 tool_name,
+                input_preview,
                 timestamp,
                 ..
             } => {
+                let content = if input_preview.is_empty() {
+                    format!("  [tool] {tool_name}...")
+                } else {
+                    format!("  [tool] {tool_name} {input_preview}...")
+                };
                 self.push_both(LogEntry {
                     timestamp: *timestamp,
                     node_id: Some(node_id.clone()),
                     kind: LogKind::ToolCallStart,
-                    content: format!("  [tool] {tool_name}..."),
+                    content,
                 });
                 Command::none()
             }
@@ -444,16 +456,38 @@ impl PipelineTui {
                 tool_name,
                 duration_ms,
                 is_error,
+                result_preview,
                 timestamp,
                 ..
             } => {
-                let status_str = if *is_error { "ERR" } else { "ok" };
+                let content = if *is_error && !result_preview.is_empty() {
+                    let preview = if result_preview.chars().count() > 60 {
+                        let t: String = result_preview.chars().take(60).collect();
+                        format!("{t}…")
+                    } else {
+                        result_preview.clone()
+                    };
+                    format!("  [tool] {tool_name} ERR ({duration_ms}ms) \"{preview}\"")
+                } else {
+                    let status_str = if *is_error { "ERR" } else { "ok" };
+                    format!("  [tool] {tool_name} {status_str} ({duration_ms}ms)")
+                };
                 self.push_both(LogEntry {
                     timestamp: *timestamp,
                     node_id: Some(node_id.clone()),
                     kind: LogKind::ToolCallComplete,
-                    content: format!("  [tool] {tool_name} {status_str} ({duration_ms}ms)"),
+                    content,
                 });
+                Command::none()
+            }
+
+            PipelineEvent::AgentTokenUsage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                self.total_input_tokens += input_tokens;
+                self.total_output_tokens += output_tokens;
                 Command::none()
             }
 
@@ -462,8 +496,9 @@ impl PipelineTui {
                 text,
                 timestamp,
             } => {
-                let truncated = if text.len() > 120 {
-                    format!("{}...", &text[..120])
+                let truncated = if text.chars().count() > 120 {
+                    let t: String = text.chars().take(120).collect();
+                    format!("{t}…")
                 } else {
                     text.clone()
                 };
@@ -788,12 +823,22 @@ impl PipelineTui {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ));
-        let node_counter = format!("{}/{} nodes ", self.finished_node_count, self.nodes.len());
+        let total_tokens = self.total_input_tokens + self.total_output_tokens;
+        let right_text = if total_tokens > 0 {
+            format!(
+                "{}tok  {}/{} nodes ",
+                format_token_count(total_tokens),
+                self.finished_node_count,
+                self.nodes.len()
+            )
+        } else {
+            format!("{}/{} nodes ", self.finished_node_count, self.nodes.len())
+        };
 
         StatusBar::new()
             .left(left_line)
             .center(center_line)
-            .right(node_counter)
+            .right(right_text)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White))
             .render(frame, area);
     }
@@ -910,6 +955,17 @@ impl PipelineTui {
             .right(" q quit | j/k nav | h nodes | tab cycle | g/G top/bottom ")
             .style(Style::default().bg(Color::DarkGray))
             .render(frame, area);
+    }
+}
+
+/// Format a token count for compact display: "1.2k", "45.3k", "1.2M".
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -1180,12 +1236,14 @@ mod tests {
             node_id: "node_a".into(),
             tool_name: "bash".into(),
             tool_call_id: "call_001".into(),
+            input_preview: "cargo test".into(),
             timestamp: Utc::now(),
         });
         assert_eq!(model.log_entries.len(), before + 1);
         let entry = model.log_entries.last().unwrap();
         assert_eq!(entry.node_id.as_deref(), Some("node_a"));
         assert!(entry.content.contains("bash"));
+        assert!(entry.content.contains("cargo test"));
     }
 
     #[test]
@@ -1242,6 +1300,7 @@ mod tests {
             node_id: "node_b".into(),
             tool_name: "bash".into(),
             tool_call_id: "call_001".into(),
+            input_preview: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -1279,6 +1338,86 @@ mod tests {
             text_1.contains("node_b"),
             "expected node_b prefix, got: {text_1}"
         );
+    }
+
+    #[test]
+    fn tool_call_started_shows_empty_preview_without_extra_space() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallStarted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            input_preview: String::new(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.content, "  [tool] bash...");
+    }
+
+    #[test]
+    fn tool_call_completed_shows_error_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallCompleted {
+            node_id: "node_a".into(),
+            tool_name: "bash".into(),
+            tool_call_id: "call_001".into(),
+            duration_ms: 500,
+            is_error: true,
+            result_preview: "command not found: ffmpeg".into(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert!(entry.content.contains("ERR"));
+        assert!(entry.content.contains("command not found: ffmpeg"));
+    }
+
+    #[test]
+    fn tool_call_completed_ok_does_not_show_preview() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a"]));
+        model.handle_pipeline_event(PipelineEvent::AgentToolCallCompleted {
+            node_id: "node_a".into(),
+            tool_name: "Read".into(),
+            tool_call_id: "call_001".into(),
+            duration_ms: 12,
+            is_error: false,
+            result_preview: "file contents here".into(),
+            timestamp: Utc::now(),
+        });
+        let entry = model.log_entries.last().unwrap();
+        assert_eq!(entry.content, "  [tool] Read ok (12ms)");
+    }
+
+    #[test]
+    fn token_usage_accumulates() {
+        let (mut model, _) = PipelineTui::init(make_flags("test", &["node_a", "node_b"]));
+        assert_eq!(model.total_input_tokens, 0);
+        assert_eq!(model.total_output_tokens, 0);
+
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_a".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.total_input_tokens, 1000);
+        assert_eq!(model.total_output_tokens, 500);
+
+        model.handle_pipeline_event(PipelineEvent::AgentTokenUsage {
+            node_id: "node_b".into(),
+            input_tokens: 2000,
+            output_tokens: 800,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(model.total_input_tokens, 3000);
+        assert_eq!(model.total_output_tokens, 1300);
+    }
+
+    #[test]
+    fn format_token_count_formats_correctly() {
+        assert_eq!(format_token_count(500), "500");
+        assert_eq!(format_token_count(1500), "1.5k");
+        assert_eq!(format_token_count(45300), "45.3k");
+        assert_eq!(format_token_count(1_200_000), "1.2M");
     }
 
     #[test]
