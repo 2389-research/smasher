@@ -59,7 +59,11 @@ pub async fn run(args: LintArgs) -> Result<(), CliError> {
     let report = runner.run(&resolved);
 
     // Print diagnostics to stderr.
-    for diag in &report.diagnostics {
+    for diag in report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity != Severity::Info)
+    {
         let severity_tag = match diag.severity {
             Severity::Error => "E",
             Severity::Warning => "W",
@@ -107,7 +111,11 @@ pub fn lint_graph(graph: &smasher_attractor::graph::Graph) -> Result<(), CliErro
     let runner = LintRunner::with_builtins();
     let report = runner.run(graph);
 
-    for diag in &report.diagnostics {
+    for diag in report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity != Severity::Info)
+    {
         let severity_tag = match diag.severity {
             Severity::Error => "E",
             Severity::Warning => "W",

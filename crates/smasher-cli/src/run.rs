@@ -978,13 +978,9 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         ..EngineConfig::default()
     };
 
-    // Create a pipeline event emitter when the TUI is active so the engine and
-    // the ClaudeCliBackend streaming path can both forward events to the TUI.
-    let pipeline_emitter: Option<Arc<PipelineEventEmitter>> = if tui_enabled {
-        Some(Arc::new(PipelineEventEmitter::new(256)))
-    } else {
-        None
-    };
+    // Create a pipeline event emitter so the engine can broadcast events to
+    // both the TUI dashboard and the headless progress logger.
+    let pipeline_emitter = Arc::new(PipelineEventEmitter::new(256));
 
     let mut registry = default_registry();
     match args.backend.as_str() {
@@ -995,7 +991,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                 timeout: Duration::from_secs(args.agent_timeout),
                 claude_path: None,
                 streaming: tui_enabled,
-                emitter: pipeline_emitter.clone(),
+                emitter: Some(pipeline_emitter.clone()),
                 consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 max_consecutive_timeouts: args.max_timeouts,
             });
@@ -1122,9 +1118,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     engine.apply_sub_pipeline_transform(&pipeline_dir)?;
 
     // Attach the emitter so the engine broadcasts PipelineEvents during execution.
-    if let Some(ref emitter) = pipeline_emitter {
-        engine = engine.with_emitter(Arc::clone(emitter));
-    }
+    engine = engine.with_emitter(Arc::clone(&pipeline_emitter));
 
     let context = Context::default();
 
@@ -1135,8 +1129,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
     // Run the engine, with or without the TUI dashboard.
     let result = if tui_enabled {
-        let emitter = pipeline_emitter.as_ref().unwrap();
-        let event_rx = emitter.subscribe();
+        let event_rx = pipeline_emitter.subscribe();
 
         // Set up the human gate response channel when a ChannelInterviewer is in use.
         let (human_response_tx, human_response_rx) = if human_gate_question_rx.is_some() {
@@ -1229,10 +1222,19 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         engine_task
             .await
             .map_err(|e| CliError::Other(format!("engine task panicked: {e}")))?
-    } else if let Some(checkpoint) = resume_checkpoint {
-        engine.run_from_checkpoint(checkpoint, context).await
     } else {
-        engine.run(context).await
+        // Headless mode: log pipeline progress to stderr.
+        let event_rx = pipeline_emitter.subscribe();
+        let headless_pipeline_name = tui_pipeline_name.clone();
+        tokio::spawn(async move {
+            crate::headless::log_pipeline_events(event_rx, &headless_pipeline_name).await;
+        });
+
+        if let Some(checkpoint) = resume_checkpoint {
+            engine.run_from_checkpoint(checkpoint, context).await
+        } else {
+            engine.run(context).await
+        }
     };
 
     // Always clean up the worktree, even if the engine failed. Capture the

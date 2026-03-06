@@ -5,13 +5,19 @@
 
 ## Overview
 
-The `smasher` binary provides three subcommands for AI workflow orchestration:
+The `smasher` binary provides nine subcommands for AI workflow orchestration:
 
 | Subcommand | Purpose |
 |------------|---------|
 | `complete` | Send a one-shot prompt to an LLM |
 | `chat` | Start an interactive agent chat session |
 | `run` | Execute a DOT-based pipeline |
+| `resume` | Resume a checkpointed pipeline run |
+| `render` | Render a DOT pipeline file to SVG or PNG |
+| `serve` | Start the web dashboard server |
+| `ingest` | Convert English requirements into a DOT pipeline file using an LLM |
+| `archive` | Create a compressed archive of a run directory |
+| `lint` | Validate a DOT pipeline file with lint rules |
 
 ## Global Flags
 

@@ -234,9 +234,9 @@ impl ConsoleInterviewer {
         }
     }
 
-    /// Create a ConsoleInterviewer that reads from stdin and writes to stdout.
+    /// Create a ConsoleInterviewer that reads from stdin and writes to stderr.
     pub fn from_stdio() -> Self {
-        Self::new(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
+        Self::new(std::io::BufReader::new(std::io::stdin()), std::io::stderr())
     }
 
     /// Write a string to the output and flush it.
