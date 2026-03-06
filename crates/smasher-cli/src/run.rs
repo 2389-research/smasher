@@ -176,6 +176,10 @@ struct ClaudeCliBackend {
     streaming: bool,
     /// Optional emitter for forwarding parsed NDJSON events to the TUI pipeline bridge.
     emitter: Option<Arc<PipelineEventEmitter>>,
+    /// Consecutive timeout counter shared across invocations. When this reaches
+    /// `max_consecutive_timeouts`, the backend aborts the pipeline.
+    consecutive_timeouts: Arc<std::sync::atomic::AtomicU32>,
+    max_consecutive_timeouts: u32,
 }
 
 #[async_trait::async_trait]
@@ -400,10 +404,7 @@ impl CodergenBackend for ClaudeCliBackend {
                 }
                 Err(_) => {
                     let _ = child.kill().await;
-                    return Err(HandlerError::Other(format!(
-                        "claude CLI timed out after {}s",
-                        self.timeout.as_secs()
-                    )));
+                    return Err(self.record_timeout());
                 }
             };
 
@@ -419,6 +420,8 @@ impl CodergenBackend for ClaudeCliBackend {
             }
 
             let text = result_text.unwrap_or_default();
+            self.consecutive_timeouts
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             return Ok(Outcome::success_with(serde_json::json!({"response": text})));
         }
 
@@ -469,10 +472,7 @@ impl CodergenBackend for ClaudeCliBackend {
             }
             Err(_) => {
                 let _ = child.kill().await;
-                return Err(HandlerError::Other(format!(
-                    "claude CLI timed out after {}s",
-                    self.timeout.as_secs()
-                )));
+                return Err(self.record_timeout());
             }
         };
 
@@ -489,7 +489,36 @@ impl CodergenBackend for ClaudeCliBackend {
         }
 
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        self.consecutive_timeouts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(Outcome::success_with(serde_json::json!({"response": text})))
+    }
+}
+
+impl ClaudeCliBackend {
+    /// Record a timeout and return the appropriate error. Increments the
+    /// consecutive timeout counter and aborts the pipeline if the threshold
+    /// is reached.
+    fn record_timeout(&self) -> HandlerError {
+        let count = self
+            .consecutive_timeouts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if count >= self.max_consecutive_timeouts {
+            HandlerError::Other(format!(
+                "aborting: {} consecutive timeouts ({}s each). \
+                 Consider increasing --agent-timeout or simplifying node prompts.",
+                count,
+                self.timeout.as_secs()
+            ))
+        } else {
+            HandlerError::Other(format!(
+                "claude CLI timed out after {}s ({}/{} consecutive timeouts)",
+                self.timeout.as_secs(),
+                count,
+                self.max_consecutive_timeouts
+            ))
+        }
     }
 }
 
@@ -684,13 +713,21 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_tui: bool,
 
+    /// Disable the TUI dashboard (alias for --no-tui).
+    #[arg(long)]
+    pub headless: bool,
+
     /// Resume the latest incomplete run of this pipeline instead of starting fresh.
     #[arg(long)]
     pub resume: bool,
+
+    /// Abort pipeline after this many consecutive agent timeouts. Default: 3.
+    #[arg(long, default_value = "3")]
+    pub max_timeouts: u32,
 }
 
 fn should_enable_tui(args: &RunArgs) -> bool {
-    if args.no_tui {
+    if args.no_tui || args.headless {
         return false;
     }
     if args.tui {
@@ -953,6 +990,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                 claude_path: None,
                 streaming: tui_enabled,
                 emitter: pipeline_emitter.clone(),
+                consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                max_consecutive_timeouts: args.max_timeouts,
             });
             let agent_backend: Arc<dyn CodergenBackend> = Arc::new(AgentCodergenBackend::new(
                 Arc::clone(client),
@@ -1460,6 +1499,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1507,6 +1548,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1553,6 +1596,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: Some(Arc::clone(&emitter)),
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1605,6 +1650,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: true,
             emitter: Some(Arc::clone(&emitter)),
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1688,6 +1735,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1727,6 +1776,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1767,6 +1818,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1799,6 +1852,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1810,6 +1865,52 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
             "error should mention timeout, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cli_backend_consecutive_timeouts_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("claude");
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let backend = ClaudeCliBackend {
+            working_dir: tmp.path().display().to_string(),
+            timeout: std::time::Duration::from_millis(100),
+            claude_path: Some(script_path.display().to_string()),
+            streaming: false,
+            emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 2,
+        };
+
+        let ctx = smasher_attractor::state::Context::new();
+
+        // First timeout: shows 1/2
+        let err1 = backend
+            .generate("test", None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err1.contains("1/2"),
+            "first timeout should show 1/2, got: {err1}"
+        );
+
+        // Second timeout: triggers abort
+        let err2 = backend
+            .generate("test", None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err2.contains("aborting"),
+            "second timeout should abort, got: {err2}"
         );
     }
 
@@ -1837,6 +1938,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
@@ -1884,6 +1987,8 @@ mod tests {
             claude_path: Some(script_path.display().to_string()),
             streaming: false,
             emitter: None,
+            consecutive_timeouts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            max_consecutive_timeouts: 3,
         };
 
         let ctx = smasher_attractor::state::Context::new();
