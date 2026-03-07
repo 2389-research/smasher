@@ -345,6 +345,7 @@ dependencies = [
 [[package]]
 name = "boba"
 version = "0.1.0"
+source = "git+https://github.com/2389-research/boba.git?rev=78b5e8a#78b5e8a6c8c7bd6829484de035365192e5f41157"
 dependencies = [
  "boba-core",
  "boba-widgets",
@@ -356,6 +357,7 @@ dependencies = [
 [[package]]
 name = "boba-core"
 version = "0.1.0"
+source = "git+https://github.com/2389-research/boba.git?rev=78b5e8a#78b5e8a6c8c7bd6829484de035365192e5f41157"
 dependencies = [
  "crossterm",
  "futures",
@@ -369,6 +371,7 @@ dependencies = [
 [[package]]
 name = "boba-widgets"
 version = "0.1.0"
+source = "git+https://github.com/2389-research/boba.git?rev=78b5e8a#78b5e8a6c8c7bd6829484de035365192e5f41157"
 dependencies = [
  "boba-core",
  "crossterm",

@@ -75,4 +75,4 @@ smasher-attractor = { path = "crates/smasher-attractor" }
 smasher-web = { path = "crates/smasher-web" }
 
 # TUI framework
-boba = { path = "/Users/harper/Public/src/2389/boba/crates/boba" }
+boba = { git = "https://github.com/2389-research/boba.git", rev = "78b5e8a" }
