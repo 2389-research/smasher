@@ -154,6 +154,8 @@ jobs:
         with:
           shared-key: "ci-test"
           save-if: false
+      - name: Build CLI binary (needed by cli_spec tests)
+        run: cargo build -p smasher-cli
       - name: Run per-crate test report
         run: bash scripts/ci-test-report.sh test-results
       - name: Upload test result artifacts
