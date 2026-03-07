@@ -237,28 +237,28 @@ pub struct ExecutionResult {
 /// Returns None if no retry target is found at any level.
 pub(crate) fn resolve_retry_target(node: &GraphNode, graph: &Graph) -> Option<String> {
     // 1. Node-level retry_target
-    if let Some(NodeAttrValue::String(t)) = node.attrs.get("retry_target") {
-        if !t.is_empty() {
-            return Some(t.clone());
-        }
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("retry_target")
+        && !t.is_empty()
+    {
+        return Some(t.clone());
     }
     // 2. Node-level fallback_retry_target
-    if let Some(NodeAttrValue::String(t)) = node.attrs.get("fallback_retry_target") {
-        if !t.is_empty() {
-            return Some(t.clone());
-        }
+    if let Some(NodeAttrValue::String(t)) = node.attrs.get("fallback_retry_target")
+        && !t.is_empty()
+    {
+        return Some(t.clone());
     }
     // 3. Graph-level retry_target
-    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("retry_target") {
-        if !t.is_empty() {
-            return Some(t.clone());
-        }
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("retry_target")
+        && !t.is_empty()
+    {
+        return Some(t.clone());
     }
     // 4. Graph-level fallback_retry_target
-    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("fallback_retry_target") {
-        if !t.is_empty() {
-            return Some(t.clone());
-        }
+    if let Some(NodeAttrValue::String(t)) = graph.graph_attrs.get("fallback_retry_target")
+        && !t.is_empty()
+    {
+        return Some(t.clone());
     }
     None
 }

@@ -285,32 +285,32 @@ pub fn convert_request(request: &Request) -> OpenAiRequest {
                 let mut params = t.parameters.clone();
                 let mut strict_eligible = true;
 
-                if let Some(obj) = params.as_object_mut() {
-                    if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
-                        // Check if all properties are covered by required.
-                        let prop_keys: Vec<String> = obj
-                            .get("properties")
-                            .and_then(|p| p.as_object())
-                            .map(|p| p.keys().cloned().collect())
-                            .unwrap_or_default();
-                        let required_keys: Vec<String> = obj
-                            .get("required")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                if let Some(obj) = params.as_object_mut()
+                    && obj.get("type").and_then(|v| v.as_str()) == Some("object")
+                {
+                    // Check if all properties are covered by required.
+                    let prop_keys: Vec<String> = obj
+                        .get("properties")
+                        .and_then(|p| p.as_object())
+                        .map(|p| p.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let required_keys: Vec<String> = obj
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                        let all_required = prop_keys.iter().all(|k| required_keys.contains(k));
+                    let all_required = prop_keys.iter().all(|k| required_keys.contains(k));
 
-                        if all_required {
-                            obj.entry("additionalProperties")
-                                .or_insert(serde_json::Value::Bool(false));
-                        } else {
-                            strict_eligible = false;
-                        }
+                    if all_required {
+                        obj.entry("additionalProperties")
+                            .or_insert(serde_json::Value::Bool(false));
+                    } else {
+                        strict_eligible = false;
                     }
                 }
 
