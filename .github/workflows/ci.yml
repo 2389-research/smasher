@@ -65,7 +65,7 @@ jobs:
           cargo test --workspace 2>&1 | tee test-logs/full-output.log
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs
           path: test-logs/
@@ -93,7 +93,7 @@ jobs:
           cargo clippy --workspace -- -D warnings 2>&1 | tee clippy-logs/clippy-human.log
       - name: Upload clippy logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clippy-logs
           path: clippy-logs/
@@ -135,7 +135,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: Upload doc build log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: doc-build-log
           path: doc-build.log
@@ -158,7 +158,7 @@ jobs:
         run: bash scripts/ci-test-report.sh test-results
       - name: Upload test result artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: test-results/

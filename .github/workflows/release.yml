@@ -30,7 +30,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p smasher-cli
       - name: Upload release binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smasher-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/smasher
