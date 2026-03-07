@@ -875,7 +875,7 @@ impl PipelineTui {
             .collect()
     }
 
-    /// Build styled lines for the unified console panel — all agents, prefixed with timestamp and [node_id].
+    /// Build styled lines for the unified console panel — all agents, prefixed with timestamp and \[node_id\].
     fn render_console_lines(&self) -> Vec<Line<'static>> {
         self.console_entries
             .iter()

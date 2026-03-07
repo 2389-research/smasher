@@ -56,6 +56,8 @@ jobs:
         with:
           shared-key: "ci-test"
           cache-on-failure: true
+      - name: Build CLI binary (needed by cli_spec tests)
+        run: cargo build -p smasher-cli
       - name: Run tests and capture output
         run: |
           set -o pipefail
@@ -110,6 +112,7 @@ jobs:
           shared-key: "ci-msrv"
           cache-on-failure: true
       - run: cargo check --workspace
+      - run: cargo build -p smasher-cli
       - run: cargo test --workspace
 
   # ── Documentation build ────────────────────────────────────────────

@@ -340,7 +340,7 @@ pub struct StatusStyle {
     pub border_color: &'static str,
     /// DOT `penwidth` attribute for the node border.
     pub pen_width: &'static str,
-    /// Text suffix appended to the node label (e.g. " [RUNNING]").
+    /// Text suffix appended to the node label (e.g. " \[RUNNING\]").
     pub label_suffix: &'static str,
 }
 

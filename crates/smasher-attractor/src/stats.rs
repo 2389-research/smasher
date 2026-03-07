@@ -3,7 +3,7 @@
 
 //! Pipeline statistics collected during execution.
 //!
-//! After every pipeline run, an [`ExecutionResult`] carries a [`PipelineStats`]
+//! After every pipeline run, an [`crate::engine::ExecutionResult`] carries a [`PipelineStats`]
 //! that summarises how long each node took, how many nodes succeeded or failed,
 //! and the total wall-clock duration.
 
