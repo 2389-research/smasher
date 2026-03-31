@@ -15,7 +15,7 @@ smasher-attractor.workspace = true
 
 axum = { version = "0.8", features = ["macros"] }
 askama = "0.12"
-askama_axum = "0.4"
+askama_axum = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 async-stream = "0.3"
 futures.workspace = true
