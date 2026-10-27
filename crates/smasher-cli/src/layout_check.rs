@@ -241,3 +241,115 @@ fn no_circular_dependencies() {
         "smasher-cli should depend on smasher-web"
     );
 }
+
+/// Read the locked versions of `package_name` from the workspace `Cargo.lock`.
+fn locked_versions(package_name: &str) -> Vec<String> {
+    let root = workspace_root();
+    let lock_path = root.join("Cargo.lock");
+    let contents = fs::read_to_string(&lock_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", lock_path.display()));
+
+    let mut versions = Vec::new();
+    let mut current_package: Option<String> = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            current_package = None;
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("name = ") {
+            current_package = Some(name.trim_matches('"').to_string());
+            continue;
+        }
+        if let Some(version) = trimmed.strip_prefix("version = ")
+            && current_package.as_deref() == Some(package_name)
+        {
+            versions.push(version.trim_matches('"').to_string());
+            current_package = None;
+        }
+    }
+
+    assert!(
+        !versions.is_empty(),
+        "package '{package_name}' not found in {}",
+        lock_path.display()
+    );
+    versions
+}
+
+/// Returns true when `version` is affected by RUSTSEC-2026-0098.
+///
+/// Patched ranges are `>=0.103.12, <0.104.0-alpha.1` and
+/// `>=0.104.0-alpha.6`, so every `0.104.0-alpha.N` below `alpha.6` is still
+/// vulnerable even though it sorts after `0.103.12`. Conversely, pre-releases
+/// of `0.103.12` (e.g. `0.103.12-rc.1`) sort *below* `0.103.12` and are still
+/// vulnerable. Comparing parsed `semver` versions keeps both edges, and any
+/// pre-release/build metadata, correct.
+fn rustls_webpki_is_vulnerable(version: &str) -> bool {
+    let bound = |s: &str| semver::Version::parse(s).expect("advisory bound should be valid semver");
+
+    let Ok(version) = semver::Version::parse(version) else {
+        // An unparseable version cannot be proven patched, so report it.
+        return true;
+    };
+
+    let first_patch = bound("0.103.12");
+    let patched_alpha = bound("0.104.0-alpha.1");
+    let patched_alpha_6 = bound("0.104.0-alpha.6");
+
+    version < first_patch || (version >= patched_alpha && version < patched_alpha_6)
+}
+
+#[test]
+fn rustls_webpki_is_patched_for_rustsec_2026_0098() {
+    // RUSTSEC-2026-0098 / GHSA-965h-392x-2mh5: name constraints for URI names
+    // were ignored and therefore accepted. URI name constraints are now
+    // rejected unconditionally. Patched in >=0.103.12 (and >=0.104.0-alpha.6).
+    let versions = locked_versions("rustls-webpki");
+    for version in &versions {
+        assert!(
+            !rustls_webpki_is_vulnerable(version),
+            "Cargo.lock pins rustls-webpki {version}, which is affected by \
+             RUSTSEC-2026-0098; upgrade to >=0.103.12 (or >=0.104.0-alpha.6)"
+        );
+    }
+}
+
+#[test]
+fn rustls_webpki_vulnerable_version_predicate_is_accurate() {
+    for vulnerable in [
+        "0.103.9",
+        "0.103.0",
+        "0.103.11",
+        "0.102.8",
+        // Pre-releases sort below their release, so these are still affected.
+        "0.103.12-alpha.1",
+        "0.103.12-rc.1",
+        "0.104.0-alpha.1",
+        "0.104.0-alpha.5",
+        // Unparseable input is treated as potentially affected.
+        "not-a-version",
+    ] {
+        assert!(
+            rustls_webpki_is_vulnerable(vulnerable),
+            "{vulnerable} should be reported as vulnerable"
+        );
+    }
+    for patched in [
+        "0.103.12",
+        "0.103.13",
+        "0.103.12+build.5",
+        "0.104.0",
+        "0.104.0-alpha.6",
+        "0.104.0-alpha.6.1",
+        "0.104.0-alpha.10",
+        "0.104.0-beta.1",
+        "0.104.1",
+        "0.105.0",
+    ] {
+        assert!(
+            !rustls_webpki_is_vulnerable(patched),
+            "{patched} should be reported as patched"
+        );
+    }
+}

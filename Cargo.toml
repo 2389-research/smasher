@@ -67,6 +67,7 @@ winnow = "0.7"
 wiremock = "0.6"
 tokio-test = "0.4"
 tempfile = "3"
+semver = "1"
 
 # Workspace crate cross-references
 smasher-llm = { path = "crates/smasher-llm" }
