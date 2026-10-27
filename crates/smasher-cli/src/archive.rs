@@ -275,4 +275,56 @@ mod tests {
         assert_eq!(cli.archive.run_dir, "/tmp/run-123");
         assert_eq!(cli.archive.output, Some("/tmp/archive.tgz".into()));
     }
+
+    /// Regression test for RUSTSEC-2026-0068 (CVE-2026-33055).
+    ///
+    /// tar-rs 0.4.44 and below only honored a PAX `size` extension when the
+    /// base header size was zero. Other archivers (Go `archive/tar`, GNU tar)
+    /// unconditionally let the PAX record win, so an archive could be seen as
+    /// one size by smasher and another size by every other tool. Reading such
+    /// an archive must use the PAX size even when the header size is nonzero.
+    #[test]
+    fn archive_reading_honors_pax_size_over_nonzero_header_size() {
+        use std::io::Read;
+
+        const PAX_SIZE: usize = 5;
+        const HEADER_SIZE: u64 = 3;
+
+        // Hand-build an archive whose PAX `size` record (5) disagrees with the
+        // following ustar header's size field (3). This is exactly the shape a
+        // malicious archive uses to hide bytes from some parsers.
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("size", PAX_SIZE.to_string().as_bytes())])
+            .unwrap();
+
+        let mut header = tar::Header::new_ustar();
+        header.set_path("pax-size.txt").unwrap();
+        header.set_size(HEADER_SIZE);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &b"hello"[..]).unwrap();
+
+        let bytes = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+
+        let mut entry = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().unwrap().display().to_string() == "pax-size.txt")
+            .expect("archive should contain pax-size.txt");
+
+        assert_eq!(
+            entry.size(),
+            PAX_SIZE as u64,
+            "PAX size record must override a nonzero base header size"
+        );
+
+        // And the reader must actually hand back the PAX-declared contents,
+        // not the header-declared prefix.
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"hello");
+    }
 }
