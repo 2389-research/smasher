@@ -52,7 +52,8 @@ tar = "0.4.45"
 flate2 = "1"
 
 # Utilities
-rand = "0.9"
+# Floor is 0.9.3: earlier 0.9.x is affected by RUSTSEC-2026-0097 (unsound ThreadRng reseeding)
+rand = "0.9.3"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
