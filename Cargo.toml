@@ -48,7 +48,7 @@ dotenvy = "0.15"
 sha2 = "0.10"
 
 # Archive
-tar = "0.4"
+tar = "0.4.45"
 flate2 = "1"
 
 # Utilities
