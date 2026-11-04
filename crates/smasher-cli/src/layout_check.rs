@@ -353,3 +353,82 @@ fn rustls_webpki_vulnerable_version_predicate_is_accurate() {
         );
     }
 }
+
+/// Returns true when `version` is affected by RUSTSEC-2026-0049.
+///
+/// The affected range starts at `0.102.0-alpha.0` and ends just below
+/// `0.103.10`. Pre-releases of `0.103.10` (e.g. `0.103.10-alpha.1`) sort below
+/// their release and are therefore still affected, matching the advisory.
+fn rustls_webpki_is_vulnerable_to_rustsec_2026_0049(version: &str) -> bool {
+    let bound = |s: &str| semver::Version::parse(s).expect("advisory bound should be valid semver");
+
+    let Ok(version) = semver::Version::parse(version) else {
+        // An unparseable version cannot be proven patched, so report it.
+        return true;
+    };
+
+    let first_affected = bound("0.102.0-alpha.0");
+    let first_patched = bound("0.103.10");
+
+    version >= first_affected && version < first_patched
+}
+
+#[test]
+fn rustls_webpki_is_patched_for_rustsec_2026_0049() {
+    // RUSTSEC-2026-0049 / GHSA-pwjx-qhcg-rvj4: only the first certificate
+    // `distributionPoint` was compared against a CRL's IssuingDistributionPoint,
+    // so a correctly supplied CRL could be ignored and revocation checking
+    // silently degraded. Patched in >=0.103.10.
+    let versions = locked_versions("rustls-webpki");
+    for version in &versions {
+        assert!(
+            !rustls_webpki_is_vulnerable_to_rustsec_2026_0049(version),
+            "Cargo.lock pins rustls-webpki {version}, which is affected by \
+             RUSTSEC-2026-0049 (CRL distribution points are matched incorrectly); \
+             upgrade to >=0.103.10"
+        );
+    }
+}
+
+#[test]
+fn rustls_webpki_rustsec_2026_0049_version_predicate_is_accurate() {
+    for vulnerable in [
+        // The version named by the advisory.
+        "0.103.9",
+        "0.103.0",
+        "0.102.0-alpha.0",
+        "0.102.8",
+        // Pre-releases sort below their release, so 0.103.10 pre-releases are
+        // still affected.
+        "0.103.10-alpha.1",
+        "0.103.10-rc.1",
+        // Sorts after 0.102.0-alpha.0, so it is inside the affected range.
+        "0.102.0-alpha.0.pre",
+        // Unparseable input is treated as potentially affected.
+        "not-a-version",
+    ] {
+        assert!(
+            rustls_webpki_is_vulnerable_to_rustsec_2026_0049(vulnerable),
+            "{vulnerable} should be reported as affected by RUSTSEC-2026-0049"
+        );
+    }
+
+    for patched in [
+        "0.103.10",
+        // The version this workspace actually resolves.
+        "0.103.12",
+        "0.103.13",
+        "0.103.10+build.5",
+        "0.104.0",
+        "0.104.0-alpha.1",
+        "0.105.0",
+        // Below the affected range entirely.
+        "0.101.0",
+        "0.100.0",
+    ] {
+        assert!(
+            !rustls_webpki_is_vulnerable_to_rustsec_2026_0049(patched),
+            "{patched} should be reported as patched for RUSTSEC-2026-0049"
+        );
+    }
+}
