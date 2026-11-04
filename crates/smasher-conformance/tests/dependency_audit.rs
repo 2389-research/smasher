@@ -1,5 +1,5 @@
 // ABOUTME: Lockfile audit test guarding against known-unsound dependency versions.
-// ABOUTME: Fails if `rand` resolves to a version affected by RUSTSEC-2026-0097.
+// ABOUTME: Fails if `rand` or `h2` resolves to an advisory-affected version.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,24 @@ fn vulnerable_rand_versions(packages: &[(String, String)]) -> Vec<String> {
         .filter(|(name, _)| name == "rand")
         .map(|(_, version)| version)
         .filter(|version| is_vulnerable_rand(version))
+        .cloned()
+        .collect()
+}
+
+/// Vulnerable ranges from RUSTSEC-2026-0258: `h2` accepts and queues empty DATA
+/// frames without limit, so an undrained stream can grow memory unboundedly or
+/// panic on length overflow.
+fn is_vulnerable_h2(version: &str) -> bool {
+    version_lt(version, "0.4.16")
+}
+
+/// Locked `h2` versions that fall inside an advisory's vulnerable ranges.
+fn vulnerable_h2_versions(packages: &[(String, String)]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|(name, _)| name == "h2")
+        .map(|(_, version)| version)
+        .filter(|version| is_vulnerable_h2(version))
         .cloned()
         .collect()
 }
@@ -182,4 +200,92 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         "parser must still parse unrelated packages"
     );
     assert!(vulnerable_rand_versions(&packages).is_empty());
+}
+
+#[test]
+fn no_locked_h2_version_is_affected_by_rustsec_2026_0258() {
+    let lockfile_path = workspace_root().join("Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lockfile_path.display()));
+
+    let packages = locked_packages(&lockfile);
+    assert!(
+        !packages.is_empty(),
+        "no packages parsed from {}; lockfile format changed?",
+        lockfile_path.display()
+    );
+
+    let vulnerable = vulnerable_h2_versions(&packages);
+    assert!(
+        vulnerable.is_empty(),
+        "RUSTSEC-2026-0258: `h2` resolves to vulnerable version(s) {vulnerable:?}; \
+         upgrade to >=0.4.16."
+    );
+}
+
+#[test]
+fn is_vulnerable_h2_covers_advisory_boundaries() {
+    for version in ["0.3.26", "0.4.0", "0.4.13", "0.4.15"] {
+        assert!(
+            is_vulnerable_h2(version),
+            "h2 {version} is affected by RUSTSEC-2026-0258 and must be flagged"
+        );
+    }
+
+    for version in ["0.4.16", "0.4.20", "0.5.0"] {
+        assert!(
+            !is_vulnerable_h2(version),
+            "h2 {version} is not affected by RUSTSEC-2026-0258 but was flagged"
+        );
+    }
+}
+
+#[test]
+fn lockfile_audit_flags_vulnerable_h2_in_synthetic_lockfile() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "h2"
+version = "0.4.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "hyper"
+version = "1.8.1"
+dependencies = [
+ "h2",
+]
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(packages.contains(&("h2".to_string(), "0.4.13".to_string())));
+    assert_eq!(
+        vulnerable_h2_versions(&packages),
+        vec!["0.4.13".to_string()]
+    );
+}
+
+#[test]
+fn lockfile_audit_accepts_synthetic_lockfile_without_h2() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(
+        !packages.is_empty(),
+        "parser must still parse unrelated packages"
+    );
+    assert!(vulnerable_h2_versions(&packages).is_empty());
 }
