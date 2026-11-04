@@ -23,6 +23,9 @@ async-stream = "0.3"
 async-trait = "0.1"
 
 # HTTP + networking
+# Transitive floor: h2 >=0.4.16 (via hyper -> axum/reqwest) is required by
+# RUSTSEC-2026-0258 (unbounded queued empty DATA frames). Guarded by
+# crates/smasher-conformance/tests/dependency_audit.rs.
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 bytes = "1"
 
