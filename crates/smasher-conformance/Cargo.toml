@@ -21,3 +21,6 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+semver.workspace = true
