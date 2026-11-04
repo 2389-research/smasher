@@ -16,7 +16,13 @@ license = "MIT"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+# Floor is 1.53.3 for RUSTSEC-2026-0386 (AsyncFd::new and friends violate I/O
+# safety). Patched: >=1.51.6, <1.52.0 or >=1.53.3; 1.52.0-1.53.2 are vulnerable
+# because the fix was not backported to the 1.52 line.
+# Guarded by crates/smasher-conformance/tests/dependency_audit.rs (lockfile and
+# the whole manifest requirement: any version the requirement admits must be
+# unaffected).
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = "0.7"
 futures = "0.3"
 async-stream = "0.3"
