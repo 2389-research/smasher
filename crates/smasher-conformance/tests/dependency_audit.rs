@@ -1,5 +1,5 @@
 // ABOUTME: Lockfile audit test guarding against known-unsound dependency versions.
-// ABOUTME: Fails if `rand` or `h2` resolves to an advisory-affected version.
+// ABOUTME: Fails if `rand`, `h2` or `anyhow` resolves to an advisory-affected version.
 
 use std::path::{Path, PathBuf};
 
@@ -288,4 +288,133 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         "parser must still parse unrelated packages"
     );
     assert!(vulnerable_h2_versions(&packages).is_empty());
+}
+
+/// First `anyhow` release that fixes RUSTSEC-2026-0190.
+const ANYHOW_PATCHED: &str = "1.0.103";
+
+/// Returns true when a locked `anyhow` version is affected by
+/// RUSTSEC-2026-0190.
+///
+/// `Error::context` left a shared reference in the borrow chain that
+/// `Error::downcast_mut` then retagged as unique, so writing through the
+/// returned `&mut` violated the aliasing rules and was undefined behaviour.
+/// Patched in >=1.0.103. Versions that do not parse cannot be shown to be
+/// patched, so they count as affected.
+fn is_vulnerable_anyhow(version: &str) -> bool {
+    let patched = semver::Version::parse(ANYHOW_PATCHED).expect("advisory bound is valid semver");
+    match semver::Version::parse(version) {
+        Ok(version) => version < patched,
+        Err(_) => true,
+    }
+}
+
+/// Locked `anyhow` versions that fall inside the advisory's vulnerable range.
+fn vulnerable_anyhow_versions(packages: &[(String, String)]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|(name, _)| name == "anyhow")
+        .map(|(_, version)| version)
+        .filter(|version| is_vulnerable_anyhow(version))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn no_locked_anyhow_version_is_affected_by_rustsec_2026_0190() {
+    let lockfile_path = workspace_root().join("Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lockfile_path.display()));
+
+    let packages = locked_packages(&lockfile);
+    assert!(
+        !packages.is_empty(),
+        "no packages parsed from {}; lockfile format changed?",
+        lockfile_path.display()
+    );
+
+    let vulnerable = vulnerable_anyhow_versions(&packages);
+    assert!(
+        vulnerable.is_empty(),
+        "RUSTSEC-2026-0190: `anyhow` resolves to unsound version(s) {vulnerable:?}; \
+         upgrade to >=1.0.103."
+    );
+}
+
+#[test]
+fn is_vulnerable_anyhow_covers_advisory_boundaries() {
+    for version in [
+        // The version named by the advisory.
+        "1.0.102",
+        "1.0.0",
+        "0.1.0",
+        // Pre-releases sort below their release, so 1.0.103 pre-releases are
+        // still affected.
+        "1.0.103-alpha.1",
+        "1.0.103-rc.1",
+        // Unparseable input is treated as potentially affected.
+        "not-a-version",
+    ] {
+        assert!(
+            is_vulnerable_anyhow(version),
+            "anyhow {version} is affected by RUSTSEC-2026-0190 and must be flagged"
+        );
+    }
+
+    for version in ["1.0.103", "1.0.104", "1.0.104+build.5", "1.1.0", "2.0.0"] {
+        assert!(
+            !is_vulnerable_anyhow(version),
+            "anyhow {version} is not affected by RUSTSEC-2026-0190 but was flagged"
+        );
+    }
+}
+
+#[test]
+fn lockfile_audit_flags_vulnerable_anyhow_in_synthetic_lockfile() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "termwiz"
+version = "0.23.3"
+dependencies = [
+ "anyhow",
+]
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(packages.contains(&("anyhow".to_string(), "1.0.102".to_string())));
+    assert_eq!(
+        vulnerable_anyhow_versions(&packages),
+        vec!["1.0.102".to_string()]
+    );
+}
+
+#[test]
+fn lockfile_audit_accepts_synthetic_lockfile_without_anyhow() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(
+        !packages.is_empty(),
+        "parser must still parse unrelated packages"
+    );
+    assert!(vulnerable_anyhow_versions(&packages).is_empty());
 }
