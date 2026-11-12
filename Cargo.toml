@@ -53,6 +53,10 @@ dotenvy = "0.15"
 sha2 = "0.10"
 
 # Archive
+# Transitive floor, guarded by crates/smasher-conformance/tests/dependency_audit.rs:
+# - rustix >=1.1.6 (via xattr <- tar; also crossterm and tempfile):
+#   RUSTSEC-2026-0486 (xattr functions mark unwritten bytes as initialized when
+#   given a zero-length buffer).
 tar = "0.4.45"
 flate2 = "1"
 
