@@ -1,5 +1,6 @@
 // ABOUTME: Lockfile audit test guarding against known-unsound dependency versions.
-// ABOUTME: Fails if `rand`, `h2` or `quinn-proto` resolves to an advisory-affected version.
+// ABOUTME: Fails if `rand`, `h2`, `quinn-proto` or `rustix` resolves to an advisory-affected
+// ABOUTME: version.
 
 use std::path::{Path, PathBuf};
 
@@ -102,6 +103,25 @@ fn vulnerable_quinn_proto_versions(packages: &[(String, String)]) -> Vec<String>
         .filter(|(name, _)| name == "quinn-proto")
         .map(|(_, version)| version)
         .filter(|version| is_vulnerable_quinn_proto(version))
+        .cloned()
+        .collect()
+}
+
+/// Vulnerable ranges from RUSTSEC-2026-0486: rustix's xattr functions
+/// (`getxattr`, `listxattr`, ...) mark as many bytes initialized as the syscall
+/// reported, even for a zero-length buffer where the call is a size query and
+/// nothing was written. Reachable from safe code via `spare_capacity`.
+fn is_vulnerable_rustix(version: &str) -> bool {
+    version_gte(version, "1.0.0") && version_lt(version, "1.1.6")
+}
+
+/// Locked `rustix` versions that fall inside an advisory's vulnerable ranges.
+fn vulnerable_rustix_versions(packages: &[(String, String)]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|(name, _)| name == "rustix")
+        .map(|(_, version)| version)
+        .filter(|version| is_vulnerable_rustix(version))
         .cloned()
         .collect()
 }
@@ -397,4 +417,92 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         "parser must still parse unrelated packages"
     );
     assert!(vulnerable_quinn_proto_versions(&packages).is_empty());
+}
+
+#[test]
+fn no_locked_rustix_version_is_affected_by_rustsec_2026_0486() {
+    let lockfile_path = workspace_root().join("Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lockfile_path.display()));
+
+    let packages = locked_packages(&lockfile);
+    assert!(
+        !packages.is_empty(),
+        "no packages parsed from {}; lockfile format changed?",
+        lockfile_path.display()
+    );
+
+    let vulnerable = vulnerable_rustix_versions(&packages);
+    assert!(
+        vulnerable.is_empty(),
+        "RUSTSEC-2026-0486: `rustix` resolves to unsound version(s) {vulnerable:?}; \
+         upgrade to >=1.1.6."
+    );
+}
+
+#[test]
+fn is_vulnerable_rustix_covers_advisory_boundaries() {
+    for version in ["1.0.0", "1.1.0", "1.1.4", "1.1.5"] {
+        assert!(
+            is_vulnerable_rustix(version),
+            "rustix {version} is affected by RUSTSEC-2026-0486 and must be flagged"
+        );
+    }
+
+    for version in ["0.38.44", "0.39.0", "1.1.6", "1.1.7", "1.2.0"] {
+        assert!(
+            !is_vulnerable_rustix(version),
+            "rustix {version} is not affected by RUSTSEC-2026-0486 but was flagged"
+        );
+    }
+}
+
+#[test]
+fn lockfile_audit_flags_vulnerable_rustix_in_synthetic_lockfile() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "rustix"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+dependencies = [
+ "rustix",
+]
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(packages.contains(&("rustix".to_string(), "1.1.4".to_string())));
+    assert_eq!(
+        vulnerable_rustix_versions(&packages),
+        vec!["1.1.4".to_string()]
+    );
+}
+
+#[test]
+fn lockfile_audit_accepts_synthetic_lockfile_without_rustix() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(
+        !packages.is_empty(),
+        "parser must still parse unrelated packages"
+    );
+    assert!(vulnerable_rustix_versions(&packages).is_empty());
 }
