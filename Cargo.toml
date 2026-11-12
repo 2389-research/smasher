@@ -23,9 +23,11 @@ async-stream = "0.3"
 async-trait = "0.1"
 
 # HTTP + networking
-# Transitive floor: h2 >=0.4.16 (via hyper -> axum/reqwest) is required by
-# RUSTSEC-2026-0258 (unbounded queued empty DATA frames). Guarded by
-# crates/smasher-conformance/tests/dependency_audit.rs.
+# Transitive floors, guarded by crates/smasher-conformance/tests/dependency_audit.rs:
+# - h2 >=0.4.16 (via hyper -> axum/reqwest): RUSTSEC-2026-0258 (unbounded queued
+#   empty DATA frames).
+# - quinn-proto >=0.11.18 (via reqwest's QUIC support): RUSTSEC-2026-0340 (panics
+#   clamping ACK delays when ACK_FREQUENCY transmission is enabled).
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 bytes = "1"
 

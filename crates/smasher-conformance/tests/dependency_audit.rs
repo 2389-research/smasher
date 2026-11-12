@@ -1,5 +1,5 @@
 // ABOUTME: Lockfile audit test guarding against known-unsound dependency versions.
-// ABOUTME: Fails if `rand` or `h2` resolves to an advisory-affected version.
+// ABOUTME: Fails if `rand`, `h2` or `quinn-proto` resolves to an advisory-affected version.
 
 use std::path::{Path, PathBuf};
 
@@ -83,6 +83,25 @@ fn vulnerable_h2_versions(packages: &[(String, String)]) -> Vec<String> {
         .filter(|(name, _)| name == "h2")
         .map(|(_, version)| version)
         .filter(|version| is_vulnerable_h2(version))
+        .cloned()
+        .collect()
+}
+
+/// Vulnerable ranges from RUSTSEC-2026-0340: when ACK_FREQUENCY transmission is
+/// enabled, a peer advertising a large `min_ack_delay` makes
+/// `AckFrequencyState::candidate_max_ack_delay` call `Duration::clamp` with a
+/// minimum greater than its maximum, panicking the connection.
+fn is_vulnerable_quinn_proto(version: &str) -> bool {
+    version_gte(version, "0.11.0") && version_lt(version, "0.11.18")
+}
+
+/// Locked `quinn-proto` versions that fall inside an advisory's vulnerable ranges.
+fn vulnerable_quinn_proto_versions(packages: &[(String, String)]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|(name, _)| name == "quinn-proto")
+        .map(|(_, version)| version)
+        .filter(|version| is_vulnerable_quinn_proto(version))
         .cloned()
         .collect()
 }
@@ -288,4 +307,94 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         "parser must still parse unrelated packages"
     );
     assert!(vulnerable_h2_versions(&packages).is_empty());
+}
+
+#[test]
+fn no_locked_quinn_proto_version_is_affected_by_rustsec_2026_0340() {
+    let lockfile_path = workspace_root().join("Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lockfile_path.display()));
+
+    let packages = locked_packages(&lockfile);
+    assert!(
+        !packages.is_empty(),
+        "no packages parsed from {}; lockfile format changed?",
+        lockfile_path.display()
+    );
+
+    let vulnerable = vulnerable_quinn_proto_versions(&packages);
+    assert!(
+        vulnerable.is_empty(),
+        "RUSTSEC-2026-0340: `quinn-proto` resolves to vulnerable version(s) {vulnerable:?}; \
+         upgrade to >=0.11.18."
+    );
+}
+
+#[test]
+fn is_vulnerable_quinn_proto_covers_advisory_boundaries() {
+    for version in [
+        "0.11.0", "0.11.2", "0.11.9", "0.11.13", "0.11.14", "0.11.17",
+    ] {
+        assert!(
+            is_vulnerable_quinn_proto(version),
+            "quinn-proto {version} is affected by RUSTSEC-2026-0340 and must be flagged"
+        );
+    }
+
+    for version in ["0.10.1", "0.11.18", "0.11.19", "0.12.0", "0.12.1"] {
+        assert!(
+            !is_vulnerable_quinn_proto(version),
+            "quinn-proto {version} is not affected by RUSTSEC-2026-0340 but was flagged"
+        );
+    }
+}
+
+#[test]
+fn lockfile_audit_flags_vulnerable_quinn_proto_in_synthetic_lockfile() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+dependencies = [
+ "quinn",
+]
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(packages.contains(&("quinn-proto".to_string(), "0.11.14".to_string())));
+    assert_eq!(
+        vulnerable_quinn_proto_versions(&packages),
+        vec!["0.11.14".to_string()]
+    );
+}
+
+#[test]
+fn lockfile_audit_accepts_synthetic_lockfile_without_quinn_proto() {
+    let lockfile = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+
+    let packages = locked_packages(lockfile);
+    assert!(
+        !packages.is_empty(),
+        "parser must still parse unrelated packages"
+    );
+    assert!(vulnerable_quinn_proto_versions(&packages).is_empty());
 }
